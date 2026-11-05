@@ -311,11 +311,9 @@ impl Editor {
         });
     }
     /// Saves the session when the window is maximized or restored. A minimized
-    /// window keeps what it was: Windows reports it as not maximized.
+    /// window keeps what it was: Windows reports it as not maximized. On macOS
+    /// the state comes from AppKit (`platform::titlebar::refresh_window_state`).
     pub(super) fn remember_maximized(&mut self, ctx: &egui::Context) {
-        if !KEEPS_MAXIMIZED {
-            return;
-        }
         let (maximized, now) = ctx.input(|i| {
             let viewport = i.viewport();
             let maximized = viewport
@@ -2210,11 +2208,6 @@ pub(super) enum LayoutEdit {
     Changing,
     Settled,
 }
-
-/// Whether the window opens maximized when it was left so. Not on macOS, where egui
-/// reads the state only at launch (emilk/egui#3494), so a window zoomed back out
-/// would still open zoomed.
-pub(super) const KEEPS_MAXIMIZED: bool = !cfg!(target_os = "macos");
 
 /// How long a window reopened maximized waits for the window manager to maximize
 /// it before its state is saved again: until then it shows unmaximized on X11.

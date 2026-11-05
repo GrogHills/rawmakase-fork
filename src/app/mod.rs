@@ -549,6 +549,8 @@ impl eframe::App for Editor {
     }
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         workspace::clipboard_shortcut_keys(ctx, raw_input);
+        #[cfg(target_os = "macos")]
+        crate::platform::titlebar::refresh_window_state(ctx, raw_input);
     }
     // fastframe-titlebar turns on eframe's glow feature, which adds the context.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -628,7 +630,7 @@ fn run_window(path: Option<PathBuf>, launch: crate::updates::Launch) -> anyhow::
             // size with its maximized flag still set (#553). Let the first
             // frame maximize it after sizing instead. X11 also needs that
             // request because its window manager waits for the window to show.
-            .with_maximized(!cfg!(windows) && workspace::KEEPS_MAXIMIZED && session.maximized)
+            .with_maximized(!cfg!(windows) && session.maximized)
             // On macOS the workspace bar is the title bar, under the traffic
             // lights; elsewhere the window keeps its decorations.
             .with_fullsize_content_view(true)
