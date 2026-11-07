@@ -724,20 +724,29 @@ impl Editor {
         &self,
         ids: Option<&[PhotoId]>,
     ) -> Result<BTreeSet<PhotoId>, String> {
+        let mut recorded = self.editable_previews_of(ids)?;
+        if let Some(library) = &self.library {
+            recorded.retain(|m| library.export_refusal(*m).is_some());
+        }
+        Ok(recorded)
+    }
+
+    /// The photos (masters) of `ids`, or of the whole catalog when `None`, that
+    /// have editable previews: those a discard of them removes.
+    fn editable_previews_of(&self, ids: Option<&[PhotoId]>) -> Result<BTreeSet<PhotoId>, String> {
         let Some(library) = &self.library else {
             return Ok(BTreeSet::new());
         };
-        let masters = ids.map(|ids| masters_of(library, ids));
-        let recorded = library
+        let mut recorded = library
             .session
             .catalog()
             .photos_with_editable_previews()
             .map_err(|e| format!("The catalog could not be read: {e:#}"))?;
-        Ok(recorded
-            .into_iter()
-            .filter(|m| masters.as_ref().is_none_or(|masters| masters.contains(m)))
-            .filter(|m| library.export_refusal(*m).is_some())
-            .collect())
+        if let Some(ids) = ids {
+            let masters = masters_of(library, ids);
+            recorded.retain(|m| masters.contains(m));
+        }
+        Ok(recorded)
     }
 
     /// Discard Editable Previews for `ids` (their masters'), keeping those of
@@ -769,23 +778,27 @@ impl Editor {
     /// whose editable preview it removes is online, else after asking, as none
     /// of an offline photo's can be built again until its original is back.
     pub(in crate::app) fn discard_editable_previews_from_menu(&mut self, ids: &[PhotoId]) {
-        let offline = match self.offline_editable_previews(Some(ids)) {
-            Ok(offline) => offline.len(),
+        let recorded = match self.editable_previews_of(Some(ids)) {
+            Ok(recorded) => recorded,
             Err(e) => {
                 self.messages
                     .fail(format!("Editable previews not discarded: {e}"));
                 return;
             }
         };
-        if offline == 0 {
-            return self.discard_editable_previews_now(ids);
-        }
         let Some(library) = &self.library else {
             return;
         };
+        let offline = recorded
+            .iter()
+            .filter(|m| library.export_refusal(**m).is_some())
+            .count();
+        if offline == 0 {
+            return self.discard_editable_previews_now(ids);
+        }
         self.modal = Some(crate::app::Modal::DiscardEditablePreviews(OfflineDiscard {
             catalog: library.session.catalog().location().clone(),
-            photos: masters_of(library, ids).len(),
+            photos: recorded.len(),
             ids: ids.to_vec(),
             offline,
         }));
@@ -958,7 +971,6 @@ pub(in crate::app) fn queued_message(queued: Queued) -> String {
     line
 }
 
-/// "Discarded the editable previews of 3 photos".
 /// A thumbnail menu's Discard Editable Previews waiting for the user's answer,
 /// as some of the photos whose editable previews it removes are offline.
 #[derive(Debug)]
@@ -967,7 +979,7 @@ pub(in crate::app) struct OfflineDiscard {
     catalog: CatalogLocation,
     /// The photos the menu was chosen for, as it would discard them.
     ids: Vec<PhotoId>,
-    /// Their masters.
+    /// Their masters with editable previews: those it would remove.
     photos: usize,
     /// The masters whose editable previews it would remove while offline.
     offline: usize,
@@ -993,6 +1005,7 @@ fn offline_question(offline: usize, photos: usize) -> (String, String) {
     ("Discard editable previews anyway?".into(), line)
 }
 
+/// "Discarded the editable previews of 3 photos".
 pub(in crate::app) fn discarded_message(done: Discarded) -> String {
     match done.discarded {
         0 => "No editable previews to discard".into(),

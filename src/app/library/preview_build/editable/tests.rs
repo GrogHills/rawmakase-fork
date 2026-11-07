@@ -793,8 +793,8 @@ fn key(key: egui::Key, pressed: bool) -> egui::Event {
 #[test]
 fn discarding_an_offline_photo_s_from_the_menu_asks_first() {
     use crate::app::library::cell::PhotoAction;
-    let (_dir, mut e, ids) = editor(&["a.ARW", "b.ARW", "c.ARW"]);
-    let [a, b, c] = ["a.ARW", "b.ARW", "c.ARW"].map(|name| id_named(&e, &ids, name));
+    let (_dir, mut e, ids) = editor(&["a.ARW", "b.ARW", "c.ARW", "d.ARW"]);
+    let [a, b, c, d] = ["a.ARW", "b.ARW", "c.ARW", "d.ARW"].map(|name| id_named(&e, &ids, name));
     let copy = copy_of(&mut e, a);
     e.build_editable_previews(&[a, b, c]).unwrap();
     settle(&mut e);
@@ -810,6 +810,19 @@ fn discarding_an_offline_photo_s_from_the_menu_asks_first() {
     assert!(e.modal.is_none());
     assert!(recorded(&e, c).is_none());
     std::fs::remove_file(path_of(&e, a)).unwrap();
+    // Offline without one, d is not counted: its photo has none to lose.
+    std::fs::remove_file(path_of(&e, d)).unwrap();
+    e.discard_editable_previews_from_menu(&[d]);
+    assert!(e.modal.is_none());
+    e.discard_editable_previews_from_menu(&[copy, d]);
+    draw_offline_discard(&mut e, vec![]);
+    let shapes = draw_offline_discard(&mut e, vec![]);
+    assert!(shown(&shapes, "This photo is offline."));
+    draw_offline_discard(
+        &mut e,
+        vec![key(egui::Key::Escape, true), key(egui::Key::Escape, false)],
+    );
+    assert!(e.modal.is_none());
     // A virtual copy's is its master's, offline: asked, nothing discarded yet.
     choose(&mut e, copy);
     assert!(matches!(
