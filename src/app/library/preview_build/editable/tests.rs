@@ -84,7 +84,9 @@ fn test_fit(
         return DefaultFit::Missing("No embedded preview".into());
     }
     let base = fitted::matrix_base(m, [[0.4, 0.4, 0.2], [0.2, 0.7, 0.1], [0., 0.1, 0.8]]).unwrap();
-    DefaultFit::Fitted(fitted::with_look(&base, &fitted::FittedLook::identity()).unwrap())
+    DefaultFit::Fitted(Box::new(
+        fitted::with_look(&base, &fitted::FittedLook::identity()).unwrap(),
+    ))
 }
 
 const STEPS: Steps = Steps {
@@ -520,7 +522,7 @@ fn only_a_photo_without_colour_data_keeps_a_camera_look() {
         &[],
         Cancel::NEVER,
     ) {
-        DefaultFit::Fitted(p) => p,
+        DefaultFit::Fitted(p) => *p,
         other => panic!("{other:?}"),
     };
     assert_eq!(stored.camera_look(), Some(&expected));

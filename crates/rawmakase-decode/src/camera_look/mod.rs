@@ -243,7 +243,7 @@ pub fn with_default(
     cancel: Cancel<'_>,
 ) -> Vec<Arc<CameraProfile>> {
     if let DefaultFit::Fitted(p) = default_fit(path, m, &profiles, cancel) {
-        profiles.push(Arc::new(p));
+        profiles.push(Arc::new(*p));
     }
     profiles
 }
@@ -255,7 +255,7 @@ pub enum DefaultFit {
     /// has no default fit.
     NotDefault,
     /// The fit [`with_default`] adds to the photo's profiles.
-    Fitted(CameraProfile),
+    Fitted(Box<CameraProfile>),
     /// The photo would start from a fit, but there is none: why.
     Missing(String),
 }
@@ -275,7 +275,7 @@ pub fn default_fit(
         return DefaultFit::NotDefault;
     }
     match default_profile(path, m, &cache::dir(), cancel) {
-        Ok(p) => DefaultFit::Fitted(p),
+        Ok(p) => DefaultFit::Fitted(Box::new(p)),
         Err(why) => DefaultFit::Missing(why),
     }
 }
