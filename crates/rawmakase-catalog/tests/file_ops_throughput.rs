@@ -1,7 +1,10 @@
 //! How long renaming and moving a large batch of photos takes on a real
 //! volume, with the catalog as it ships (`synchronous=FULL`), as #692
 //! measured: ignored by default, as the time is the drive's. Run it with
-//! `TMPDIR` on the drive to measure (not tmpfs, whose syncs cost nothing):
+//! `TMPDIR` on the drive to measure (not tmpfs, whose syncs cost nothing),
+//! and for this crate alone: a run that also builds a crate whose
+//! dev-dependencies turn on `test-support` (the app's or export's) skips the
+//! catalog's syncs, and the budget measures nothing.
 //!
 //! ```text
 //! TMPDIR=~/.cache/throughput cargo test -p rawmakase-catalog --release \
