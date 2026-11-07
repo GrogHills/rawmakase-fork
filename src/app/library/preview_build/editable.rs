@@ -744,10 +744,13 @@ impl Editor {
         let Some(builder) = &builds.builder else {
             return;
         };
-        let mut built = false;
+        // Any result can change what they take: a stale one is discarded before
+        // its rebuild, which may then fail, and a record that raced a discard is
+        // discarded again.
+        let mut finished = false;
         loop {
             match builder.results.try_recv() {
-                Ok(done) => built |= matches!(done.outcome, Outcome::Built { .. }),
+                Ok(_) => finished = true,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // Nothing more will finish; the progress went with it.
@@ -758,7 +761,7 @@ impl Editor {
                 }
             }
         }
-        if built {
+        if finished {
             self.editable_previews_changed();
         }
     }

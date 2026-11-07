@@ -15,6 +15,8 @@ static STARTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static RELEASED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 /// "absent" photos' fits are refused while set.
 static REFUSE_FIT: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+/// Photos whose opening fails while set, whatever their names.
+static FAIL: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
 /// The camera of the stand-in decodes, with a colour matrix unless `bare`.
 fn metadata(width: u32, height: u32, bare: bool) -> Metadata {
@@ -33,16 +35,19 @@ fn metadata(width: u32, height: u32, bare: bool) -> Metadata {
     m
 }
 
-/// Opens by the file's name: "panic…" panics, "fail…" fails, "slow…" waits until
-/// released or cancelled, "absent…" has no colour data; anything else is a small
-/// full-size decode of a camera with a matrix.
+/// Opens by the file's name: "panic…" panics, "fail…" (or one in [`FAIL`])
+/// fails, "slow…" waits until released or cancelled, "absent…" has no colour
+/// data; anything else is a small full-size decode of a camera with a matrix.
 fn test_open(item: &Item, _: &Identity, cancel: Cancel<'_>) -> anyhow::Result<Original> {
     OPENED.lock().unwrap().push(item.path.clone());
     let name = item.path.file_name().unwrap().to_string_lossy().to_string();
     if name.starts_with("panic") {
         panic!("test panic");
     }
-    anyhow::ensure!(!name.starts_with("fail"), "test failure");
+    anyhow::ensure!(
+        !name.starts_with("fail") && !in_set(&FAIL, &item.path),
+        "test failure"
+    );
     if name.starts_with("slow") {
         STARTED.lock().unwrap().push(item.path.clone());
         while !in_set(&RELEASED, &item.path) {
@@ -556,6 +561,25 @@ fn preferences_shows_what_they_take_and_discards_them_all() {
     e.discard_editable_previews(None).unwrap();
     assert_eq!(e.shown_editable_previews_size(), Some(0));
     assert!(files(&e).is_empty());
+}
+
+/// A stale editable preview is discarded before it is built again, so a rebuild
+/// that fails still changes what Preferences shows.
+#[test]
+fn preferences_shows_a_stale_preview_gone_when_its_rebuild_fails() {
+    let (_dir, mut e, ids) = editor(&["a.ARW"]);
+    e.build_editable_previews(&ids).unwrap();
+    settle(&mut e);
+    e.open_preferences(crate::app::preferences::Tab::Catalog);
+    assert!(e.shown_editable_previews_size().is_some_and(|size| size > 0));
+    let path = path_of(&e, ids[0]);
+    std::fs::write(&path, "the original, changed since").unwrap();
+    add(&FAIL, &path);
+    e.build_editable_previews(&ids).unwrap();
+    settle(&mut e);
+    assert_eq!(progress(&e).failed.len(), 1);
+    assert!(recorded(&e, ids[0]).is_none() && files(&e).is_empty());
+    assert_eq!(e.shown_editable_previews_size(), Some(0));
 }
 
 #[test]
