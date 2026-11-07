@@ -1467,16 +1467,38 @@ mod tests {
                     .decoded_cache_size_gib()
             })
         };
+        // The field sits below the fold of the Catalog page, so scroll down a step
+        // at a time, as a user would, until all of it is in view. Scrolling is
+        // animated, so wait until the field stops moving before pressing on it.
         let mut field = None;
-        for _ in 0..3 {
-            field = frame(&mut e, vec![])
+        let mut events = vec![];
+        for _ in 0..120 {
+            let shown = frame(&mut e, std::mem::take(&mut events))
                 .into_iter()
                 .find_map(|s| match s.shape {
                     egui::Shape::Text(t) if t.galley.text().contains("GiB") => {
-                        Some(t.visual_bounding_rect().center())
+                        let rect = t.visual_bounding_rect();
+                        s.clip_rect.contains_rect(rect).then(|| rect.center())
                     }
                     _ => None,
                 });
+            if shown.is_some() {
+                if shown == field {
+                    break;
+                }
+                field = shown;
+                continue;
+            }
+            field = None;
+            events = vec![
+                egui::Event::PointerMoved(egui::pos2(800., 500.)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0., -40.),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
         }
         let pos = field.expect("the cache size field is shown");
         let button = |pressed| egui::Event::PointerButton {
