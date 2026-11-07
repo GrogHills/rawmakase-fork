@@ -713,3 +713,43 @@ fn the_loupe_asks_again_after_passing_through_an_online_photo() {
     assert_eq!(l.loupe_develops(), None);
     assert_eq!(l.loupe_offline_developed(), Some(a));
 }
+
+#[test]
+fn a_drag_held_when_a_synced_photo_can_t_be_opened_again_is_not_saved() {
+    let mut fx = fixture(&["a.dng"]);
+    let a = fx.id("a.dng");
+    fx.build(a, false);
+    fx.open(a);
+    // A Sync running wrote A's edit; meanwhile a drag on it is held, its drive
+    // went away and its editable preview can't be used (deleted).
+    let path = fx.path(a);
+    let synced = crate::model::recipe::Recipe {
+        exposure: 0.5,
+        ..Default::default()
+    };
+    Catalog::open(catalog(&fx.e).location())
+        .unwrap()
+        .save_edit(
+            a,
+            &path,
+            &Identity::read(&path).unwrap(),
+            &synced,
+            &Default::default(),
+            crate::catalog::HistoryUpdate::Keep,
+        )
+        .unwrap();
+    let frame = fx.e.document.edit.begin();
+    fx.e.document.edit.recipe_mut().exposure = 0.9;
+    fx.e.document
+        .edit
+        .finish(frame, crate::edit_session::Gesture::Held);
+    fx.take_offline(a);
+    let file = catalog(&fx.e).editable_preview(a).unwrap().unwrap().path;
+    std::fs::remove_file(file).unwrap();
+    assert!(fx.e.reopen_synced(&[a]), "the drag was taken back");
+    assert_eq!(fx.e.document.catalog_photo, None);
+    let record = catalog(&fx.e).edit_record(a).unwrap();
+    let stored: crate::model::recipe::Recipe =
+        serde_json::from_str(&record.recipe.unwrap()).unwrap();
+    assert_eq!(stored.exposure, 0.5);
+}
