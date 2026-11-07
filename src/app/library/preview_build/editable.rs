@@ -59,6 +59,9 @@ pub(in crate::app) struct Item {
     /// The original's path as the catalog had it when asked: the file read, and
     /// the path the build is recorded for.
     pub path: PathBuf,
+    /// The demosaic the original is decoded with. An editable preview keeps the
+    /// demosaic it was built with, and its identity doesn't include it, as
+    /// [`Demosaic`] has a single variant; revisit both if a second one is added.
     pub demosaic: Demosaic,
     /// Where the full-size decode is looked up first.
     pub decode_cache: crate::decode_cache::DecodeCache,
