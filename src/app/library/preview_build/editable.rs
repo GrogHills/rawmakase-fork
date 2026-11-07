@@ -26,6 +26,7 @@
 //! original it was built from is still there to build from again.
 use super::{Progress as PreviewProgress, Queued};
 use crate::app::Editor;
+use crate::app::library::Library;
 use crate::app::ui::widgets::plural;
 use crate::camera_data::{CameraImage, Demosaic, Metadata};
 use crate::camera_look::DefaultFit;
@@ -693,12 +694,7 @@ impl Editor {
         let Some(library) = &self.library else {
             return Err("No catalog is open".into());
         };
-        let masters: Option<BTreeSet<PhotoId>> = ids.map(|ids| {
-            ids.iter()
-                .filter_map(|id| library.photo(*id))
-                .map(|p| p.master.unwrap_or(p.id))
-                .collect()
-        });
+        let masters = ids.map(|ids| masters_of(library, ids));
         // Counted before the rows go, so a build recording meanwhile drops its
         // own record (see `State::discarded_since`).
         let stopped = match &self.editable_builds.builder {
@@ -720,13 +716,98 @@ impl Editor {
         })
     }
 
-    /// The thumbnail menu's Discard Editable Previews.
+    /// The photos (masters) of `ids`, or of the whole catalog when `None`, whose
+    /// editable previews a discard would remove while their originals are
+    /// offline, as a build finds them ([`Library::export_refusal`]): none of
+    /// these can be built again until its original is back.
+    pub(in crate::app) fn offline_editable_previews(
+        &self,
+        ids: Option<&[PhotoId]>,
+    ) -> Result<BTreeSet<PhotoId>, String> {
+        let Some(library) = &self.library else {
+            return Ok(BTreeSet::new());
+        };
+        let masters = ids.map(|ids| masters_of(library, ids));
+        let recorded = library
+            .session
+            .catalog()
+            .photos_with_editable_previews()
+            .map_err(|e| format!("The catalog could not be read: {e:#}"))?;
+        Ok(recorded
+            .into_iter()
+            .filter(|m| masters.as_ref().is_none_or(|masters| masters.contains(m)))
+            .filter(|m| library.export_refusal(*m).is_some())
+            .collect())
+    }
+
+    /// The thumbnail menu's Discard Editable Previews: at once when every photo
+    /// whose editable preview it removes is online, else after asking, as none
+    /// of an offline photo's can be built again until its original is back.
     pub(in crate::app) fn discard_editable_previews_from_menu(&mut self, ids: &[PhotoId]) {
+        let offline = match self.offline_editable_previews(Some(ids)) {
+            Ok(offline) => offline.len(),
+            Err(e) => {
+                self.messages
+                    .fail(format!("Editable previews not discarded: {e}"));
+                return;
+            }
+        };
+        if offline == 0 {
+            return self.discard_editable_previews_now(ids);
+        }
+        let Some(library) = &self.library else {
+            return;
+        };
+        self.modal = Some(crate::app::Modal::DiscardEditablePreviews(OfflineDiscard {
+            catalog: library.session.catalog().location().clone(),
+            photos: masters_of(library, ids).len(),
+            ids: ids.to_vec(),
+            offline,
+        }));
+    }
+
+    fn discard_editable_previews_now(&mut self, ids: &[PhotoId]) {
         match self.discard_editable_previews(Some(ids)) {
             Ok(done) => self.messages.note(discarded_message(done)),
             Err(e) => self
                 .messages
                 .fail(format!("Editable previews not discarded: {e}")),
+        }
+    }
+
+    /// Asks before the thumbnail menu's Discard Editable Previews removes those
+    /// of offline photos. Cancel has the focus; Return, Escape and a click
+    /// outside cancel.
+    pub(in crate::app) fn discard_editable_previews_window(&mut self, ctx: &eframe::egui::Context) {
+        let Some(crate::app::Modal::DiscardEditablePreviews(asked)) = &self.modal else {
+            return;
+        };
+        // Asked of another catalog, its photos' ids name others here.
+        let current = self
+            .library
+            .as_ref()
+            .map(|l| l.session.catalog().location());
+        if current != Some(&asked.catalog) {
+            self.modal = None;
+            return;
+        }
+        let (title, line) = offline_question(asked.offline, asked.photos);
+        let choice = crate::app::ui::widgets::destructive_choice(
+            ctx,
+            "discard-editable-previews",
+            &title,
+            &[line],
+            "Cancel",
+            &["Discard"],
+        );
+        let Some(choice) = choice else {
+            return;
+        };
+        let Some(crate::app::Modal::DiscardEditablePreviews(asked)) = self.modal.take() else {
+            return;
+        };
+        if choice.is_some() {
+            self.discard_editable_previews_now(&asked.ids);
         }
     }
 
@@ -853,6 +934,40 @@ pub(in crate::app) fn queued_message(queued: Queued) -> String {
 }
 
 /// "Discarded the editable previews of 3 photos".
+/// A thumbnail menu's Discard Editable Previews waiting for the user's answer,
+/// as some of the photos whose editable previews it removes are offline.
+#[derive(Debug)]
+pub(in crate::app) struct OfflineDiscard {
+    /// The catalog it was asked of.
+    catalog: CatalogLocation,
+    /// The photos the menu was chosen for, as it would discard them.
+    ids: Vec<PhotoId>,
+    /// Their masters.
+    photos: usize,
+    /// The masters whose editable previews it would remove while offline.
+    offline: usize,
+}
+
+/// The masters of `ids`, a virtual copy's request being its master's.
+fn masters_of(library: &Library, ids: &[PhotoId]) -> BTreeSet<PhotoId> {
+    ids.iter()
+        .filter_map(|id| library.photo(*id))
+        .map(|p| p.master.unwrap_or(p.id))
+        .collect()
+}
+
+/// The question, and why it is asked, for discarding editable previews of
+/// `photos` photos, `offline` of them with their originals offline.
+fn offline_question(offline: usize, photos: usize) -> (String, String) {
+    let line = match (offline, photos) {
+        (1, 1) => "This photo is offline. Its editable preview can't be built again until its original is back.".to_string(),
+        (1, _) => "1 of these photos is offline. Its editable preview can't be built again until its original is back.".to_string(),
+        (n, p) if n == p => "These photos are offline. Their editable previews can't be built again until the originals are back.".to_string(),
+        (n, _) => format!("{n} of these photos are offline. Their editable previews can't be built again until the originals are back."),
+    };
+    ("Discard editable previews anyway?".into(), line)
+}
+
 pub(in crate::app) fn discarded_message(done: Discarded) -> String {
     match done.discarded {
         0 => "No editable previews to discard".into(),

@@ -80,8 +80,9 @@ pub(in crate::app) struct Preferences {
     stale: bool,
     /// Remove was clicked for Lensfun's profiles, waiting for the confirmation.
     lensfun_remove: bool,
-    /// Discard All Editable Previews was clicked, waiting for the confirmation.
-    editable_discard: bool,
+    /// Discard All Editable Previews was clicked, waiting for the confirmation:
+    /// how many of them are of photos whose originals were offline then.
+    editable_discard: Option<usize>,
     /// The status line when the window opened; only later messages are shown.
     status_at_open: String,
     /// Default Creator and Copyright for photos added from folders, as typed.
@@ -190,7 +191,7 @@ impl Editor {
             folders: catalog.and_then(|c| c.folders().ok().map(|f| f.len())),
             editable_previews: catalog.and_then(|c| c.editable_previews_size().ok()),
         };
-        self.preferences.editable_discard = false;
+        self.preferences.editable_discard = None;
         self.preferences.stale = self.activity.is_dialog();
         self.save_computer_name();
         self.preferences.locations = None;
@@ -209,6 +210,19 @@ impl Editor {
     #[cfg(test)]
     pub(in crate::app) fn shown_editable_previews_size(&self) -> Option<u64> {
         self.preferences.usage.editable_previews
+    }
+    /// Discard All Editable Previews… was clicked: asks, saying how many are of
+    /// photos whose originals are offline, counted once as it asks, as each is
+    /// a look at its original's file.
+    pub(in crate::app) fn ask_discard_all_editable_previews(&mut self) {
+        let offline = self.offline_editable_previews(None).map_or(0, |o| o.len());
+        self.preferences.editable_discard = Some(offline);
+    }
+    /// While Discard All Editable Previews asks: how many of them it said are of
+    /// offline photos.
+    #[cfg(test)]
+    pub(in crate::app) fn asked_discard_all_offline(&self) -> Option<usize> {
+        self.preferences.editable_discard
     }
     /// ⌘, (Ctrl+, elsewhere) opens Preferences, as in Lightroom.
     pub(in crate::app) fn preferences_shortcut(&mut self, ctx: &egui::Context) {
@@ -485,34 +499,35 @@ impl Editor {
         };
         form_row(ui, "Size", |ui| value(ui, &bytes(size)));
         let mut discard = false;
-        if self.preferences.editable_discard {
-            form_row(ui, "", |ui| {
-                hint(
-                    ui,
-                    "Discard every editable preview of this catalog? Photos whose originals are offline can't have them built again until the originals are back.",
-                );
-            });
+        let mut ask = false;
+        if let Some(offline) = self.preferences.editable_discard {
+            let question = match offline {
+                0 => "Discard every editable preview of this catalog? Photos whose originals are offline can't have them built again until the originals are back.".to_string(),
+                1 => "Discard every editable preview of this catalog? 1 is of a photo whose original is offline, and can't be built again until its original is back.".to_string(),
+                n => format!("Discard every editable preview of this catalog? {n} are of photos whose originals are offline, and can't be built again until the originals are back."),
+            };
+            form_row(ui, "", |ui| hint(ui, &question));
             form_row(ui, "", |ui| {
                 if ui.button("Discard All").clicked() {
                     discard = true;
-                    self.preferences.editable_discard = false;
+                    self.preferences.editable_discard = None;
                 }
                 if ui.button("Cancel").clicked() {
-                    self.preferences.editable_discard = false;
+                    self.preferences.editable_discard = None;
                 }
             });
         } else {
             form_row(ui, "", |ui| {
-                if ui
+                ask = ui
                     .add_enabled(
                         size > 0 || self.editable_builds.running(),
                         egui::Button::new("Discard All Editable Previews…"),
                     )
-                    .clicked()
-                {
-                    self.preferences.editable_discard = true;
-                }
+                    .clicked();
             });
+        }
+        if ask {
+            self.ask_discard_all_editable_previews();
         }
         form_row(ui, "", |ui| {
             hint(

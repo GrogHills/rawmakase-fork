@@ -4,6 +4,7 @@
 use super::*;
 use crate::app::testing::editor_with_catalog;
 use crate::camera_profiles::fitted;
+use eframe::egui;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
@@ -700,4 +701,138 @@ fn the_menu_builds_and_discards_the_selection_or_the_photo_clicked() {
     );
     assert!(recorded(&e, ids[2]).is_some());
     assert_eq!(files(&e).len(), 1);
+}
+
+/// Draws the Discard Editable Previews confirmation, with `events` (a window
+/// shown first is only sized, and paints from its second frame).
+fn draw_offline_discard(
+    e: &mut Editor,
+    events: Vec<egui::Event>,
+) -> Vec<egui::epaint::ClippedShape> {
+    let ctx = e.context.clone();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1200., 800.),
+        )),
+        events,
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(input, |ui| e.discard_editable_previews_window(ui.ctx()));
+    out.textures_delta.clear();
+    out.shapes
+}
+fn text_at(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<egui::Pos2> {
+    shapes.iter().find_map(|s| match &s.shape {
+        egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect().center()),
+        _ => None,
+    })
+}
+fn shown(shapes: &[egui::epaint::ClippedShape], part: &str) -> bool {
+    shapes.iter().any(|s| match &s.shape {
+        egui::Shape::Text(t) => t.galley.text().contains(part),
+        _ => false,
+    })
+}
+fn key(key: egui::Key, pressed: bool) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// The thumbnail menu's Discard Editable Previews asks first when an offline
+/// photo's would go, counting masters; Escape and Return cancel, Discard
+/// discards. A selection whose photos are all online discards at once.
+#[test]
+fn discarding_an_offline_photo_s_from_the_menu_asks_first() {
+    use crate::app::library::cell::PhotoAction;
+    let (_dir, mut e, ids) = editor(&["a.ARW", "b.ARW", "c.ARW"]);
+    let [a, b, c] = ["a.ARW", "b.ARW", "c.ARW"].map(|name| id_named(&e, &ids, name));
+    let copy = copy_of(&mut e, a);
+    e.build_editable_previews(&[a, b, c]).unwrap();
+    settle(&mut e);
+    let choose = |e: &mut Editor, id: PhotoId| {
+        let ctx = e.context.clone();
+        let library = e.library.as_mut().unwrap();
+        let photo = library.photo(id).unwrap().clone();
+        library.photo_action(&ctx, &photo, PhotoAction::DiscardEditablePreviews, true);
+        e.library_requests(&ctx);
+    };
+    // Online: at once.
+    choose(&mut e, c);
+    assert!(e.modal.is_none());
+    assert!(recorded(&e, c).is_none());
+    std::fs::remove_file(path_of(&e, a)).unwrap();
+    // A virtual copy's is its master's, offline: asked, nothing discarded yet.
+    choose(&mut e, copy);
+    assert!(matches!(
+        e.modal,
+        Some(crate::app::Modal::DiscardEditablePreviews(_))
+    ));
+    draw_offline_discard(&mut e, vec![]);
+    let shapes = draw_offline_discard(&mut e, vec![]);
+    assert!(shown(&shapes, "This photo is offline."));
+    draw_offline_discard(
+        &mut e,
+        vec![key(egui::Key::Escape, true), key(egui::Key::Escape, false)],
+    );
+    assert!(e.modal.is_none());
+    assert!(recorded(&e, a).is_some());
+    // The selection, a and b, from b's menu: 1 of 2 offline. Return is Cancel's.
+    let library = e.library.as_mut().unwrap();
+    library.select(Some(a));
+    library.select_range_to(b);
+    choose(&mut e, b);
+    draw_offline_discard(&mut e, vec![]);
+    let shapes = draw_offline_discard(&mut e, vec![]);
+    assert!(shown(&shapes, "1 of these photos is offline."));
+    draw_offline_discard(
+        &mut e,
+        vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)],
+    );
+    draw_offline_discard(&mut e, vec![]);
+    assert!(e.modal.is_none());
+    assert!(recorded(&e, a).is_some() && recorded(&e, b).is_some());
+    choose(&mut e, b);
+    draw_offline_discard(&mut e, vec![]);
+    let shapes = draw_offline_discard(&mut e, vec![]);
+    let at = text_at(&shapes, "Discard").expect("the Discard button");
+    let click = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    draw_offline_discard(&mut e, vec![egui::Event::PointerMoved(at), click(true)]);
+    draw_offline_discard(&mut e, vec![click(false)]);
+    assert!(e.modal.is_none());
+    assert!(recorded(&e, a).is_none() && recorded(&e, b).is_none());
+    assert!(
+        e.messages
+            .line()
+            .contains("Discarded the editable previews of 2 photos"),
+        "{}",
+        e.messages.line()
+    );
+    assert!(files(&e).is_empty());
+}
+
+/// Discard All Editable Previews… says how many are of offline photos.
+#[test]
+fn discard_all_says_how_many_are_of_offline_photos() {
+    let (_dir, mut e, ids) = editor(&["a.ARW", "b.ARW"]);
+    e.build_editable_previews(&ids).unwrap();
+    settle(&mut e);
+    e.open_preferences(crate::app::preferences::Tab::Catalog);
+    e.ask_discard_all_editable_previews();
+    assert_eq!(e.asked_discard_all_offline(), Some(0));
+    std::fs::remove_file(path_of(&e, ids[0])).unwrap();
+    e.open_preferences(crate::app::preferences::Tab::Catalog);
+    assert_eq!(e.asked_discard_all_offline(), None, "opening forgets it");
+    e.ask_discard_all_editable_previews();
+    assert_eq!(e.asked_discard_all_offline(), Some(1));
 }

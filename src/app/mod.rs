@@ -504,6 +504,9 @@ enum Modal {
     CatalogExported(Box<crate::app::catalog::export_catalog::Exported>),
     /// Photos waiting for the user to confirm Read Metadata from Files.
     ReadMetadata(Vec<PhotoId>),
+    /// Discard Editable Previews waiting for the user to confirm removing those
+    /// of offline photos.
+    DiscardEditablePreviews(library::preview_build::editable::OfflineDiscard),
     /// A folder change waiting for the user's answer.
     FolderQuestion(crate::app::catalog::folder_locations::FolderQuestion),
     /// Find on Disk's review, held while the user decides whether to discard

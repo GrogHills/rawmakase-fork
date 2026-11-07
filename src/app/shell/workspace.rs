@@ -302,6 +302,7 @@ impl Editor {
         self.folder_sync_window(&ctx);
         self.discard_for_find_window(&ctx);
         self.read_metadata_window(&ctx);
+        self.discard_editable_previews_window(&ctx);
         self.file_op_window(&ctx);
         self.shortcuts_window(&ctx);
         self.report_issue_window(&ctx);
