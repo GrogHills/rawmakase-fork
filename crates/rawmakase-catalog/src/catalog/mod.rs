@@ -27,6 +27,7 @@ mod descriptive;
 mod develop_history;
 mod edit_records;
 mod edit_rows;
+mod editable_previews;
 mod edits;
 mod export_catalog;
 pub mod file_ops;
@@ -41,9 +42,8 @@ pub mod locations;
 mod mask_assets;
 mod models;
 mod naming;
-// XMP metadata sidecars; `legacy_sidecar` is the old `*.rawmakase.json` edits.
-mod editable_previews;
 mod sequences;
+// XMP metadata sidecars; `legacy_sidecar` is the old `*.rawmakase.json` edits.
 mod sidecar;
 mod snapshots;
 mod stacks;
