@@ -413,3 +413,93 @@ fn an_exported_folder_found_elsewhere_since_is_not_removed() -> Result<()> {
     assert_eq!(s.catalog.photos()?.len(), 3);
     Ok(())
 }
+
+/// Writes and records a smart preview of `photo` in `catalog`, built from
+/// its file at `path`; returns its file name.
+fn smart_preview(catalog: &mut Catalog, photo: PhotoId, path: &std::path::Path) -> Result<String> {
+    let original = crate::storage::Identity::read(path)?;
+    let file = super::smart_preview_file_name(photo, &original);
+    let folder = catalog.smart_preview_folder();
+    std::fs::create_dir_all(&folder)?;
+    std::fs::write(folder.join(&file), file.as_bytes())?;
+    catalog.record_smart_preview(
+        photo,
+        &super::BuiltSmartPreview {
+            file: file.clone(),
+            format_version: 1,
+            original,
+            original_size: (6000, 4000),
+            size: (2560, 1707),
+        },
+    )?;
+    Ok(file)
+}
+
+#[test]
+fn an_export_carries_its_photos_smart_previews_and_no_others() -> Result<()> {
+    let mut s = shoots()?;
+    let photos = s.dir.join("photos");
+    let a1 = smart_preview(&mut s.catalog, s.a1, &photos.join("A/a1.ARW"))?;
+    let a2 = smart_preview(&mut s.catalog, s.a2, &photos.join("A/a2.ARW"))?;
+    let b1 = smart_preview(&mut s.catalog, s.b1, &photos.join("B/b1.ARW"))?;
+    // a2's file went missing: its row can't go with the export.
+    std::fs::remove_file(s.catalog.smart_preview_folder().join(&a2))?;
+    let destination = s.dir.join("out/Shoot A.rawmakase");
+
+    let export = s
+        .catalog
+        .export_catalog(&ExportScope::Folders(vec![s.a]), &destination)?;
+
+    assert_eq!(export.smart_previews, 1);
+    assert_eq!(export.missing_smart_previews, [s.a2]);
+    let out = Catalog::open(&destination)?;
+    let store = s.dir.join("out/Shoot A.rawmakase-smart-previews");
+    assert_eq!(out.smart_preview_folder(), store);
+    let found = out.smart_preview(s.a1)?.context("carried")?;
+    assert_eq!(found.path, store.join(&a1));
+    assert_eq!(std::fs::read(&found.path)?, a1.as_bytes());
+    assert_eq!(out.smart_preview(s.a2)?, None);
+    assert_eq!(out.smart_preview(s.b1)?, None);
+    let names: Vec<_> = std::fs::read_dir(&store)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(names, [std::ffi::OsString::from(&a1)]);
+    // This catalog keeps its own.
+    let own = s.catalog.smart_preview_folder();
+    assert!(own.join(&a1).is_file() && own.join(&b1).is_file());
+    assert!(s.catalog.smart_preview(s.a1)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn a_failed_export_leaves_no_smart_preview_behind() -> Result<()> {
+    let mut s = shoots()?;
+    let photos = s.dir.join("photos");
+    smart_preview(&mut s.catalog, s.a1, &photos.join("A/a1.ARW"))?;
+    let a2 = smart_preview(&mut s.catalog, s.a2, &photos.join("A/a2.ARW"))?;
+    let out = s.dir.join("out");
+    std::fs::create_dir_all(&out)?;
+    // A file of one's name is already in the folder the export would use:
+    // nothing replaces it, and what was copied before it goes again.
+    let store = out.join("a.rawmakase-smart-previews");
+    std::fs::create_dir(&store)?;
+    std::fs::write(store.join(&a2), b"someone else's")?;
+    assert!(
+        s.catalog
+            .export_catalog(&ExportScope::Folders(vec![s.a]), &out.join("a.rawmakase"))
+            .is_err()
+    );
+    assert!(!out.join("a.rawmakase").exists());
+    assert_eq!(std::fs::read(store.join(&a2))?, b"someone else's");
+    assert_eq!(std::fs::read_dir(&store)?.count(), 1);
+
+    // Refused before anything is copied.
+    std::fs::write(out.join("b.rawmakase"), b"mine")?;
+    assert!(
+        s.catalog
+            .export_catalog(&ExportScope::Folders(vec![s.a]), &out.join("b.rawmakase"))
+            .is_err()
+    );
+    assert!(!out.join("b.rawmakase-smart-previews").exists());
+    Ok(())
+}

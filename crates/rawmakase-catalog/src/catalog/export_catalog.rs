@@ -58,6 +58,11 @@ pub struct CatalogExport {
     /// For a folder exported, what to check before removing it from this
     /// catalog.
     pub removal: Option<ExportedFolders>,
+    /// Smart previews copied into the export's store folder with it.
+    pub smart_previews: usize,
+    /// Photos whose smart preview's file was gone from this catalog's store
+    /// folder: exported without one.
+    pub missing_smart_previews: Vec<PhotoId>,
 }
 
 /// Folders as they were exported: removing them from the catalog is refused
@@ -126,6 +131,15 @@ impl Catalog {
             .unwrap_or_else(|| "Exported".into());
         let mut copy = Catalog::open_as(working.as_path(), &self.computer)?;
         let mut export = copy.keep_only(scope, &collection)?;
+        // Before the export is published, so it never names a smart preview
+        // its folder lacks; removed again if it isn't.
+        let carried = carry_smart_previews(
+            &mut copy,
+            &self.smart_preview_folder(),
+            &super::smart_previews::folder(&destination.into()),
+        )?;
+        export.smart_previews = carried.written.len();
+        export.missing_smart_previews = carried.missing.clone();
         let kept: i64 = copy.db.read_one(sql!("SELECT count(*) FROM photos"), &[])?;
         drop(copy);
         // Opened again as anyone would open it, on this computer.
@@ -137,6 +151,7 @@ impl Catalog {
         drop(opened);
         crate::storage::rename_noclobber(&working, destination)
             .context("Could not save the exported catalog under its name")?;
+        carried.keep();
         export.path = destination.to_path_buf();
         Ok(export)
     }
@@ -243,6 +258,8 @@ impl Catalog {
             lens_profiles,
             kept_every_mask,
             removal,
+            smart_previews: 0,
+            missing_smart_previews: Vec::new(),
         })
     }
 
@@ -366,6 +383,84 @@ fn master_of(db: &impl Reads, photo: PhotoId) -> Result<PhotoId> {
 }
 
 /// The tables `schema.sql` makes.
+/// The smart preview files copied for an export. Deleted again when dropped,
+/// unless kept: they are copies the export made, never another's.
+struct Carried {
+    folder: PathBuf,
+    /// Whether the export made the folder.
+    made_folder: bool,
+    written: Vec<PathBuf>,
+    /// Photos whose file was gone, and whose rows were dropped.
+    missing: Vec<PhotoId>,
+}
+impl Carried {
+    /// The export was published: its files stay.
+    fn keep(mut self) {
+        self.written.clear();
+        self.made_folder = false;
+    }
+}
+impl Drop for Carried {
+    fn drop(&mut self) {
+        for file in &self.written {
+            let _ = std::fs::remove_file(file);
+        }
+        if self.made_folder {
+            // Only while empty: nothing but what the export wrote goes.
+            let _ = std::fs::remove_dir(&self.folder);
+        }
+    }
+}
+
+/// Copies the smart previews `copy`, an export being made, still records from
+/// `from` (this catalog's store folder) into `to` (the export's), each under
+/// its own name, replacing nothing. One whose file is gone loses its row.
+fn carry_smart_previews(copy: &mut Catalog, from: &Path, to: &Path) -> Result<Carried> {
+    let files = super::smart_previews::files(&copy.db)?;
+    let mut carried = Carried {
+        folder: to.to_path_buf(),
+        made_folder: false,
+        written: Vec::new(),
+        missing: Vec::new(),
+    };
+    for (photo, file) in files {
+        let mut source = match std::fs::File::open(from.join(&file)) {
+            Ok(source) => source,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                carried.missing.push(photo);
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context("Could not read a smart preview"));
+            }
+        };
+        if !carried.made_folder && !to.is_dir() {
+            std::fs::create_dir(to).context("Could not make the smart previews folder")?;
+            carried.made_folder = true;
+        }
+        let mut staged = tempfile::NamedTempFile::new_in(to)?;
+        std::io::copy(&mut source, &mut staged)?;
+        staged.as_file().sync_all()?;
+        let path = to.join(&file);
+        crate::storage::persist_noclobber(staged, &path).map_err(|e| {
+            anyhow::Error::from(e.error).context(format!(
+                "A smart preview is already at {}; choose another name",
+                path.display()
+            ))
+        })?;
+        carried.written.push(path);
+    }
+    if !carried.missing.is_empty() {
+        copy.db.write(|w| {
+            for photo in &carried.missing {
+                w.execute(sql!("DELETE FROM smart_previews WHERE photo=?"), &[photo])?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(carried)
+}
+
 fn known_tables() -> BTreeSet<&'static str> {
     include_str!("schema.sql")
         .lines()

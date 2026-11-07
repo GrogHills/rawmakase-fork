@@ -658,6 +658,8 @@ mod rename_tests;
 #[cfg(test)]
 mod rules_tests;
 #[cfg(test)]
+mod smart_preview_tests;
+#[cfg(test)]
 mod stack_tests;
 #[cfg(test)]
 mod tests;
