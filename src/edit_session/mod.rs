@@ -125,7 +125,7 @@ impl EditSession {
         self.history.finish_gesture(&self.recipe);
     }
     /// Takes back a gesture still held, as no History step, returning the
-    /// settings to where it began; returns whether one was held. For settings
+    /// settings to where it began; returns whether that took back a change. For settings
     /// about to be replaced by an edit written meanwhile (a Sync of the open
     /// photo), which the gesture, begun on the old settings, must not be saved
     /// over. Whether anything is left to save is the caller's to set.
@@ -133,8 +133,9 @@ impl EditSession {
         let Some(before) = self.history.drop_gesture() else {
             return false;
         };
+        let changed = before != self.recipe;
         self.set_whole(|s| s.recipe = before);
-        true
+        changed
     }
     /// Ends a gesture still held as the settings were when `frame` began, as one
     /// History step to be saved: what changes later in the frame is a step of
@@ -390,6 +391,16 @@ mod tests {
         // Nothing held: nothing to take back.
         assert!(!session.discard_gesture());
         assert_eq!(session.recipe().exposure, 0.3);
+        // A drag held back where it began took back no change.
+        let frame = session.begin();
+        session.recipe_mut().exposure = 1.;
+        session.finish(frame, Gesture::Held);
+        let frame = session.begin();
+        session.recipe_mut().exposure = 0.3;
+        session.finish(frame, Gesture::Held);
+        assert!(session.history().in_gesture());
+        assert!(!session.discard_gesture());
+        assert!(!session.history().in_gesture());
     }
 
     #[test]

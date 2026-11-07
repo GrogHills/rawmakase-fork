@@ -718,10 +718,14 @@ fn the_loupe_asks_again_after_passing_through_an_online_photo() {
 fn a_drag_held_when_a_synced_photo_can_t_be_opened_again_is_not_saved() {
     let mut fx = fixture(&["a.dng"]);
     let a = fx.id("a.dng");
-    fx.build(a, false);
+    let original = fx.build(a, false);
+    // Open from its editable preview, so a save would go through against the
+    // identity it recorded.
+    fx.take_offline(a);
     fx.open(a);
-    // A Sync running wrote A's edit; meanwhile a drag on it is held, its drive
-    // went away and its editable preview can't be used (deleted).
+    assert!(fx.e.document.opened_from_preview());
+    // A Sync running wrote A's edit; meanwhile a drag on it is held, and its
+    // editable preview can't be used any more (deleted).
     let path = fx.path(a);
     let synced = crate::model::recipe::Recipe {
         exposure: 0.5,
@@ -731,8 +735,8 @@ fn a_drag_held_when_a_synced_photo_can_t_be_opened_again_is_not_saved() {
         .unwrap()
         .save_edit(
             a,
-            &path,
-            &Identity::read(&path).unwrap(),
+            crate::edits::Original::recorded(&path, &original),
+            &original,
             &synced,
             &Default::default(),
             crate::catalog::HistoryUpdate::Keep,
@@ -743,7 +747,6 @@ fn a_drag_held_when_a_synced_photo_can_t_be_opened_again_is_not_saved() {
     fx.e.document
         .edit
         .finish(frame, crate::edit_session::Gesture::Held);
-    fx.take_offline(a);
     let file = catalog(&fx.e).editable_preview(a).unwrap().unwrap().path;
     std::fs::remove_file(file).unwrap();
     assert!(fx.e.reopen_synced(&[a]), "the drag was taken back");
