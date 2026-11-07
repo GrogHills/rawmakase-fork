@@ -7,9 +7,10 @@
 //! Renders are compared in CIEDE2000 over every pixel. "format" compares the
 //! reduced image before and after the file, so it is the curve's loss alone; the
 //! recipes compare renders of the original and of the smart preview, per pixel and
-//! averaged over 16-pixel blocks, both with the camera's crop taken off
-//! ([`uncropped`]). They also differ by what Stage 1 of the plan fixes: detail
-//! radii scaled to the image in memory.
+//! averaged over 16-pixel blocks, both with the camera's default crop taken off
+//! ([`uncropped`]); an aspect crop the camera recorded reaches both as the recipe's
+//! crop. They also differ by what Stage 1 of the plan fixes: detail radii scaled to
+//! the image in memory.
 use super::*;
 use crate::color_difference::{delta_e2000, lab};
 use crate::develop;
@@ -39,9 +40,9 @@ fn blocks(im: &rawmakase_model::rendered::Rendered) -> (Vec<[f32; 3]>, u32, u32)
 }
 
 /// `im` with the camera's default and aspect crops taken off, its recovered image
-/// too. Comparisons render both images so: until Develop opens a smart preview with
-/// its original's frame (Stage 5 of the plan), the renderer applies the crop, in the
-/// original's pixels, to the reduced image, and the frames would differ.
+/// too. Comparisons render both images so, at the same size: a smart preview is
+/// 2560 pixels before the crop, so its cropped frame is a few pixels smaller, and a
+/// render never enlarges.
 fn uncropped(im: &CameraImage) -> CameraImage {
     let strip = |im: &CameraImage| CameraImage {
         recovered: Default::default(),
