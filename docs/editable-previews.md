@@ -100,9 +100,10 @@ Measured 2026-11-07 (codec 2, `editable_preview::depths`, the same 25 RAWs):
 dithered 12-bit files average 9.2 MB (median 8.8, largest 14.6). On the
 noise-free gradient, under every edit measured, the largest contour step is
 0.7–1.3 times the lossless preview's (undithered 12-bit: 1.6–9 times), and each
-excess over the lossless step is within what the grain left after averaging
-makes by itself (at most 21 levels of 16-bit output over the lossless step,
-against a noise floor of 52), so no contour is left; the cost is fine grain, at
+excess over the lossless step is within what that edit's grain left after
+averaging makes by itself (the largest, under Saturation and Vibrance +100, 26
+levels of 16-bit output over the lossless step against that edit's noise floor
+of 57), so no contour is left; the cost is fine grain, at
 most about 0.6 of an 8-bit level. Against the lossless
 preview, 16 px blocks differ by at most 0.32 ΔE2000 (p99, worst photo) and pixels
 by 0.05–0.31 on average; per-pixel p99 stays under 1 for defaults, ±EV and

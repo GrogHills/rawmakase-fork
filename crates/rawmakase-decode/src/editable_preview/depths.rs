@@ -231,8 +231,10 @@ fn gradient(precision: Precision) -> EditablePreview {
 /// changes only along x, so each column is averaged over every row: that keeps a
 /// contour step whole and averages the dither's noise away. Reported, on the
 /// 16-bit output scale: the largest step between neighbouring columns of that
-/// profile, as a multiple of the lossless preview's (contours), and the noise
-/// left about the profile (standard deviation, any channel).
+/// profile, as a multiple of the lossless preview's (contours); the noise left
+/// about the profile (standard deviation, any channel); and the largest step that
+/// noise alone makes in the profile. A step's excess over the lossless one within
+/// that floor is noise, not a contour.
 #[test]
 #[ignore = "a measurement, not a check"]
 fn banding_on_a_smooth_gradient() {
