@@ -402,6 +402,12 @@ impl Editor {
             generation: self.document.load_id(),
             revision: self.automation.revision,
             loaded: develop && self.document.full().is_some() && !self.document.loading(),
+            opened_from: (develop && self.document.path.is_some()).then(|| {
+                match self.document.from {
+                    crate::app::worker::OpenedFrom::Original => "original",
+                    crate::app::worker::OpenedFrom::EditablePreview(_) => "editable_preview",
+                }
+            }),
             open_failed: self.open_failed(),
             open_error: self
                 .open_failed()
@@ -1202,7 +1208,7 @@ impl Editor {
             .photo(id)
             .cloned()
             .ok_or_else(|| Error::new("not_found", "No photo has this ID"))?;
-        if let Some(refusal) = crate::app::library::develop_refusal(&photo, photo.path.is_file()) {
+        if let Err(refusal) = library.develop_from(&photo, photo.path.is_file()) {
             return Err(Error::new("not_editable", refusal.detail()));
         }
         if !self.flush() {

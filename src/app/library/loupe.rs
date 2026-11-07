@@ -335,8 +335,11 @@ impl Library {
     /// one it would develop (see [`Self::loupe_develops`]).
     pub(in crate::app) fn loupe_offline_developed(&self) -> Option<PhotoId> {
         let photo = self.selection.active.and_then(|id| self.photo(id))?;
-        (self.loupe.open && !self.is_available(&photo.path) && self.develops(photo))
-            .then_some(photo.id)
+        (self.loupe.open
+            && !self.is_available(&photo.path)
+            && !self.has_editable_preview(photo.id)
+            && self.develops(photo))
+        .then_some(photo.id)
     }
     /// The identity of the stored preview the Loupe shows for an offline photo it
     /// would develop.
@@ -347,13 +350,14 @@ impl Library {
         self.loupe_stored.as_ref()
     }
     /// The photo the Loupe shows through Develop's pipeline: the active photo,
-    /// when it is online and a RAW or an edited JPEG, TIFF or PNG. An unedited
-    /// one, which its defaults reproduce, and offline photos are shown by the
+    /// when it is online and a RAW or an edited JPEG, TIFF or PNG, or offline
+    /// with an editable preview, which it is developed from. An unedited one,
+    /// which its defaults reproduce, and other offline photos are shown by the
     /// Loupe's own, quicker preview instead.
     pub(crate) fn loupe_develops(&self) -> Option<PhotoId> {
         let photo = self.selection.active.and_then(|id| self.photo(id))?;
-        (self.loupe.open && self.is_available(&photo.path) && self.develops(photo))
-            .then_some(photo.id)
+        let source = self.is_available(&photo.path) || self.has_editable_preview(photo.id);
+        (self.loupe.open && source && self.develops(photo)).then_some(photo.id)
     }
     /// Whether `photo` is shown developed: a RAW always, a JPEG, TIFF or PNG once
     /// it has an edit of its own.

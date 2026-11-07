@@ -97,6 +97,18 @@ impl Editor {
         if another && let Some(settings) = self.current_settings() {
             self.previous_settings = Some(settings);
         }
+        // An offline photo opens from its editable preview, when it has a usable
+        // one; otherwise from its file, whose load says why it can't be read.
+        let from = match photo {
+            Some(id) if !path.is_file() => self
+                .library
+                .as_ref()
+                .and_then(|l| l.photo(id).map(|p| (l, p)))
+                .filter(|(_, p)| p.path == path)
+                .and_then(|(l, p)| l.develop_from(p, false).ok())
+                .unwrap_or_default(),
+            _ => crate::app::worker::OpenedFrom::Original,
+        };
         let (id, cancel) = self.document.open(photo);
         // The reference photo stays on screen from photo to photo; Before goes.
         let reference = self
@@ -115,7 +127,9 @@ impl Editor {
         // What failed for the photo left says nothing of this one.
         self.messages.settle(Topic::Load);
         self.messages.settle(Topic::Render);
-        let text: String = if crate::storage::is_raw(&path) {
+        let text: String = if from.is_final_reduced() {
+            "Reading editable preview…"
+        } else if crate::storage::is_raw(&path) {
             "Reading RAW…"
         } else {
             "Reading photo…"
@@ -125,6 +139,7 @@ impl Editor {
         self.loader.submit(LoadJob {
             id,
             path,
+            from,
             cancel,
             prefetch,
             defaults: self.raw_defaults.clone(),
@@ -204,7 +219,7 @@ impl Editor {
                 .and_then(|source| {
                     l.session.save_edit(
                         id,
-                        path,
+                        self.document.original(path),
                         source,
                         self.document.edit.recipe(),
                         &self.document.export,
@@ -281,6 +296,7 @@ impl Editor {
             photo,
             raw,
             source,
+            from_editable_preview: self.document.from_editable_preview(),
             recipe: self.document.edit.recipe().clone(),
             export: self.document.export.clone(),
             history: self
@@ -615,7 +631,8 @@ impl Editor {
         }
     }
     /// The photo `step` photos from `id` in the filmstrip that Develop can
-    /// open, passing over the ones it can't (offline, HDR, animated, CMYK):
+    /// open, passing over the ones it can't (offline without a usable editable
+    /// preview, HDR, animated, CMYK):
     /// stopping on them would leave every photo beyond out of reach of the
     /// arrow keys. With none in that direction, the first one, so opening it
     /// says why it can't be.
@@ -625,9 +642,7 @@ impl Editor {
         let mut at = first;
         loop {
             let photo = library.photo(at)?;
-            if at == id
-                || crate::app::library::develop_refusal(photo, photo.path.is_file()).is_none()
-            {
+            if at == id || library.develop_from(photo, photo.path.is_file()).is_ok() {
                 return Some(at);
             }
             match library.navigate(at, step) {
@@ -668,3 +683,7 @@ pub(in crate::app) struct RenderEdges {
 #[cfg(test)]
 #[path = "workflow_editor_tests.rs"]
 mod editor_tests;
+
+#[cfg(test)]
+#[path = "editable_preview_editor_tests.rs"]
+mod editable_preview_tests;
