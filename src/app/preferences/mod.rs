@@ -67,6 +67,8 @@ struct Usage {
     preview_kinds: Option<crate::catalog::preview_cache::PreviewUsage>,
     catalog: Option<u64>,
     folders: Option<usize>,
+    /// What the open catalog's editable previews take, as recorded.
+    editable_previews: Option<u64>,
 }
 
 #[derive(Default)]
@@ -78,6 +80,8 @@ pub(in crate::app) struct Preferences {
     stale: bool,
     /// Remove was clicked for Lensfun's profiles, waiting for the confirmation.
     lensfun_remove: bool,
+    /// Discard All Editable Previews was clicked, waiting for the confirmation.
+    editable_discard: bool,
     /// The status line when the window opened; only later messages are shown.
     status_at_open: String,
     /// Default Creator and Copyright for photos added from folders, as typed.
@@ -184,10 +188,27 @@ impl Editor {
                 std::fs::metadata(path).ok().map(|m| m.len())
             }),
             folders: catalog.and_then(|c| c.folders().ok().map(|f| f.len())),
+            editable_previews: catalog.and_then(|c| c.editable_previews_size().ok()),
         };
+        self.preferences.editable_discard = false;
         self.preferences.stale = self.activity.is_dialog();
         self.save_computer_name();
         self.preferences.locations = None;
+    }
+    /// Editable previews were built or discarded: Preferences shows what they
+    /// take now, if it is open.
+    pub(in crate::app) fn editable_previews_changed(&mut self) {
+        if self.preferences.open {
+            self.preferences.usage.editable_previews = self
+                .library
+                .as_ref()
+                .and_then(|l| l.session.catalog().editable_previews_size().ok());
+        }
+    }
+    /// What Preferences › Catalog shows the editable previews take.
+    #[cfg(test)]
+    pub(in crate::app) fn shown_editable_previews_size(&self) -> Option<u64> {
+        self.preferences.usage.editable_previews
     }
     /// ⌘, (Ctrl+, elsewhere) opens Preferences, as in Lightroom.
     pub(in crate::app) fn preferences_shortcut(&mut self, ctx: &egui::Context) {
@@ -449,6 +470,68 @@ impl Editor {
         });
     }
 
+    /// Preferences › Catalog › Editable previews: what they take, and Discard All
+    /// Editable Previews, confirmed first, since none can be built again while its
+    /// original is offline.
+    fn editable_previews_block(&mut self, ui: &mut egui::Ui) {
+        group(ui, "Editable previews");
+        let Some(size) = self
+            .library
+            .as_ref()
+            .and(self.preferences.usage.editable_previews)
+        else {
+            form_row(ui, "Size", |ui| value(ui, "–"));
+            return;
+        };
+        form_row(ui, "Size", |ui| value(ui, &bytes(size)));
+        let mut discard = false;
+        if self.preferences.editable_discard {
+            form_row(ui, "", |ui| {
+                hint(
+                    ui,
+                    "Discard every editable preview of this catalog? Photos whose originals are offline can't have them built again until the originals are back.",
+                );
+            });
+            form_row(ui, "", |ui| {
+                if ui.button("Discard All").clicked() {
+                    discard = true;
+                    self.preferences.editable_discard = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.preferences.editable_discard = false;
+                }
+            });
+        } else {
+            form_row(ui, "", |ui| {
+                if ui
+                    .add_enabled(
+                        size > 0 || self.editable_builds.running(),
+                        egui::Button::new("Discard All Editable Previews…"),
+                    )
+                    .clicked()
+                {
+                    self.preferences.editable_discard = true;
+                }
+            });
+        }
+        form_row(ui, "", |ui| {
+            hint(
+                ui,
+                "Build them from a photo's menu, while its original is online: a smaller copy, about 16 MB, kept beside the catalog for editing the photo while its original is offline.",
+            );
+        });
+        if discard {
+            match self.discard_editable_previews(None) {
+                Ok(done) => self
+                    .messages
+                    .done(crate::app::library::preview_build::editable::discarded_message(done)),
+                Err(e) => self
+                    .messages
+                    .fail(format!("Editable previews not discarded: {e}")),
+            }
+        }
+    }
+
     fn catalog_page(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let usage = &self.preferences.usage;
@@ -596,6 +679,8 @@ impl Editor {
                 },
             });
         }
+        gap(ui);
+        self.editable_previews_block(ui);
         gap(ui);
         group(ui, "Decoded images");
         let mut cache_size = (self.decode_cache.limit() >> 30) as u32;

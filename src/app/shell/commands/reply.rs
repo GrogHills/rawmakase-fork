@@ -33,6 +33,8 @@ pub(in crate::app) struct State {
     pub exporting: bool,
     /// Previews being built: how many are done of how many queued.
     pub building_previews: Option<BuildProgress>,
+    /// Editable previews being built: how many are done of how many queued.
+    pub building_editable_previews: Option<BuildProgress>,
     pub auto_running: bool,
     pub treatment_pending: bool,
     pub save_state: &'static str,
@@ -93,10 +95,17 @@ pub(in crate::app) enum Outcome {
         saved: bool,
     },
     Output(OutputState),
-    /// Previews queued by `build_previews`; queueing is not building.
+    /// Previews queued by `build_previews` or `build_editable_previews`;
+    /// queueing is not building.
     Previews {
         queued: usize,
         skipped: usize,
+    },
+    /// What `discard_editable_previews` did: the photos (masters) whose
+    /// editable previews went, and the builds of them it stopped.
+    EditablePreviewsDiscarded {
+        discarded: usize,
+        stopped: usize,
     },
 }
 #[derive(Debug, Serialize)]

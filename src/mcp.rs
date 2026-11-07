@@ -433,6 +433,18 @@ impl Server {
         self.send(Request::BuildPreviews { kind }, None).await
     }
     #[tool(
+        description = "Build editable previews of the selected photos (the Library selection, or in Develop the Filmstrip's) in the background: a smaller copy of each RAW (2560 pixels, about 16 MB), kept beside the catalog, for editing the photo while its original is offline in a later release. A virtual copy's is its master's. Returns how many were queued and skipped (offline or not RAW); a photo whose editable preview is of its original as it is costs nothing. Queueing is not completion: get_state's building_editable_previews shows progress."
+    )]
+    async fn build_editable_previews(&self) -> CallToolResult {
+        self.send(Request::BuildEditablePreviews, None).await
+    }
+    #[tool(
+        description = "Discard the editable previews of the selected photos (their masters', for virtual copies), stopping their builds. They can't be built again while an original is offline. Returns how many photos' editable previews were discarded and how many builds were stopped."
+    )]
+    async fn discard_editable_previews(&self) -> CallToolResult {
+        self.send(Request::DiscardEditablePreviews, None).await
+    }
+    #[tool(
         description = "Save the current Develop edit to its catalog. Success confirms persistence; protected edits return an error."
     )]
     async fn save_photo(&self, Parameters(p): Parameters<Guarded>) -> CallToolResult {

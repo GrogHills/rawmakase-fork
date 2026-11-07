@@ -223,6 +223,13 @@ pub enum Request {
         #[serde(default)]
         kind: PreviewKind,
     },
+    /// Queues editable previews of the selected photos (their masters', for
+    /// virtual copies), built in the background; the reply says how many were
+    /// queued and skipped, and `state` how far they have got.
+    BuildEditablePreviews,
+    /// Discards the selected photos' editable previews and stops their builds;
+    /// the reply says how many photos' went.
+    DiscardEditablePreviews,
     /// An output job's status.
     Job {
         /// The job's id, from the reply that started it.
@@ -738,5 +745,13 @@ mod tests {
             }
         );
         assert!(parse(json!({"cmd":"build_previews","kind":"huge"})).is_err());
+        assert_eq!(
+            parse(json!({"cmd":"build_editable_previews"})).unwrap(),
+            Request::BuildEditablePreviews
+        );
+        assert_eq!(
+            parse(json!({"cmd":"discard_editable_previews"})).unwrap(),
+            Request::DiscardEditablePreviews
+        );
     }
 }
