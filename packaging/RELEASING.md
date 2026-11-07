@@ -296,20 +296,24 @@ executable and every bundled library against that baseline.
 The Test build workflow (`.github/workflows/test-build.yml`, in this fork only)
 builds unsigned apps from any branch, tag or commit, so a change can be tried
 without compiling it. It never signs, publishes, tags or uses secrets. Run it
-from **Actions → Test build → Run workflow**, enter the ref (default `main`),
-and when the run finishes download from the run's **Artifacts**:
+from **Actions → Test build → Run workflow**, enter a branch, tag or full
+commit SHA (default `main`), and when the run finishes download from the run's
+**Artifacts**. Each download is a zip; the macOS and Linux ones hold a second
+archive to extract:
 
-- `rawmakase-test-<sha>-macos-arm64`: `RAWmakase Test.app`, for Apple Silicon.
+- `rawmakase-test-<sha>-macos-arm64`: a zip of `RAWmakase Test.app`, for Apple
+  Silicon.
 - `rawmakase-test-<sha>-linux-x86_64`: the portable tarball. Extract it and run
-  `./usr/bin/rawmakase`.
-- `rawmakase-test-<sha>-windows-x86_64`: the portable folder. Unzip it and run
-  `rawmakase.exe`.
+  `./usr/bin/rawmakase` (the tarball keeps its permissions).
+- `rawmakase-test-<sha>-windows-x86_64`: the portable folder itself. Unzip it
+  and run `rawmakase.exe`.
 
-Each includes ONNX Runtime, so AI masks and AI Denoise work. `<sha>` is the
-commit built; the system report under **Report an Issue…** (the Help menu on
-macOS) names the full commit. The artifacts are kept for 14 days.
+Each includes ONNX Runtime, so AI masks and AI Denoise work once their models
+are downloaded on first use, as in a release. `<sha>` is the commit built; the
+system report under **Report an Issue…** (the Help menu on macOS, Preferences
+elsewhere) names the full commit. The artifacts are kept for 14 days.
 
-The builds are unsigned. On macOS, unzip the app and clear the quarantine flag
+The builds are unsigned. On macOS, unzip the inner zip and clear the quarantine flag
 with `xattr -dr com.apple.quarantine "RAWmakase Test.app"`. Without that,
 macOS refuses to open it; since macOS 15, right-click → **Open** no longer
 gets past this, so open it once, then choose **Open Anyway** under **System
@@ -323,4 +327,5 @@ release only shows a notice that links to its page. A test build shares
 settings, presets and previews with an installed RAWmakase, and opening a
 catalog can upgrade its format so that older releases refuse it. Try test
 builds on a copy of a catalog, and set `RAWMAKASE_DATA_DIR` to a folder of
-their own to keep their settings apart.
+their own to keep their settings apart (downloaded models and the crash log
+stay shared).

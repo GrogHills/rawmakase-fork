@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch, tag or commit to build
+        description: Branch, tag or full 40-character commit SHA to build
         type: string
         default: main
   # Only so a change to this file proves itself in its pull request.
@@ -180,8 +180,8 @@ jobs:
           $reported = (& dist\windows\rawmakase.exe --version | Out-String).Trim()
           if ($reported -notlike 'rawmakase *') { throw "rawmakase.exe --version printed '$reported'" }
           $reported
-      # The artifact's own zip is the portable archive: unpacked, it is the
-      # folder the release's zip holds.
+      # The artifact's own zip is the portable archive. It holds the files
+      # the release zip's folder holds, at its root rather than in a folder.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rawmakase-test-${{ env.SHORT_SHA }}-windows-x86_64
