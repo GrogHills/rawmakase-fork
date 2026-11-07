@@ -57,9 +57,9 @@ pub(super) const PHOTO_TABLES: [(&str, Sql, Sql); 18] = [
         sql!("SELECT photo, * FROM photo_checksums"),
     ),
     (
-        "smart_previews",
-        sql!("SELECT * FROM smart_previews WHERE photo=?"),
-        sql!("SELECT photo, * FROM smart_previews"),
+        "editable_previews",
+        sql!("SELECT * FROM editable_previews WHERE photo=?"),
+        sql!("SELECT photo, * FROM editable_previews"),
     ),
     (
         "photo_sequences",
@@ -196,7 +196,7 @@ fn combine(mut members: Vec<(PhotoId, [u8; 32])>) -> FamilyDigest {
 
 /// The tables background reads write (checksums, photo info, sequences, the
 /// EXIF capture time of import facts), which [`user_state`] leaves out so a
-/// queued read can't change it. Smart previews too: a build or discard
+/// queued read can't change it. Editable previews too: a build or discard
 /// between planning a file operation and finishing it changes nothing the
 /// operation acts on (removing a photo removes whatever row it has then),
 /// and [`ExportedFolders`](crate::catalog::ExportedFolders) checks them on
@@ -206,7 +206,7 @@ pub(in crate::catalog) const BACKGROUND_TABLES: [&str; 5] = [
     "photo_info",
     "photo_sequences",
     "photo_import_facts",
-    "smart_previews",
+    "editable_previews",
 ];
 
 /// The `photos` columns [`user_state`] covers: all but where the photo is

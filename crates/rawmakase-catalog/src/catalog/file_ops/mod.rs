@@ -638,6 +638,8 @@ mod batch_tests;
 #[cfg(test)]
 mod copy_tests;
 #[cfg(test)]
+mod editable_preview_tests;
+#[cfg(test)]
 mod folder_tests;
 #[cfg(test)]
 mod journal_tests;
@@ -657,8 +659,6 @@ mod recover_tests;
 mod rename_tests;
 #[cfg(test)]
 mod rules_tests;
-#[cfg(test)]
-mod smart_preview_tests;
 #[cfg(test)]
 mod stack_tests;
 #[cfg(test)]

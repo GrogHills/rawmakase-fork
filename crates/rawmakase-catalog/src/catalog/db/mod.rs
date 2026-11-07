@@ -328,7 +328,7 @@ impl Db {
 /// Deletes the files a committed write discarded. They are RAWmakase's own
 /// derived files, never a user's (see [`Write::delete_after_commit`]). One
 /// that can't be deleted is left: no row names it any more, and
-/// [`Catalog::smart_preview_orphans`](super::Catalog::smart_preview_orphans)
+/// [`Catalog::editable_preview_orphans`](super::Catalog::editable_preview_orphans)
 /// finds it again.
 fn delete_discarded(files: Vec<std::path::PathBuf>) {
     for file in files {
@@ -512,7 +512,7 @@ impl Write<'_> {
     /// Deletes `file` once this transaction commits, and never if it rolls
     /// back, so no committed row names a file that is gone. Only for
     /// RAWmakase's own derived files, which the rows being written stop
-    /// naming (a smart preview): never a user's file, which only
+    /// naming (an editable preview): never a user's file, which only
     /// `catalog::file_ops` moves or puts in the Trash.
     pub(in crate::catalog) fn delete_after_commit(&mut self, file: std::path::PathBuf) {
         self.discarded.push(file);

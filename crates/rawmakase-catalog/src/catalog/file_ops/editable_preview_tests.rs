@@ -1,25 +1,25 @@
-//! A photo's smart preview leaves with its rows, by Remove from Catalog or
+//! A photo's editable preview leaves with its rows, by Remove from Catalog or
 //! Move to Trash, in the same transaction; its file is deleted only after
 //! that commits. Moves and renames leave it as it is.
 use super::tests::*;
 use super::*;
-use crate::catalog::{BuiltSmartPreview, smart_preview_file_name};
+use crate::catalog::{BuiltEditablePreview, editable_preview_file_name};
 use crate::storage::Identity;
 use anyhow::Result;
 use std::path::PathBuf;
 
-/// Records a smart preview of `photo`, whose file is `name` below the root.
+/// Records an editable preview of `photo`, whose file is `name` below the root.
 fn record(fx: &mut Fx, photo: PhotoId, name: &str) -> PathBuf {
     let original = Identity::read(&fx.root.join(name)).unwrap();
-    let file = smart_preview_file_name(photo, &original);
-    let folder = fx.cat.smart_preview_folder();
+    let file = editable_preview_file_name(photo, &original);
+    let folder = fx.cat.editable_preview_folder();
     std::fs::create_dir_all(&folder).unwrap();
-    std::fs::write(folder.join(&file), b"smart preview").unwrap();
+    std::fs::write(folder.join(&file), b"editable preview").unwrap();
     fx.cat
-        .record_smart_preview(
+        .record_editable_preview(
             photo,
             &fx.root.join(name),
-            &BuiltSmartPreview {
+            &BuiltEditablePreview {
                 file: file.clone(),
                 format_version: 1,
                 original,
@@ -32,7 +32,7 @@ fn record(fx: &mut Fx, photo: PhotoId, name: &str) -> PathBuf {
 }
 
 #[test]
-fn remove_from_catalog_removes_the_smart_preview() -> Result<()> {
+fn remove_from_catalog_removes_the_editable_preview() -> Result<()> {
     let mut fx = fixture(&["a.NEF", "b.NEF"]);
     let (a, b) = (fx.photo("a.NEF"), fx.photo("b.NEF"));
     let (pa, pb) = (record(&mut fx, a, "a.NEF"), record(&mut fx, b, "b.NEF"));
@@ -42,15 +42,15 @@ fn remove_from_catalog_removes_the_smart_preview() -> Result<()> {
         &Faulty::default(),
     );
     assert_eq!(results(&outcome), [ItemResult::Removed]);
-    assert_eq!(fx.cat.smart_preview(a)?, None);
+    assert_eq!(fx.cat.editable_preview(a)?, None);
     assert!(!pa.exists());
-    assert!(fx.cat.smart_preview(b)?.is_some() && pb.is_file());
+    assert!(fx.cat.editable_preview(b)?.is_some() && pb.is_file());
     assert!(fx.root.join("a.NEF").is_file(), "the original stays");
     Ok(())
 }
 
 #[test]
-fn move_to_trash_removes_the_smart_preview_after_the_rows_go() -> Result<()> {
+fn move_to_trash_removes_the_editable_preview_after_the_rows_go() -> Result<()> {
     let mut fx = fixture(&["a.NEF", "b.NEF"]);
     let (a, b) = (fx.photo("a.NEF"), fx.photo("b.NEF"));
     let copy = fx.cat.create_virtual_copy(a)?;
@@ -62,20 +62,20 @@ fn move_to_trash_removes_the_smart_preview_after_the_rows_go() -> Result<()> {
         &Faulty::default(),
     );
     assert_eq!(results(&outcome), [ItemResult::Trashed]);
-    assert_eq!(fx.cat.smart_preview(a)?, None);
-    assert_eq!(fx.cat.smart_preview(copy)?, None);
+    assert_eq!(fx.cat.editable_preview(a)?, None);
+    assert_eq!(fx.cat.editable_preview(copy)?, None);
     assert!(!pa.exists());
-    assert!(fx.cat.smart_preview(b)?.is_some() && pb.is_file());
+    assert!(fx.cat.editable_preview(b)?.is_some() && pb.is_file());
     Ok(())
 }
 
 #[test]
-fn a_trash_whose_rows_could_not_go_keeps_the_smart_preview_until_they_do() -> Result<()> {
+fn a_trash_whose_rows_could_not_go_keeps_the_editable_preview_until_they_do() -> Result<()> {
     let mut fx = fixture(&["a.NEF"]);
     let a = fx.photo("a.NEF");
     let pa = record(&mut fx, a, "a.NEF");
     let trash = FakeTrash::new(&fx);
-    fx.fail_journal("BEFORE DELETE ON smart_previews");
+    fx.fail_journal("BEFORE DELETE ON editable_previews");
     let outcome = fx.run(
         FileOp::TrashPhotos { photos: vec![a] },
         &trash,
@@ -85,19 +85,19 @@ fn a_trash_whose_rows_could_not_go_keeps_the_smart_preview_until_they_do() -> Re
     // The file went to the Trash, but the rows are still there, and so is
     // what they name.
     assert!(fx.rows().contains_key(&a));
-    assert!(fx.cat.smart_preview(a)?.is_some());
+    assert!(fx.cat.editable_preview(a)?.is_some());
     assert!(pa.is_file());
     // Finished on the next start.
     fx.reopen();
     fx.recover_with(&Faulty::default(), &trash);
     assert!(!fx.rows().contains_key(&a));
-    assert_eq!(fx.cat.smart_preview(a)?, None);
+    assert_eq!(fx.cat.editable_preview(a)?, None);
     assert!(!pa.exists());
     Ok(())
 }
 
 #[test]
-fn a_folder_in_the_trash_takes_its_photos_smart_previews() -> Result<()> {
+fn a_folder_in_the_trash_takes_its_photos_editable_previews() -> Result<()> {
     let mut fx = fixture(&["day/a.NEF", "other/c.NEF"]);
     let (a, c) = (fx.photo("day/a.NEF"), fx.photo("other/c.NEF"));
     let (pa, pc) = (
@@ -124,18 +124,18 @@ fn a_folder_in_the_trash_takes_its_photos_smart_previews() -> Result<()> {
     )
     .unwrap();
     assert_eq!(results(&outcome), [ItemResult::Trashed], "{outcome:?}");
-    assert_eq!(fx.cat.smart_preview(a)?, None);
+    assert_eq!(fx.cat.editable_preview(a)?, None);
     assert!(!pa.exists());
-    assert!(fx.cat.smart_preview(c)?.is_some() && pc.is_file());
+    assert!(fx.cat.editable_preview(c)?.is_some() && pc.is_file());
     Ok(())
 }
 
 #[test]
-fn a_moved_or_renamed_photo_keeps_its_smart_preview() -> Result<()> {
+fn a_moved_or_renamed_photo_keeps_its_editable_preview() -> Result<()> {
     let mut fx = fixture(&["a.NEF", "sub/"]);
     let a = fx.photo("a.NEF");
     let pa = record(&mut fx, a, "a.NEF");
-    let was = fx.cat.smart_preview(a)?;
+    let was = fx.cat.editable_preview(a)?;
     let to = fx.folder("sub");
     let moved = fx.run(
         FileOp::MovePhotos {
@@ -159,13 +159,13 @@ fn a_moved_or_renamed_photo_keeps_its_smart_preview() -> Result<()> {
         [ItemResult::Renamed { .. }]
     ));
     assert_eq!(fx.rows()[&a], "sub/renamed.NEF");
-    assert_eq!(fx.cat.smart_preview(a)?, was);
+    assert_eq!(fx.cat.editable_preview(a)?, was);
     assert!(pa.is_file());
     Ok(())
 }
 
 #[test]
-fn a_smart_preview_built_or_discarded_after_planning_changes_no_operation() -> Result<()> {
+fn a_editable_preview_built_or_discarded_after_planning_changes_no_operation() -> Result<()> {
     let mut fx = fixture(&["a.NEF", "b.NEF", "sub/"]);
     let (a, b) = (fx.photo("a.NEF"), fx.photo("b.NEF"));
     let pb = record(&mut fx, b, "b.NEF");
@@ -188,11 +188,11 @@ fn a_smart_preview_built_or_discarded_after_planning_changes_no_operation() -> R
         matches!(results(&moved)[..], [ItemResult::Moved { .. }]),
         "{moved:?}"
     );
-    assert!(fx.cat.smart_preview(a)?.is_some() && pa.is_file());
+    assert!(fx.cat.editable_preview(a)?.is_some() && pa.is_file());
     // Discarded while a Trash waits: the Trash goes ahead.
     let trash = FakeTrash::new(&fx);
     let plan = fx.plan(FileOp::TrashPhotos { photos: vec![b] });
-    fx.cat.discard_smart_previews(&[b])?;
+    fx.cat.discard_editable_previews(&[b])?;
     let trashed = execute::execute_with(
         &mut fx.cat,
         plan.confirm(),

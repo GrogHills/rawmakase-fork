@@ -1,7 +1,7 @@
-//! The catalog's record of smart previews (`smart_previews`): which photos
+//! The catalog's record of editable previews (`editable_previews`): which photos
 //! have one, its file, and the original it was built from.
 //!
-//! A smart preview is a smaller copy of a photo that RAWmakase built while the
+//! An editable preview is a smaller copy of a photo that RAWmakase built while the
 //! original was online, so the photo can be edited while the original is
 //! offline. It is not a cache: once the original is offline, it can't be built
 //! again, so the catalog keeps track of it for as long as its photo exists. A
@@ -12,12 +12,12 @@
 //!
 //! Rows are keyed by master photo, so virtual copies share their master's,
 //! and moving or renaming the photo changes nothing here. The files are in the
-//! catalog's store folder ([`Catalog::smart_preview_folder`]). The catalog
+//! catalog's store folder ([`Catalog::editable_preview_folder`]). The catalog
 //! only records their names and what their headers say. It never reads or
 //! writes their contents: the format belongs to `rawmakase-decode`, which the
 //! catalog can't reach.
 //!
-//! Smart preview files are RAWmakase's own derived files, not a user's photos,
+//! Editable preview files are RAWmakase's own derived files, not a user's photos,
 //! so they are deleted outright, as the preview cache's are.
 use super::db::{Reads, Write, sql};
 use super::value::row;
@@ -27,14 +27,14 @@ use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The extension of a smart preview file.
-const EXTENSION: &str = "rmsp";
+/// The extension of an editable preview file.
+const EXTENSION: &str = "rmep";
 
-/// A smart preview just built, as its file's header describes it, to record
-/// with [`Catalog::record_smart_preview`].
+/// An editable preview just built, as its file's header describes it, to record
+/// with [`Catalog::record_editable_preview`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BuiltSmartPreview {
-    /// Its name in the store folder ([`smart_preview_file_name`]).
+pub struct BuiltEditablePreview {
+    /// Its name in the store folder ([`editable_preview_file_name`]).
     pub file: String,
     /// The version of the file's format.
     pub format_version: u32,
@@ -42,13 +42,13 @@ pub struct BuiltSmartPreview {
     pub original: Identity,
     /// The original's width and height, in pixels.
     pub original_size: (u32, u32),
-    /// The smart preview's width and height, in pixels.
+    /// The editable preview's width and height, in pixels.
     pub size: (u32, u32),
 }
 
-/// A photo's smart preview, as the catalog records it.
+/// A photo's editable preview, as the catalog records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SmartPreview {
+pub struct EditablePreview {
     /// The master photo it is of.
     pub photo: PhotoId,
     /// Its file, in the store folder.
@@ -67,26 +67,26 @@ pub struct SmartPreview {
     pub built_at: String,
 }
 
-impl SmartPreview {
+impl EditablePreview {
     /// Whether the original, seen online as `seen`, is no longer the photo
-    /// this was built from ([`Identity::same_photo`]). A stale smart preview
+    /// this was built from ([`Identity::same_photo`]). A stale editable preview
     /// is kept: the caller decides what to do with it.
     pub fn is_stale(&self, seen: &Identity) -> bool {
         !self.original.same_photo(seen)
     }
 }
 
-/// The name of the file of a smart preview of `master` built from
-/// `original`: `<photo id>-<identity key>.rmsp`, unique per photo and version
+/// The name of the file of an editable preview of `master` built from
+/// `original`: `<photo id>-<identity key>.rmep`, unique per photo and version
 /// of its original. The builder writes it under a temporary name, then
 /// renames it to this without replacing anything.
-pub fn smart_preview_file_name(master: PhotoId, original: &Identity) -> String {
+pub fn editable_preview_file_name(master: PhotoId, original: &Identity) -> String {
     format!("{}-{}.{EXTENSION}", master.0, original.key())
 }
 
-/// The folder a catalog at `location` keeps its smart previews in: beside a
+/// The folder a catalog at `location` keeps its editable previews in: beside a
 /// catalog file, named after its whole file name (`Photos.rawmakase` keeps
-/// them in `Photos.rawmakase-smart-previews`), so two catalogs differing only
+/// them in `Photos.rawmakase-editable-previews`), so two catalogs differing only
 /// in extension never share one. It is beside the file's real path, through
 /// any link, as the file operation lock is, so every path a catalog is opened
 /// by finds the same folder. A catalog that isn't a file would keep them in
@@ -103,13 +103,13 @@ pub(super) fn folder(location: &CatalogLocation) -> PathBuf {
                 })
                 .unwrap_or_else(|_| path.clone());
             let mut name = real.file_name().unwrap_or_default().to_os_string();
-            name.push("-smart-previews");
+            name.push("-editable-previews");
             real.with_file_name(name)
         }
     }
 }
 
-/// Whether `file` is a smart preview's name, as [`smart_preview_file_name`]
+/// Whether `file` is an editable preview's name, as [`editable_preview_file_name`]
 /// makes them: digits, lowercase hex letters and hyphens, then the
 /// extension. The same on every system, so a name a catalog holds can't lead
 /// out of the store folder wherever the catalog is opened (no separator,
@@ -125,12 +125,12 @@ fn is_file_name(file: &str) -> bool {
         })
 }
 
-/// The path of smart preview `file` in `folder`. Refused for a name that
-/// isn't a smart preview's, whatever a catalog holds.
+/// The path of editable preview `file` in `folder`. Refused for a name that
+/// isn't an editable preview's, whatever a catalog holds.
 pub(super) fn path_in(folder: &Path, file: &str) -> Result<PathBuf> {
     ensure!(
         is_file_name(file),
-        "Not a smart preview's file name: {file}"
+        "Not an editable preview's file name: {file}"
     );
     Ok(folder.join(file))
 }
@@ -159,13 +159,13 @@ row! {
 }
 
 impl Stored {
-    fn read(self, folder: &Path) -> Result<SmartPreview> {
-        Ok(SmartPreview {
+    fn read(self, folder: &Path) -> Result<EditablePreview> {
+        Ok(EditablePreview {
             photo: self.photo,
             path: path_in(folder, &self.file)?,
             format_version: u32::try_from(self.version)?,
             original: serde_json::from_str(&self.identity)
-                .context("A smart preview's original can't be read")?,
+                .context("An editable preview's original can't be read")?,
             original_size: (
                 u32::try_from(self.original_width)?,
                 u32::try_from(self.original_height)?,
@@ -194,7 +194,7 @@ fn forget_family(w: &mut Write<'_>, master: PhotoId, keep: Option<&str>) -> Resu
     let folder = folder(w.location());
     for row in &rows {
         w.execute(
-            sql!("DELETE FROM smart_previews WHERE photo=?"),
+            sql!("DELETE FROM editable_previews WHERE photo=?"),
             &[&row.photo],
         )?;
         if keep != Some(row.file.as_str()) {
@@ -204,8 +204,8 @@ fn forget_family(w: &mut Write<'_>, master: PhotoId, keep: Option<&str>) -> Resu
     Ok(!rows.is_empty())
 }
 
-/// Deletes smart preview `file` of `folder` once `w` commits. A name that
-/// isn't a smart preview's is left alone: the row goes, and nothing outside
+/// Deletes editable preview `file` of `folder` once `w` commits. A name that
+/// isn't an editable preview's is left alone: the row goes, and nothing outside
 /// the store folder is touched.
 fn discard(w: &mut Write<'_>, folder: &Path, file: &str) {
     if let Ok(path) = path_in(folder, file) {
@@ -217,14 +217,14 @@ fn discard(w: &mut Write<'_>, folder: &Path, file: &str) {
 fn family_rows(db: &impl Reads, master: PhotoId) -> Result<Vec<Named>> {
     db.read(
         sql!(
-            "SELECT s.photo, s.file FROM smart_previews s JOIN photos p ON p.id = s.photo
+            "SELECT s.photo, s.file FROM editable_previews s JOIN photos p ON p.id = s.photo
              WHERE p.id = ? OR p.master_id = ? ORDER BY s.photo"
         ),
         &[&master, &master],
     )
 }
 
-/// The smart preview files `master`'s family's rows name.
+/// The editable preview files `master`'s family's rows name.
 pub(super) fn family_files(db: &impl Reads, master: PhotoId) -> Result<Vec<String>> {
     Ok(family_rows(db, master)?
         .into_iter()
@@ -239,7 +239,7 @@ pub(super) fn family_files(db: &impl Reads, master: PhotoId) -> Result<Vec<Strin
 /// family's.
 pub(super) fn forget_photo(w: &mut Write<'_>, photo: PhotoId) -> Result<()> {
     let file: Option<String> = w.read_optional(
-        sql!("SELECT file FROM smart_previews WHERE photo=?"),
+        sql!("SELECT file FROM editable_previews WHERE photo=?"),
         &[&photo],
     )?;
     if let Some(file) = file {
@@ -247,82 +247,85 @@ pub(super) fn forget_photo(w: &mut Write<'_>, photo: PhotoId) -> Result<()> {
             sql!(
                 "SELECT m.id FROM photos c JOIN photos m ON m.id = c.master_id
                  WHERE c.id = ?
-                 AND NOT EXISTS (SELECT 1 FROM smart_previews s WHERE s.photo = m.id)"
+                 AND NOT EXISTS (SELECT 1 FROM editable_previews s WHERE s.photo = m.id)"
             ),
             &[&photo],
         )?;
         if let Some(master) = heir {
             w.execute(
-                sql!("UPDATE smart_previews SET photo=? WHERE photo=?"),
+                sql!("UPDATE editable_previews SET photo=? WHERE photo=?"),
                 &[&master, &photo],
             )?;
             return Ok(());
         }
-        w.execute(sql!("DELETE FROM smart_previews WHERE photo=?"), &[&photo])?;
+        w.execute(
+            sql!("DELETE FROM editable_previews WHERE photo=?"),
+            &[&photo],
+        )?;
         let folder = folder(w.location());
         discard(w, &folder, &file);
     }
     Ok(())
 }
 
-/// Gives the smart preview of `master` to `now`, its copy that becomes the
+/// Gives the editable preview of `master` to `now`, its copy that becomes the
 /// master (Set Copy as Master). The file keeps its name.
 pub(super) fn pass_to(w: &mut Write<'_>, master: PhotoId, now: PhotoId) -> Result<()> {
     // A row of the copy's own, which nothing records, would be its family's
     // second; the master's is the one kept.
     let had: Option<i64> = w.read_optional(
-        sql!("SELECT 1 FROM smart_previews WHERE photo=?"),
+        sql!("SELECT 1 FROM editable_previews WHERE photo=?"),
         &[&master],
     )?;
     if had.is_some() {
         forget_photo(w, now)?;
     }
     w.execute(
-        sql!("UPDATE smart_previews SET photo=? WHERE photo=?"),
+        sql!("UPDATE editable_previews SET photo=? WHERE photo=?"),
         &[&now, &master],
     )?;
     Ok(())
 }
 
-/// The file names of every smart preview recorded in `db`.
+/// The file names of every editable preview recorded in `db`.
 pub(super) fn files(db: &impl Reads) -> Result<Vec<(PhotoId, String)>> {
     let rows: Vec<Named> = db.read(
-        sql!("SELECT photo, file FROM smart_previews ORDER BY photo"),
+        sql!("SELECT photo, file FROM editable_previews ORDER BY photo"),
         &[],
     )?;
     Ok(rows.into_iter().map(|r| (r.photo, r.file)).collect())
 }
 
 impl Catalog {
-    /// The folder this catalog keeps its smart preview files in.
-    pub fn smart_preview_folder(&self) -> PathBuf {
+    /// The folder this catalog keeps its editable preview files in.
+    pub fn editable_preview_folder(&self) -> PathBuf {
         folder(&self.location)
     }
 
-    /// Records the smart preview of `photo` (its master's, for a virtual
+    /// Records the editable preview of `photo` (its master's, for a virtual
     /// copy) built from its original at `source`, in
-    /// [`file`](BuiltSmartPreview::file) of the store folder. In one
+    /// [`file`](BuiltEditablePreview::file) of the store folder. In one
     /// transaction, it replaces the row of the photo's previous one, whose
     /// file is deleted only after that commits (unless it is the same file,
     /// built again from the same original).
     ///
-    /// Refused, recording nothing, when the name isn't a smart preview's, the
+    /// Refused, recording nothing, when the name isn't an editable preview's, the
     /// file isn't there, or the photo is no longer in the catalog with its
     /// file at `source` on this computer: it left, was moved or renamed, or
     /// its id was given to another photo while it was built. The new file
     /// then stays where it is, for the caller to delete (unless another row
     /// names it, which refuses it too) or record again.
-    pub fn record_smart_preview(
+    pub fn record_editable_preview(
         &mut self,
         photo: PhotoId,
         source: &Path,
-        built: &BuiltSmartPreview,
-    ) -> Result<SmartPreview> {
-        let folder = self.smart_preview_folder();
+        built: &BuiltEditablePreview,
+    ) -> Result<EditablePreview> {
+        let folder = self.editable_preview_folder();
         let path = path_in(&folder, &built.file)?;
         let computer = self.computer.id.clone();
         let metadata = std::fs::metadata(&path)
-            .with_context(|| format!("The smart preview {} is not there", path.display()))?;
+            .with_context(|| format!("The editable preview {} is not there", path.display()))?;
         ensure!(metadata.is_file(), "Not a file: {}", path.display());
         let identity = serde_json::to_string(&built.original)?;
         let bytes = i64::try_from(metadata.len())?;
@@ -342,12 +345,12 @@ impl Catalog {
             let here = super::locations::folder_path(w, &computer, place.folder)?;
             ensure!(
                 here.map(|folder| folder.join(&place.filename)).as_deref() == Some(source),
-                "The photo changed while its smart preview was built"
+                "The photo changed while its editable preview was built"
             );
             forget_family(w, master, Some(&built.file))?;
             w.execute(
                 sql!(
-                    "INSERT INTO smart_previews
+                    "INSERT INTO editable_previews
                      (photo, file, identity, original_width, original_height, width, height,
                       bytes, version, built_at)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -367,7 +370,7 @@ impl Catalog {
             )?;
             Ok(master)
         })?;
-        Ok(SmartPreview {
+        Ok(EditablePreview {
             photo: master,
             path,
             format_version: built.format_version,
@@ -379,15 +382,15 @@ impl Catalog {
         })
     }
 
-    /// The smart preview of `photo`, its master's for a virtual copy. Its
+    /// The editable preview of `photo`, its master's for a virtual copy. Its
     /// file may be missing (deleted outside RAWmakase, or the catalog moved
     /// without its store folder): the caller checks when it opens it.
-    pub fn smart_preview(&self, photo: PhotoId) -> Result<Option<SmartPreview>> {
+    pub fn editable_preview(&self, photo: PhotoId) -> Result<Option<EditablePreview>> {
         let stored: Option<Stored> = self.db.read_optional(
             sql!(
                 "SELECT s.photo, s.file, s.identity, s.original_width, s.original_height,
                     s.width, s.height, s.bytes, s.version, s.built_at
-                 FROM smart_previews s JOIN photos p ON p.id = s.photo
+                 FROM editable_previews s JOIN photos p ON p.id = s.photo
                  WHERE COALESCE(p.master_id, p.id) =
                      (SELECT COALESCE(q.master_id, q.id) FROM photos q WHERE q.id = ?)
                  ORDER BY CASE WHEN p.master_id IS NULL THEN 0 ELSE 1 END, s.built_at DESC
@@ -396,29 +399,29 @@ impl Catalog {
             &[&photo],
         )?;
         stored
-            .map(|s| s.read(&self.smart_preview_folder()))
+            .map(|s| s.read(&self.editable_preview_folder()))
             .transpose()
     }
 
-    /// Every photo with a smart preview: the masters with one, and their
+    /// Every photo with an editable preview: the masters with one, and their
     /// virtual copies.
-    pub fn photos_with_smart_previews(&self) -> Result<BTreeSet<PhotoId>> {
+    pub fn photos_with_editable_previews(&self) -> Result<BTreeSet<PhotoId>> {
         let photos: Vec<PhotoId> = self.db.read(
             sql!(
                 "SELECT p.id FROM photos p
                  WHERE COALESCE(p.master_id, p.id) IN
                      (SELECT COALESCE(q.master_id, q.id)
-                      FROM smart_previews s JOIN photos q ON q.id = s.photo)"
+                      FROM editable_previews s JOIN photos q ON q.id = s.photo)"
             ),
             &[],
         )?;
         Ok(photos.into_iter().collect())
     }
 
-    /// Discards the smart previews of `photos` (their masters', for virtual
+    /// Discards the editable previews of `photos` (their masters', for virtual
     /// copies), in one transaction; their files are deleted after it
-    /// commits. Returns the masters whose smart previews were discarded.
-    pub fn discard_smart_previews(&mut self, photos: &[PhotoId]) -> Result<Vec<PhotoId>> {
+    /// commits. Returns the masters whose editable previews were discarded.
+    pub fn discard_editable_previews(&mut self, photos: &[PhotoId]) -> Result<Vec<PhotoId>> {
         self.db.write(|w| {
             let mut masters = BTreeSet::new();
             for &photo in photos {
@@ -436,8 +439,8 @@ impl Catalog {
         })
     }
 
-    /// The bytes every smart preview's file took when it was recorded.
-    pub fn smart_previews_size(&self) -> Result<u64> {
+    /// The bytes every editable preview's file took when it was recorded.
+    pub fn editable_previews_size(&self) -> Result<u64> {
         row! {
             struct Total {
                 bytes: i64,
@@ -445,20 +448,20 @@ impl Catalog {
         }
         let total: Total = self.db.read_one(
             // Postgres sums BIGINT as NUMERIC.
-            sql!("SELECT CAST(COALESCE(sum(bytes), 0) AS BIGINT) FROM smart_previews"),
+            sql!("SELECT CAST(COALESCE(sum(bytes), 0) AS BIGINT) FROM editable_previews"),
             &[],
         )?;
         Ok(u64::try_from(total.bytes)?)
     }
 
-    /// The smart preview files in the store folder that no row names: left by
-    /// a deletion that failed, a release before smart previews that removed
+    /// The editable preview files in the store folder that no row names: left by
+    /// a deletion that failed, a release before editable previews that removed
     /// their photos, or a build whose photo left the catalog. Only RAWmakase's
     /// own files are listed, so their owner may delete them; a file a build
     /// has written but not yet recorded is listed too, so the caller asks only
     /// while no build is running.
-    pub fn smart_preview_orphans(&self) -> Result<Vec<PathBuf>> {
-        let folder = self.smart_preview_folder();
+    pub fn editable_preview_orphans(&self) -> Result<Vec<PathBuf>> {
+        let folder = self.editable_preview_folder();
         let entries = match std::fs::read_dir(&folder) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

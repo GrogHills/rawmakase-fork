@@ -149,21 +149,21 @@ CREATE TABLE IF NOT EXISTS photo_checksums (
 );
 CREATE INDEX IF NOT EXISTS photo_checksums_quick ON photo_checksums(size, quick_hash);
 
--- Each master photo's smart preview (see `catalog::smart_previews`): a smaller
+-- Each master photo's editable preview (see `catalog::editable_previews`): a smaller
 -- copy RAWmakase built while the original was online, in the folder beside the
 -- catalog, so the photo can be edited while the original is offline. Not a
 -- cache: one can't be built again while the original is offline, so a row goes
 -- only with its photo, when the user discards it, or when a newer build
 -- replaces it. Added without a format change; releases before it ignore it,
 -- and the cascade lets them still remove its photo (the file is then left for
--- `Catalog::smart_preview_orphans`).
-CREATE TABLE IF NOT EXISTS smart_previews (
+-- `Catalog::editable_preview_orphans`).
+CREATE TABLE IF NOT EXISTS editable_previews (
     photo INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     file TEXT NOT NULL UNIQUE,    -- its name in the store folder
     identity TEXT NOT NULL,       -- Identity JSON of the original it was built from
     original_width INTEGER NOT NULL,   -- the original's size in pixels
     original_height INTEGER NOT NULL,
-    width INTEGER NOT NULL,       -- the smart preview's size in pixels
+    width INTEGER NOT NULL,       -- the editable preview's size in pixels
     height INTEGER NOT NULL,
     bytes INTEGER NOT NULL,       -- the file's length when recorded
     version INTEGER NOT NULL,     -- of the file's format

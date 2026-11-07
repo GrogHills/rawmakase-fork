@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS photo_checksums (
 );
 CREATE INDEX IF NOT EXISTS photo_checksums_quick ON photo_checksums(size, quick_hash);
 
-CREATE TABLE IF NOT EXISTS smart_previews (
+CREATE TABLE IF NOT EXISTS editable_previews (
     photo BIGINT PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     file TEXT NOT NULL UNIQUE,
     identity TEXT NOT NULL,

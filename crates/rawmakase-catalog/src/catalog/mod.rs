@@ -42,9 +42,9 @@ mod mask_assets;
 mod models;
 mod naming;
 // XMP metadata sidecars; `legacy_sidecar` is the old `*.rawmakase.json` edits.
+mod editable_previews;
 mod sequences;
 mod sidecar;
-mod smart_previews;
 mod snapshots;
 mod stacks;
 mod value;
@@ -56,6 +56,7 @@ pub use db::assert_shape as assert_sql_shape;
 pub use defaults::{CameraExifReader, ImportOptions, MetadataDefaults, NewPhotoDefaults};
 pub use descriptive::MetadataSnapshot;
 pub use develop_history::{HistoryUpdate, SavedHistory, SavedStep};
+pub use editable_previews::{BuiltEditablePreview, EditablePreview, editable_preview_file_name};
 pub use edits::{EditChange, EditToSave};
 pub use export_catalog::{CatalogExport, ExportScope, ExportedFolders};
 pub use ingest::{Ambiguity, Choice, Conflict, IMPORT_BURST_SECONDS, PendingBurstStacks};
@@ -65,7 +66,6 @@ pub use locations::{Override, Overrides, RootLocations};
 pub use models::{Collection, CollectionKind, Folder, Photo, QUICK_COLLECTION};
 pub use sequences::SavedSequence;
 pub use sidecar::{RawXmpReader, SidecarReport, read_file as read_file_metadata, sidecars};
-pub use smart_previews::{BuiltSmartPreview, SmartPreview, smart_preview_file_name};
 pub use snapshots::{Snapshot, SnapshotSettings};
 pub use stacks::{
     BurstCandidate, SavedStack, StackChange, StackPlace, StackState, StacksChanged, auto_stacks,
@@ -391,6 +391,8 @@ mod descriptive_tests;
 #[cfg(test)]
 mod edit_rows_tests;
 #[cfg(test)]
+mod editable_previews_tests;
+#[cfg(test)]
 mod export_catalog_tests;
 #[cfg(test)]
 mod format_upgrade_tests;
@@ -413,8 +415,6 @@ pub mod preview_cache;
 mod private_tests;
 #[cfg(test)]
 mod sequences_tests;
-#[cfg(test)]
-mod smart_previews_tests;
 #[cfg(test)]
 mod sql_scan;
 #[cfg(test)]
