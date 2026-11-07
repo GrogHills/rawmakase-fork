@@ -128,7 +128,7 @@ fn recording_again_replaces_the_row_and_only_then_deletes_the_old_file() -> Resu
     // The original changed and was built again: another name.
     let second = Identity {
         modified_ns: first.modified_ns + 1,
-        ..first.clone()
+        ..first
     };
     let new = fx.build(fx.a, &second, b"newer")?;
     assert_ne!(old.file, new.file);
@@ -159,7 +159,7 @@ fn a_failed_record_leaves_the_row_and_files_as_they_were() -> Result<()> {
         fx.a,
         &Identity {
             size: original.size + 1,
-            ..original.clone()
+            ..original
         },
         b"new",
     )?;
@@ -300,7 +300,7 @@ fn a_changed_original_makes_a_smart_preview_stale() -> Result<()> {
     // Touched, or copied without its time: the same photo.
     let touched = Identity {
         modified_ns: original.modified_ns + 5,
-        ..original.clone()
+        ..original
     };
     assert!(!recorded.is_stale(&touched));
     // Replaced by another file.
