@@ -234,7 +234,14 @@ fn a_record_is_refused_for_a_missing_file_a_bad_name_or_a_photo_gone() -> Result
             "{bad}"
         );
     }
-    built.file = "never-written.rmsp".into();
+    // A name of its own, but never written.
+    built.file = smart_preview_file_name(
+        fx.a,
+        &Identity {
+            size: original.size + 99,
+            ..original.clone()
+        },
+    );
     assert!(
         fx.cat
             .record_smart_preview(fx.a, &fx.source(fx.a), &built)
@@ -325,6 +332,39 @@ fn a_copy_an_older_release_left_holding_it_passes_it_to_its_master() -> Result<(
     let kept = fx.cat.smart_preview(copy)?.context("kept")?;
     assert_eq!(kept.photo, copy);
     assert!(fx.file(&built.file).is_file());
+    Ok(())
+}
+
+#[test]
+fn removing_a_family_an_older_release_rearranged_removes_its_smart_preview() -> Result<()> {
+    // Removing a folder deletes each photo of it, copies first or masters
+    // first: either way the row goes, and its file after the commit.
+    for copies_first in [false, true] {
+        let mut fx = fixture()?;
+        let built = fx.build(fx.a, &fx.original("a.dng")?, b"x")?;
+        fx.cat
+            .record_smart_preview(fx.a, &fx.source(fx.a), &built)?;
+        let copy = fx.cat.create_virtual_copy(fx.a)?;
+        fx.cat.db_for_tests().execute_batch(&format!(
+            "UPDATE photos SET master_id={copy} WHERE id={a};
+             UPDATE photos SET master_id=NULL, copy_name='' WHERE id={copy};",
+            copy = copy.0,
+            a = fx.a.0
+        ))?;
+        let order = if copies_first {
+            [fx.a, copy]
+        } else {
+            [copy, fx.a]
+        };
+        fx.cat.db.write(|w| {
+            for photo in order {
+                super::copies::delete_photo(w, photo)?;
+            }
+            Ok(())
+        })?;
+        assert_eq!(fx.rows()?, 0, "copies first: {copies_first}");
+        assert!(!fx.file(&built.file).exists());
+    }
     Ok(())
 }
 

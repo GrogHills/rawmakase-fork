@@ -529,12 +529,26 @@ fn an_exported_folder_whose_smart_preview_changed_since_is_not_removed() -> Resu
     // Built since: the export doesn't have it, and removing would lose it.
     smart_preview(&mut s.catalog, s.a1, &photos.join("A/a1.ARW"))?;
     assert!(s.catalog.remove_exported_folders(&removal).is_err());
-    // Exported with it, then discarded: removing is what the user asked.
+    // Exported with it, then discarded: what is removed is no longer what
+    // was exported, so it is refused too, as for any change since.
     let export = s
         .catalog
         .export_catalog(&ExportScope::Folders(vec![s.a]), &s.dir.join("b.rawmakase"))?;
     let removal = export.removal.context("removal")?;
     s.catalog.discard_smart_previews(&[s.a1])?;
     assert!(s.catalog.remove_exported_folders(&removal).is_err());
+    // Exported with it, unchanged since: removed, its file with it, while
+    // the export keeps its own copy.
+    let a1 = smart_preview(&mut s.catalog, s.a1, &photos.join("A/a1.ARW"))?;
+    let destination = s.dir.join("c.rawmakase");
+    let export = s
+        .catalog
+        .export_catalog(&ExportScope::Folders(vec![s.a]), &destination)?;
+    let removal = export.removal.context("removal")?;
+    s.catalog.remove_exported_folders(&removal)?;
+    assert_eq!(s.catalog.smart_preview(s.a1)?, None);
+    assert!(!s.catalog.smart_preview_folder().join(&a1).exists());
+    let out = Catalog::open(&destination)?;
+    assert!(out.smart_preview(s.a1)?.context("exported")?.path.is_file());
     Ok(())
 }
