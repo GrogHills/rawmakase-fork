@@ -43,7 +43,7 @@ fn blocks(im: &rawmakase_model::rendered::Rendered) -> (Vec<[f32; 3]>, u32, u32)
 /// too. Comparisons render both images so, at the same size: an editable preview is
 /// 2560 pixels before the crop, so its cropped frame is a few pixels smaller, and a
 /// render never enlarges.
-fn uncropped(im: &CameraImage) -> CameraImage {
+pub(super) fn uncropped(im: &CameraImage) -> CameraImage {
     let strip = |im: &CameraImage| CameraImage {
         recovered: Default::default(),
         metadata: Metadata {
