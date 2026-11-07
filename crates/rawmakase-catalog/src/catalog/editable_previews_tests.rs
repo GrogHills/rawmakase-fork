@@ -508,3 +508,27 @@ fn a_catalog_reopens_with_its_editable_previews_and_an_older_one_gains_the_table
     assert_eq!(version()?, before);
     Ok(())
 }
+
+#[test]
+fn a_build_read_through_a_link_to_the_photos_file_is_recorded() -> Result<()> {
+    // The catalog keeps a folder by its real path; a build may have been
+    // given another spelling of it, as macOS's /var is /private/var.
+    let mut fx = fixture()?;
+    let built = fx.build(fx.a, &fx.original("a.dng")?, b"x")?;
+    #[cfg(unix)]
+    {
+        let link = fx.dir.join("linked");
+        std::os::unix::fs::symlink(fx.dir.join("photos"), &link)?;
+        fx.cat
+            .record_editable_preview(fx.a, &link.join("a.dng"), &built)?;
+        // A link to another file is not the photo's.
+        std::fs::write(fx.dir.join("other.dng"), b"another")?;
+        std::os::unix::fs::symlink(fx.dir.join("other.dng"), fx.dir.join("other-link.dng"))?;
+        assert!(
+            fx.cat
+                .record_editable_preview(fx.a, &fx.dir.join("other-link.dng"), &built)
+                .is_err()
+        );
+    }
+    Ok(())
+}

@@ -125,6 +125,17 @@ fn is_file_name(file: &str) -> bool {
         })
 }
 
+/// Whether `source` names the file at `at`, the photo's path as the catalog
+/// has it: the same path, or another spelling of it through links (a folder
+/// is kept by its real path, and a build may have been given the path through
+/// a link, as macOS's `/var` is `/private/var`).
+fn is_same_file(at: &Path, source: &Path) -> bool {
+    at == source
+        || std::fs::canonicalize(at)
+            .ok()
+            .is_some_and(|at| std::fs::canonicalize(source).ok() == Some(at))
+}
+
 /// The path of editable preview `file` in `folder`. Refused for a name that
 /// isn't an editable preview's, whatever a catalog holds.
 pub(super) fn path_in(folder: &Path, file: &str) -> Result<PathBuf> {
@@ -311,7 +322,8 @@ impl Catalog {
     ///
     /// Refused, recording nothing, when the name isn't an editable preview's, the
     /// file isn't there, or the photo is no longer in the catalog with its
-    /// file at `source` on this computer: it left, was moved or renamed, or
+    /// file at `source` on this computer (that path, or one leading to the
+    /// same file through links): it left, was moved or renamed, or
     /// its id was given to another photo while it was built. The new file
     /// then stays where it is, for the caller to delete (unless another row
     /// names it, which refuses it too) or record again.
@@ -343,8 +355,9 @@ impl Catalog {
                 &[&master],
             )?;
             let here = super::locations::folder_path(w, &computer, place.folder)?;
+            let at = here.map(|folder| folder.join(&place.filename));
             ensure!(
-                here.map(|folder| folder.join(&place.filename)).as_deref() == Some(source),
+                at.is_some_and(|at| is_same_file(&at, source)),
                 "The photo changed while its editable preview was built"
             );
             forget_family(w, master, Some(&built.file))?;
