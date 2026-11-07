@@ -23,6 +23,26 @@ pub(crate) fn photo_level_offset(im: &CameraImage) -> f32 {
 /// rounding on a long edge of 72 pixels or more is less.
 const WHOLE_LEVEL: f32 = 0.02;
 
+/// How much of a level a level wide, starting at the photo's fractional level
+/// `photo_level`, lies within the photo's first `levels` levels, the ones its noise
+/// reduction filters: 1 for a level wholly within them, 0 for one that starts at their
+/// end or past it, and between them the share inside. A reduced decode's last partial
+/// level blends its filtered detail with its unfiltered detail by this share, so how
+/// much of it is filtered changes smoothly with the decode's size. For a photo decoded
+/// in full every level is whole, so the share is exactly 1 or exactly 0.
+pub(crate) fn filtered_share(photo_level: f32, levels: usize) -> f32 {
+    (levels as f32 - photo_level).clamp(0., 1.)
+}
+/// `gain`, a level's detail gain, applied to only `share` of its detail: the rest is
+/// kept unfiltered. Exactly `gain` at a share of 1.
+pub(crate) fn share_gain(gain: f32, share: f32) -> f32 {
+    if share < 1. {
+        1. - share * (1. - gain)
+    } else {
+        gain
+    }
+}
+
 /// One channel at one pyramid level.
 pub(crate) struct Plane {
     pub(crate) w: usize,
@@ -108,5 +128,46 @@ impl Plane {
             }
         });
         Plane { w, h, data }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A photo decoded in full (offset 0) or by a whole number of levels, as a
+    /// half-size decode is, has each level wholly inside the photo's filtered levels
+    /// or wholly past them, and [`share_gain`] then leaves every gain exactly as it is:
+    /// their noise reduction is bit for bit what it was before partial levels were
+    /// blended.
+    #[test]
+    fn whole_levels_are_filtered_in_full_or_not_at_all() {
+        // Luminance filters five bands, colour five levels.
+        let levels = 5;
+        for offset in [0., 1., 2.] {
+            for level in 0..10 {
+                let photo_level = level as f32 + offset;
+                let share = filtered_share(photo_level, levels);
+                let expected: f32 = if photo_level < levels as f32 { 1. } else { 0. };
+                assert_eq!(share.to_bits(), expected.to_bits(), "{photo_level}");
+            }
+        }
+        for gain in [0., 1e-7, 0.3, 0.999_999, 1.] {
+            assert_eq!(share_gain(gain, 1.).to_bits(), gain.to_bits());
+        }
+    }
+
+    /// A level that starts inside the photo's last filtered level and ends past it
+    /// is filtered on the share of it inside, which shrinks to nothing as it
+    /// approaches the photo's unfiltered residual.
+    #[test]
+    fn a_partial_level_is_filtered_on_its_share_inside_the_photo_s_levels() {
+        assert!((filtered_share(4.97, 5) - 0.03).abs() < 1e-5);
+        assert!((filtered_share(4.25, 5) - 0.75).abs() < 1e-6);
+        assert_eq!(filtered_share(5., 5), 0.);
+        assert_eq!(filtered_share(3.99, 5), 1.);
+        // A quarter of the detail filtered to a gain of 0.2, the rest kept.
+        assert!((share_gain(0.2, 0.25) - 0.8).abs() < 1e-6);
+        assert_eq!(share_gain(0.2, 0.), 1.);
     }
 }

@@ -54,7 +54,9 @@ times too strong. Exports never render one: they decode the photo in full.
 Its noise reduction works at the photo's scales too. Each pyramid level of a reduced
 decode shows the photo's level `−log₂(photo_scale)` further on (about one for a
 half-size draft, 1.2 for 2560 pixels of a 6000-pixel photo): it takes the photo's
-settings there, interpolated between two levels, and stops where the photo does.
+settings there, interpolated between two levels, and stops where the photo does: a
+level that runs past the photo's last filtered level is filtered on only the share of
+it inside, so the result changes smoothly with the decode's size.
 The thresholds still follow the noise measured in the decode itself. Before
 2026-11-07 a half-size draft was filtered as if its pixels were the photo's: colour
 noise reduction gave the photo's second level the thresholds of its finest, and both

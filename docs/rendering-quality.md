@@ -35,11 +35,25 @@ its pyramid as the photo's from level `−log₂(photo_scale)` on: about level 1
 half-size draft, 1.2 for 2560 pixels of a 6000-pixel photo. Colour noise reduction
 takes the photo's thresholds there (geometrically between two levels, the noise
 exponent linearly), luminance noise reduction its Detail and Contrast weights.
-Between two of the photo's levels a level's settings are interpolated; one up to a
-level past the photo's last takes the last's, and one that starts at the photo's
-unfiltered residual, or past it, is left alone. The noise each level is measured
-with is the decode's own. A full decode, whatever its metadata says, filters exactly
-as before.
+Between two of the photo's levels a level's settings are interpolated. One that
+starts at the photo's unfiltered residual, or past it, is left alone. One that starts
+inside the photo's last filtered level and ends past it takes the last's settings,
+and its filtered detail is blended with its unfiltered detail by the share of it
+inside the photo's filtered levels: 0.22 of a level past them leaves 0.22 of its
+detail unfiltered. How much of that level is filtered therefore changes smoothly with
+the decode's size. When reduced decodes first took the photo's levels, that level was
+filtered all or nothing: a decode 0.97 levels below the photo filtered one more coarse
+level in full, mostly at a scale the photo leaves alone, while one 0.99 below, which
+is taken as a whole level (see the end of this section), did not. On the synthetic
+photo below the two kept shares of noise at 8 output pixels up to 0.27 apart (|log
+ratio|, colour Amount 25, Detail and Smoothness 80; 0.19 at luminance Amount 75);
+blended, they are at most 0.08 apart. Finer scales change smoothly with the decode's
+size, by up to about 0.2 between those two. The noise each level is measured with is
+the decode's own. A full decode, whatever its metadata says, and a decode by a whole
+number of levels, such as the half-size draft, have no partial level and filter
+exactly as before. Camera Look's fit renders its gate checks from a half-size decode
+reduced to 1536 pixels, with Color noise reduction at its default, so those scores
+move a little; the fit's cache is keyed by the build.
 
 Measured on a synthetic photo (an RGGB mosaic of flats and texture with shot noise,
 demosaiced bilinearly) against the photo denoised and rendered at the reduced size,
@@ -54,7 +68,11 @@ finer scales, which the photo's finest level took out: at colour Amount 10 a dec
 keeps about twice the photo's share there, and with Luminance Detail 20 and Contrast
 50, 1.4 times. Starting the decode's levels half a level finer instead helped
 luminance and made low colour Amounts worse. Texture keeps its detail within 5% of
-the photo's (the test allows 10%). A half-size decode of a photo with an odd side, a
+the photo's (the test allows 10%). The figures for the 0.43 reduction were measured
+before its partial last level (0.78 of it inside the photo's levels) was blended;
+blended, its worst |log ratio| at luminance Amount 75 fell from 0.10 to 0.05 and at
+colour Amount 25, Detail and Smoothness 80 rose from 0.17 to 0.25, the mean over six
+settings from 0.246 to 0.252. A half-size decode of a photo with an odd side, a
 pixel more than half of it, takes the photo's whole levels as an even photo's does.
 AI Denoise refuses reduced decodes.
 

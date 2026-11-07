@@ -20,6 +20,7 @@
 //! The levels are the photo's: a reduced decode ([`CameraImage::photo_scale`]) is
 //! filtered with the thresholds of the photo's scales its levels show, so it keeps the
 //! share of each scale's noise the photo keeps.
+use super::laplacian::{filtered_share, photo_level_offset, share_gain};
 use crate::camera_data::CameraImage;
 use anyhow::{Result, ensure};
 use rawmakase_cancel::Cancel;
@@ -129,7 +130,7 @@ impl ChromaDenoise {
     /// `im` with its colour noise reduced; stops with an error when `cancel` is set.
     pub(crate) fn apply(&self, im: &CameraImage, cancel: Cancel<'_>) -> Result<CameraImage> {
         let (w, h) = (im.width as usize, im.height as usize);
-        let offset = super::laplacian::photo_level_offset(im);
+        let offset = photo_level_offset(im);
         let wb = im.metadata.wb.map(|v| v.max(0.001));
         let (luma, data): (Vec<f32>, Vec<[f32; 2]>) = im
             .pixels
@@ -181,11 +182,13 @@ impl ChromaDenoise {
         offset: f32,
         cancel: Cancel<'_>,
     ) -> Result<Plane> {
-        // The photo's level this one shows. A level up to one past the photo's last
-        // is filtered with the last's settings. One that starts at the photo's
-        // unfiltered residual, or past it, is left alone, as the photo leaves it.
+        // The photo's level this one shows. A level that starts at the photo's
+        // unfiltered residual, or past it, is left alone, as the photo leaves it. One
+        // that starts inside the photo's last level and ends past it takes the last's
+        // settings, on only the share of its detail inside the photo's filtered levels.
         let photo_level = level as f32 + offset;
-        if photo_level >= (LEVELS + 1) as f32 || plane.w < 4 || plane.h < 4 {
+        let share = filtered_share(photo_level, LEVELS + 1);
+        if share == 0. || plane.w < 4 || plane.h < 4 {
             return Ok(plane);
         }
         ensure!(!cancel.is_cancelled(), "Render superseded");
@@ -232,6 +235,7 @@ impl ChromaDenoise {
                     // overflowing where the threshold is tiny next to the detail.
                     1. / (1. + (threshold * threshold / size).powi(ADAPTIVE_STEEPNESS))
                 };
+                let gain = share_gain(gain, share);
                 [c[0] + d[0] * gain, c[1] + d[1] * gain]
             })
             .collect();

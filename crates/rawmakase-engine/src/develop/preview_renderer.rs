@@ -844,12 +844,20 @@ mod tests {
     /// scales: each keeps about the share of the noise at each scale that the photo,
     /// denoised and resized, keeps. A half-size decode (from the mosaic, as
     /// `demosaic::half` makes it) and the photo reduced to 0.43 by area, as an
-    /// editable preview is, are checked.
+    /// editable preview is, are checked. So are decodes 0.97 and 0.99 levels below
+    /// the photo, either side of 0.98, the least offset taken as a whole level: at
+    /// 0.97 the coarsest level filtered runs past the photo's filtered levels, and the
+    /// two still render nearly alike at the coarsest scale measured.
     #[test]
     fn a_reduced_decode_reduces_noise_as_the_photo_resized() {
         let (w, h) = (1024, 640);
         let (full, half) = noisy_photo(w, h, 0.06);
         let reduced = reduce(&full, 440, 275);
+        let near_whole = [0.97, 0.99].map(|offset| {
+            let edge = (w as f32 * 2f32.powf(-offset)).round() as u32;
+            let (w, h) = quality::output_size(w, h, edge);
+            reduce(&full, w, h)
+        });
         // Name, luminance Amount, Detail and Contrast, colour Amount, Detail and
         // Smoothness, and for the half-size decode and the reduced one the worst
         // |ln| of the shares kept, measured, and the mean error, measured. Before
@@ -859,9 +867,12 @@ mod tests {
         // 0.0025, 0.0082 0.0022, 0.0081 0.0019, 0.0037 0.0023, 0.0034 0.0021 and
         // 0.0037 0.0025. At scales of 2 output pixels and more, every case is closer
         // than it was but colour 10 reduced to 0.43, as far as before (0.42 against
-        // 0.40). At 1 pixel the decode also holds noise from the photo's finer scales
-        // (neither is filtered before it is reduced), which no threshold of the
-        // photo's at its scale takes out as the photo's finest level does. Mean error
+        // 0.40); that was measured before a partial last level was blended, which
+        // moved the reduced decode's worst at luminance 75 from 0.10 to 0.05 and at
+        // colour 25, Detail 80, Smoothness 80 from 0.17 to 0.25. At 1 pixel the
+        // decode also holds noise from the photo's finer scales (neither is filtered
+        // before it is reduced), which no threshold of the photo's at its scale takes
+        // out as the photo's finest level does. Mean error
         // is mostly the noise left: it falls with any extra reduction, so it is only
         // held, not compared.
         type Case = (&'static str, [f32; 6], [f32; 2], [f32; 2]);
@@ -881,7 +892,7 @@ mod tests {
             (
                 "luminance 75",
                 [0.75, 0.5, 0., 0., 0.5, 0.5],
-                [0.07, 0.10],
+                [0.07, 0.05],
                 [0.0081, 0.0019],
             ),
             (
@@ -899,7 +910,7 @@ mod tests {
             (
                 "colour 25, Detail 80, Smoothness 80",
                 [0., 0.5, 0., 0.25, 0.8, 0.8],
-                [0.37, 0.17],
+                [0.37, 0.25],
                 [0.0038, 0.0022],
             ),
         ];
@@ -934,6 +945,18 @@ mod tests {
                     "{name}, {k}: texture {kept:.2?}"
                 );
             }
+            // At 8 output pixels, the coarsest scale measured, the two decodes either
+            // side of 0.98 keep nearly the same shares (the bound is about 1.4 times
+            // the largest measured). When the 0.97 decode's coarsest filtered level was
+            // filtered in full they differed by up to 0.27 (colour 25, Detail 80,
+            // Smoothness 80) and 0.19 (luminance 75); blended by the share of it inside
+            // the photo's filtered levels, by at most 0.08. Finer scales change smoothly
+            // with the decode's size, by up to about 0.2 between these two.
+            let [a, b] = near_whole.each_ref().map(|im| noise_kept(&full, im, &r).0);
+            let step = (0..4)
+                .map(|i| (a[i][3] / b[i][3]).ln().abs())
+                .fold(0., f32::max);
+            assert!(step < 0.12, "{name}: at 8 px, {a:.2?} against {b:.2?}");
         }
     }
     /// A half-size decode of a photo with an odd side, a pixel larger than half of it
