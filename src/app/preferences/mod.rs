@@ -517,7 +517,7 @@ impl Editor {
         form_row(ui, "", |ui| {
             hint(
                 ui,
-                "Build them from a photo's menu, while its original is online: a smaller copy, about 16 MB, kept beside the catalog for editing the photo while its original is offline.",
+                "Build them from a photo's menu, while its original is online: a smaller copy, about 16 MB, kept beside the catalog for editing the photo while its original is offline. Editing from them comes in a later release.",
             );
         });
         if discard {
