@@ -675,3 +675,83 @@ pub(super) fn read_identity(r: &Record, [size, modified, hash]: [u16; 3]) -> Res
             .context("A smart preview without its original's identity")?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The codes are part of the format: each kind's table, pinned. A code never
+    /// changes meaning; a variant added takes a new one.
+    #[test]
+    fn fact_codes_keep_their_meaning() {
+        use EmbeddedProfileStatus as E;
+        use HighlightTonePriority as H;
+        use MatrixSource as M;
+        let htp = [(H::Off, 0), (H::On, 1), (H::Enhanced, 2)];
+        for (v, code) in htp {
+            assert_eq!(htp_code(v), code);
+            assert_eq!(htp_of(code).unwrap(), v);
+        }
+        let matrix = [
+            (M::Absent, 0),
+            (M::AdobeDng, 1),
+            (M::CompatObserved, 2),
+            (M::File, 3),
+            (M::FileTungstenOnly, 4),
+            (M::MakerNote, 5),
+            (M::Neutral, 6),
+        ];
+        for (v, code) in matrix {
+            assert_eq!(matrix_source_code(v), code);
+            assert_eq!(matrix_source_of(code).unwrap(), v);
+        }
+        let status = [
+            (E::None, 0),
+            (E::Unreadable, 1),
+            (E::MatrixOnly, 2),
+            (E::OtherCamera, 3),
+            (E::Usable, 4),
+        ];
+        for (v, code) in status {
+            assert_eq!(profile_status_code(v), code);
+            assert_eq!(profile_status_of(code).unwrap(), v);
+        }
+        for (v, code) in [(Source::Raw, 0), (Source::Rendered, 1)] {
+            assert_eq!(source_code(v), code);
+            assert_eq!(source_of(code).unwrap(), v);
+        }
+        let transfer = [
+            (HdrTransfer::Pq, 0),
+            (HdrTransfer::Hlg, 1),
+            (HdrTransfer::Linear, 2),
+        ];
+        for (v, code) in transfer {
+            assert_eq!(transfer_code(v), code);
+            assert_eq!(transfer_of(code).unwrap(), v);
+        }
+        // A code only a later release knows says so.
+        for e in [
+            htp_of(3).unwrap_err(),
+            matrix_source_of(7).unwrap_err(),
+            profile_status_of(5).unwrap_err(),
+            source_of(2).unwrap_err(),
+            transfer_of(3).unwrap_err(),
+        ] {
+            assert!(e.to_string().contains("later release"), "{e}");
+        }
+    }
+
+    /// Auto CA measured with nothing found is kept apart from not measured.
+    #[test]
+    fn auto_ca_found_nothing_is_not_unmeasured() {
+        let m = Metadata::default();
+        let _ = m.lateral_ca.set(None);
+        let scale = Scale {
+            factor: 1.,
+            clipped: 0,
+        };
+        let bytes = write_metadata(&m, scale).into_bytes();
+        let (back, _) = read_metadata(&Record::parse(&bytes).unwrap(), [1, 1]).unwrap();
+        assert_eq!(back.lateral_ca.get(), Some(&None));
+    }
+}

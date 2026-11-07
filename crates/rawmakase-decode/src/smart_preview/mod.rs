@@ -82,10 +82,15 @@ const IDENTITY: [u16; 3] = [5, 6, 7];
 
 /// The log curve with headroom of `curve`.
 const CURVE_LOG: u8 = 1;
-/// The largest preview read, per side and in pixels: well beyond any long edge
-/// built, so a damaged header can't ask for a huge allocation.
-const MAX_SIDE: u32 = 1 << 15;
-const MAX_PIXELS: u64 = 1 << 28;
+/// The largest preview written or read, per side and in pixels: well beyond the
+/// long edge built, yet small enough that a damaged header can't ask for a huge
+/// allocation. The writer and the reader share them ([`check_sizes`]), so nothing
+/// is written that can't be read. A later release may raise them, never lower them.
+const MAX_SIDE: u32 = 1 << 14;
+const MAX_PIXELS: u64 = 1 << 26;
+/// The largest original recorded, per side and in pixels.
+const MAX_ORIGINAL_SIDE: u32 = 1 << 18;
+const MAX_ORIGINAL_PIXELS: u64 = 1 << 34;
 /// The largest `HEAD`, `FACT` or `EXIF` section read.
 const MAX_RECORD: u64 = 64 << 20;
 
@@ -129,6 +134,7 @@ pub struct Header {
 pub struct SmartPreview {
     /// The format version of the file it was read from; [`VERSION`] for one built.
     version: u32,
+    codec: Codec,
     identity: Identity,
     original: [u32; 2],
     exif: Option<CameraExif>,
@@ -159,7 +165,7 @@ impl SmartPreview {
     pub fn header(&self) -> Header {
         Header {
             version: self.version,
-            codec: Codec::LosslessJxl16,
+            codec: self.codec,
             identity: self.identity.clone(),
             original: self.original,
             preview: [self.image.width, self.image.height],
@@ -218,8 +224,13 @@ pub fn build(
         lateral_ca,
         ..original.metadata.clone()
     };
+    check_sizes(
+        [reduced.width, reduced.height],
+        [original.width, original.height],
+    )?;
     Ok(SmartPreview {
         version: VERSION,
+        codec: Codec::LosslessJxl16,
         identity: identity.clone(),
         original: [original.width, original.height],
         exif,
@@ -275,12 +286,22 @@ fn image_of(
 /// replaced; that is an error of kind [`std::io::ErrorKind::AlreadyExists`]. A
 /// crash may leave the temporary file (`.rmsp-*.tmp`) behind for the folder's
 /// owner to remove.
+///
+/// On a volume with neither an exclusive rename nor hard links (exFAT on macOS)
+/// the file is copied into a name created only if free
+/// ([`storage::persist_noclobber`](crate::storage::persist_noclobber)). A crash
+/// during that copy can leave a partial file under the name: [`read`] refuses it,
+/// and whoever rebuilds the smart preview removes it first, or this write fails
+/// with `AlreadyExists`.
 pub fn write(path: &Path, preview: &SmartPreview) -> Result<()> {
     let image = &preview.image;
+    check_sizes([image.width, image.height], preview.original)?;
     let codes = encode_pixels(&image.pixels);
-    let pixels = codec::encode(image.width, image.height, &codes)?;
+    let pixels = match preview.codec {
+        Codec::LosslessJxl16 => codec::encode(image.width, image.height, &codes)?,
+    };
     let mut head = Writer::default();
-    head.u8(CODEC, Codec::LosslessJxl16.code());
+    head.u8(CODEC, preview.codec.code());
     head.u8(CURVE, CURVE_LOG);
     head.u32s(PREVIEW_SIZE, &[image.width, image.height]);
     head.u32s(ORIGINAL_SIZE, &preview.original);
@@ -294,10 +315,7 @@ pub fn write(path: &Path, preview: &SmartPreview) -> Result<()> {
     );
     let exif = facts::write_exif(preview.exif.as_ref());
 
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
+    let dir = crate::storage::parent_dir(path);
     let mut builder = tempfile::Builder::new();
     builder.prefix(".rmsp-").suffix(".tmp");
     // Readable as any file the user makes (the umask applies), not only by its owner
@@ -323,20 +341,25 @@ pub fn write(path: &Path, preview: &SmartPreview) -> Result<()> {
         out.flush()?;
     }
     file.as_file().sync_all()?;
-    file.persist_noclobber(path).map_err(|e| e.error)?;
-    sync_dir(dir);
-    Ok(())
+    crate::storage::persist(file, path, crate::storage::Replace::NoClobber)
 }
 
-/// Makes the rename into `dir` durable where the system can; Windows can't open a
-/// folder to sync it and journals renames itself.
-fn sync_dir(dir: &Path) {
-    #[cfg(unix)]
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
+/// Refuses a preview of `preview` pixels standing for an `original` of that size
+/// unless both are within what [`read`] opens.
+fn check_sizes(preview: [u32; 2], original: [u32; 2]) -> Result<()> {
+    let within = |[w, h]: [u32; 2], side: u32, pixels: u64| {
+        w > 0 && h > 0 && w <= side && h <= side && u64::from(w) * u64::from(h) <= pixels
+    };
+    ensure!(
+        within(preview, MAX_SIDE, MAX_PIXELS)
+            && within(original, MAX_ORIGINAL_SIDE, MAX_ORIGINAL_PIXELS),
+        "A smart preview of {}×{} pixels for an original of {}×{} is larger than smart previews may be",
+        preview[0],
+        preview[1],
+        original[0],
+        original[1]
+    );
+    Ok(())
 }
 
 fn hash(bytes: &[u8]) -> u64 {
@@ -391,22 +414,7 @@ fn read_head(payload: &[u8]) -> Result<Head> {
     let original = r
         .u32_array::<2>(ORIGINAL_SIZE)?
         .context("A smart preview without its original's size")?;
-    for [w, h] in [preview, original] {
-        ensure!(
-            w > 0
-                && h > 0
-                && w <= MAX_SIDE * 8
-                && h <= MAX_SIDE * 8
-                && u64::from(w) * u64::from(h) <= MAX_PIXELS * 64,
-            "A smart preview with an impossible size"
-        );
-    }
-    ensure!(
-        preview[0] <= MAX_SIDE
-            && preview[1] <= MAX_SIDE
-            && u64::from(preview[0]) * u64::from(preview[1]) <= MAX_PIXELS,
-        "A smart preview with an impossible size"
-    );
+    check_sizes(preview, original)?;
     Ok(Head {
         codec,
         preview,
@@ -524,6 +532,7 @@ pub fn read(path: &Path, cancel: Cancel<'_>) -> Result<SmartPreview> {
     ensure!(!cancel.is_cancelled(), "Smart preview cancelled");
     Ok(SmartPreview {
         version,
+        codec: head.codec,
         identity: head.identity,
         original: head.original,
         exif,

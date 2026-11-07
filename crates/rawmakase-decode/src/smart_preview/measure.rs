@@ -6,14 +6,38 @@
 //!
 //! Renders are compared in CIEDE2000 over every pixel. "format" compares the
 //! reduced image before and after the file, so it is the curve's loss alone; the
-//! recipes compare renders of the original and of the smart preview, which also
-//! differ by what Stage 1 of the plan fixes (detail radii scaled to the image in
-//! memory) and by measurements taken from 2560 pixels.
+//! recipes compare renders of the original and of the smart preview, per pixel and
+//! averaged over 16-pixel blocks. Those also differ by what later stages of the plan
+//! fix: detail radii scaled to the image in memory (Stage 1), and the camera's crop,
+//! in the original's pixels, applied to the reduced image (opening with the
+//! original's frame, Stage 5), which is reported as a frame difference.
 use super::*;
 use crate::color_difference::{delta_e2000, lab};
 use crate::develop;
 use rawmakase_model::model::recipe::Recipe;
 use std::time::Instant;
+
+/// `im` averaged over blocks of 16 × 16 pixels: what is left of a difference once
+/// detail (sharpening radii, resampling) is averaged out.
+fn blocks(im: &rawmakase_model::rendered::Rendered) -> (Vec<[f32; 3]>, u32, u32) {
+    let (w, h) = (im.width / 16, im.height / 16);
+    let pixels = (0..w * h)
+        .map(|i| {
+            let (bx, by) = (i % w, i / w);
+            let mut sum = [0f32; 3];
+            for y in 0..16 {
+                for x in 0..16 {
+                    let p = im.pixels[((by * 16 + y) * im.width + bx * 16 + x) as usize];
+                    for c in 0..3 {
+                        sum[c] += p[c] / 256.;
+                    }
+                }
+            }
+            sum
+        })
+        .collect();
+    (pixels, w, h)
+}
 
 fn srgb_lab(p: [f32; 3]) -> [f64; 3] {
     lab(p.map(|v| f64::from(rawmakase_model::color::srgb_decode(v.clamp(0., 1.)))))
@@ -72,7 +96,7 @@ fn measure() {
         .collect();
     paths.sort();
     println!(
-        "| File | Camera | Original | Preview | Size (MB) | Build (s) | Write (s) | Read (s) | Format ΔE mean/p99/max (+0, +4 EV) | Default ΔE mean/p99/max | Detail off | Detail off +4 EV | Detail off −3 EV |"
+        "| File | Camera | Original | Preview | Size (MB) | Build (s) | Write (s) | Read (s) | Format ΔE mean/p99/max (+0, +4 EV) | Default ΔE mean/p99/max; 16 px blocks | Detail off | Detail off +4 EV | Detail off −3 EV |"
     );
     println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     let mut sizes = Vec::new();
@@ -106,17 +130,30 @@ fn measure() {
                 &*develop::quality::recovered(&original, Cancel::NEVER)?,
                 LONG_EDGE,
             );
+            let f = |d: [f64; 3]| format!("{:.3}/{:.2}/{:.1}", d[0], d[1], d[2]);
             let format0 = camera_difference(&reduced, image, 0.);
             let format4 = camera_difference(&reduced, image, 4.);
-            let compare = |edit: &dyn Fn(&mut Recipe)| -> Result<[f64; 3]> {
+            let compare = |edit: &dyn Fn(&mut Recipe)| -> Result<String> {
                 let mut r = Recipe::for_metadata(&original.metadata);
                 edit(&mut r);
                 let r = r.checked()?;
                 let a = develop::render(&original, &r, LONG_EDGE, Cancel::NEVER)?;
                 let b = develop::render(image, &r, LONG_EDGE, Cancel::NEVER)?;
-                Ok(difference(
-                    (&a.pixels, a.width, a.height),
-                    (&b.pixels, b.width, b.height),
+                if (a.width, a.height) != (b.width, b.height) {
+                    return Ok(format!(
+                        "frame differs: {}×{} vs {}×{}",
+                        a.width, a.height, b.width, b.height
+                    ));
+                }
+                let (pa, w, h) = blocks(&a);
+                let (pb, ..) = blocks(&b);
+                Ok(format!(
+                    "{}; {}",
+                    f(difference(
+                        (&a.pixels, a.width, a.height),
+                        (&b.pixels, b.width, b.height),
+                    )),
+                    f(difference((&pa, w, h), (&pb, w, h)))
                 ))
             };
             let off = |r: &mut Recipe| {
@@ -134,7 +171,6 @@ fn measure() {
                 off(r);
                 r.exposure -= 3.;
             })?;
-            let f = |d: [f64; 3]| format!("{:.3}/{:.2}/{:.1}", d[0], d[1], d[2]);
             Ok(format!(
                 "| {name} | {} {} | {}×{} | {}×{} | {size:.2} | {build_s:.2} | {write_s:.2} | {read_s:.2} | {}, {} | {} | {} | {} | {} |",
                 original.metadata.make,
@@ -145,10 +181,10 @@ fn measure() {
                 image.height,
                 f(format0),
                 f(format4),
-                f(default),
-                f(detail_off),
-                f(up),
-                f(down),
+                default,
+                detail_off,
+                up,
+                down,
             ))
         })();
         match result {

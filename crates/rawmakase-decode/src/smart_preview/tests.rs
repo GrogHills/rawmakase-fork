@@ -523,3 +523,72 @@ fn the_golden_version_1_file_opens() {
         }
     }
 }
+
+/// Codes over the whole range, different in every pixel and channel.
+fn noisy_code(i: usize) -> u16 {
+    (rawmakase_model::storage::fnv1a(rawmakase_model::storage::FNV_OFFSET, &i.to_le_bytes()) >> 17)
+        as u16
+}
+
+/// An image of exactly `codes`, standing for itself.
+fn of_codes(width: u32, height: u32, code: impl Fn(usize) -> u16) -> CameraImage {
+    let table = curve::table();
+    let mut im = original(width, height);
+    im.pixels = (0..(width * height) as usize)
+        .map(|i| std::array::from_fn(|c| table[code(i * 3 + c) as usize]))
+        .collect();
+    im.recovered = Default::default();
+    let _ = im.recovered.set(Arc::new(im.clone()));
+    im
+}
+
+/// A preview the size of a real one spans several of the codec's groups (256
+/// pixels) and DC groups (2048): every code comes back exactly.
+#[test]
+fn codes_round_trip_across_the_codecs_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let im = of_codes(2100, 260, noisy_code);
+    let preview = build(&im, &identity(), None, 2100, Cancel::NEVER).unwrap();
+    assert_eq!(preview.image().pixels, im.pixels);
+    let back = read(&written(dir.path(), &preview), Cancel::NEVER).unwrap();
+    assert!(back.image().pixels == im.pixels, "a code changed");
+}
+
+/// Nothing is written that `read` would refuse as too large.
+#[test]
+fn sizes_beyond_what_reads_are_refused_when_building() {
+    assert!(check_sizes([16384, 4096], [60000, 40000]).is_ok());
+    assert!(check_sizes([16385, 2], [16385, 2]).is_err());
+    assert!(check_sizes([16384, 4097], [16384, 4097]).is_err());
+    assert!(check_sizes([2560, 1707], [1 << 18 | 1, 2]).is_err());
+    let im = of_codes(16, 2, noisy_code);
+    assert!(build(&im, &identity(), None, 1 << 15, Cancel::NEVER).is_ok());
+}
+
+const GOLDEN_GROUPS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/smart-preview/v1-groups.rmsp"
+);
+
+/// The golden groups file's codes: smooth, so the file stays small, over 2100 × 260
+/// pixels, which are several of the codec's groups and two of its DC groups.
+fn groups_code(i: usize) -> u16 {
+    let (p, c) = (i / 3, i % 3);
+    let (x, y) = (p % 2100, p / 2100);
+    ((x * 30 + y * 3 + c * 20000) % 65536) as u16
+}
+
+/// A version 1 file of a real preview's width, written once and checked in: the
+/// codec's decoder must keep reading codestreams of many groups exactly.
+#[test]
+fn the_golden_version_1_groups_file_opens() {
+    let path = Path::new(GOLDEN_GROUPS);
+    let im = of_codes(2100, 260, groups_code);
+    if std::env::var_os("RAWMAKASE_WRITE_SMART_PREVIEW_GOLDEN").is_some() && !path.exists() {
+        let preview = build(&im, &identity(), None, 2100, Cancel::NEVER).unwrap();
+        write(path, &preview).unwrap();
+    }
+    let golden = read(path, Cancel::NEVER).expect("the golden version 1 groups file");
+    assert_eq!(golden.header().preview, [2100, 260]);
+    assert!(golden.image().pixels == im.pixels, "a code changed");
+}
