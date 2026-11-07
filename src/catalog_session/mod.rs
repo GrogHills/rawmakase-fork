@@ -402,7 +402,11 @@ mod tests {
                 .catalog
                 .db_for_tests()
                 .query_row("PRAGMA synchronous", [], |r| r.get(0))?;
-        assert_eq!(synchronous, 0, "PRAGMA synchronous=OFF");
+        assert_eq!(
+            synchronous, 0,
+            "PRAGMA synchronous=OFF needs RAWMAKASE_TESTS_SKIP_CATALOG_FLUSH=1, which Cargo sets \
+             from .cargo/config.toml: run the tests through Cargo, from the repository"
+        );
         Ok(())
     }
 

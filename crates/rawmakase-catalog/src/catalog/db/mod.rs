@@ -68,8 +68,10 @@ pub(in crate::catalog) fn opens(version: i64, newest: i64) -> bool {
     (FIRST_VERSION..=newest).contains(&version)
 }
 
-/// The variable `.cargo/config.toml` sets for every process Cargo runs: tests,
-/// and the app binaries the integration tests start.
+/// The variable `.cargo/config.toml` sets for every process Cargo runs: tests
+/// and the app binaries the integration tests start, but also examples and
+/// benches, which are built with dev-dependencies' features too. An example
+/// that opens a real catalog would open it without the flush.
 #[cfg(any(test, feature = "test-support"))]
 const TESTS_SKIP_FLUSH: &str = "RAWMAKASE_TESTS_SKIP_CATALOG_FLUSH";
 
@@ -86,8 +88,9 @@ const TESTS_SKIP_FLUSH: &str = "RAWMAKASE_TESTS_SKIP_CATALOG_FLUSH";
 /// with `test-support`, which only dev-dependencies turn on
 /// (scripts/crate-closures.sh checks), and skip it only when Cargo runs them
 /// with [`TESTS_SKIP_FLUSH`] set. `cargo test` also builds the app binary with
-/// dev-dependencies' features and leaves it in `target/`, from where `make
-/// install` installs it; run by hand or installed, it has no such variable and
+/// dev-dependencies' features and leaves it in `target/`; after `cargo test
+/// --release`, `make install` installs that one. Run by hand or installed, it
+/// has no such variable and
 /// keeps every catalog `FULL`.
 #[cfg(any(test, feature = "test-support"))]
 fn tests_skip_flush() -> bool {
