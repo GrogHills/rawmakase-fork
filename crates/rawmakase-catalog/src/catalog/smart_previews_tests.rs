@@ -105,7 +105,7 @@ fn the_store_is_beside_the_catalog_named_after_it() -> Result<()> {
             fx.dir.join("Photos.rawmakase"),
             link.join("Photos.rawmakase"),
         )?;
-        let linked = Catalog::open(&link.join("Photos.rawmakase"))?;
+        let linked = Catalog::open(link.join("Photos.rawmakase"))?;
         assert_eq!(linked.smart_preview_folder(), fx.cat.smart_preview_folder());
     }
     let original = fx.original("a.dng")?;
