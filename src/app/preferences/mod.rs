@@ -501,7 +501,7 @@ impl Editor {
         form_row(ui, "", |ui| {
             hint(
                 ui,
-                "Lossless: about 16 MB each, the photo as decoded. Smaller: about 40% smaller; adds fine grain under strong edits.",
+                "Lossless: about 16 MB each, every 16-bit code kept. Smaller: about 40% smaller; adds fine grain under strong edits.",
             );
         });
         form_row(ui, "", |ui| {
@@ -1630,15 +1630,16 @@ mod tests {
             .unwrap()
             .smaller_editable_previews
         };
-        // Scrolled down a step at a time until the label is in view and still.
-        let mut click = |e: &mut Editor, label: &str| {
+        // Scrolled down a step at a time until text `matches` is wholly in view and
+        // still: where it is.
+        let scroll_to = |e: &mut Editor, matches: &dyn Fn(&str) -> bool| {
             let mut at = None;
             let mut events = vec![];
             for _ in 0..120 {
                 let shown = frame(e, std::mem::take(&mut events))
                     .into_iter()
                     .find_map(|s| match s.shape {
-                        egui::Shape::Text(t) if t.galley.text() == label => {
+                        egui::Shape::Text(t) if matches(t.galley.text()) => {
                             let rect = t.visual_bounding_rect();
                             s.clip_rect.contains_rect(rect).then(|| rect.center())
                         }
@@ -1662,7 +1663,11 @@ mod tests {
                     },
                 ];
             }
-            let pos = at.unwrap_or_else(|| panic!("{label} is shown"));
+            at
+        };
+        let click = |e: &mut Editor, label: &str| {
+            let pos =
+                scroll_to(e, &|text| text == label).unwrap_or_else(|| panic!("{label} is shown"));
             let button = |pressed| egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
@@ -1672,15 +1677,11 @@ mod tests {
             frame(e, vec![egui::Event::PointerMoved(pos), button(true)]);
             frame(e, vec![button(false)]);
         };
-        let shows = |e: &mut Editor, part: &str| {
-            frame(e, vec![]).iter().any(|s| match &s.shape {
-                egui::Shape::Text(t) => t.galley.text().contains(part),
-                _ => false,
-            })
-        };
+        let shows =
+            |e: &mut Editor, part: &str| scroll_to(e, &|text| text.contains(part)).is_some();
         click(&mut e, "Smaller");
         assert_eq!(e.editable_builds.precision, Precision::Smaller);
-        // Scrolled to the choice, its cost and scope are shown beside it.
+        // Its cost and scope are said beside it.
         assert!(shows(&mut e, "adds fine grain under strong edits"));
         assert!(shows(&mut e, "For editable previews built from now on"));
         assert!(saved());
