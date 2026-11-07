@@ -68,6 +68,38 @@ pub(in crate::catalog) fn opens(version: i64, newest: i64) -> bool {
     (FIRST_VERSION..=newest).contains(&version)
 }
 
+/// The variable `.cargo/config.toml` sets for every process Cargo runs: tests,
+/// and the app binaries the integration tests start.
+#[cfg(any(test, feature = "test-support"))]
+const TESTS_SKIP_FLUSH: &str = "RAWMAKASE_TESTS_SKIP_CATALOG_FLUSH";
+
+/// Whether catalogs skip SQLite's flush to disk on each commit.
+///
+/// Tests rebuild catalogs by the hundred, and none of them has to outlive a
+/// crash of the machine: a commit only has to reach the operating system.
+/// `synchronous=FULL` (SQLite's default, and what a shipping catalog uses)
+/// flushes every commit to disk; on NTFS that flush is most of the Windows
+/// test time, this crate's fault matrices and the app's Library, file
+/// operation and folder sync tests alike.
+///
+/// This crate's unit tests always skip it. Other builds compile this only
+/// with `test-support`, which only dev-dependencies turn on
+/// (scripts/crate-closures.sh checks), and skip it only when Cargo runs them
+/// with [`TESTS_SKIP_FLUSH`] set. `cargo test` also builds the app binary with
+/// dev-dependencies' features and leaves it in `target/`, from where `make
+/// install` installs it; run by hand or installed, it has no such variable and
+/// keeps every catalog `FULL`.
+#[cfg(any(test, feature = "test-support"))]
+fn tests_skip_flush() -> bool {
+    cfg!(test) || asks_to_skip_flush(std::env::var_os(TESTS_SKIP_FLUSH).as_deref())
+}
+
+/// Whether [`TESTS_SKIP_FLUSH`]'s value asks to skip the flush: `1` alone.
+#[cfg(any(test, feature = "test-support"))]
+fn asks_to_skip_flush(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
 /// The catalog's database. Opaque: nothing outside this module sees which
 /// backend it is or its connection.
 pub(in crate::catalog) struct Db {
@@ -86,15 +118,10 @@ impl Db {
     /// publishes it under its final name.
     pub(in crate::catalog) fn create(path: &Path) -> Result<()> {
         let db = Connection::open(path)?;
-        // Unit tests of this crate rebuild a catalog per injected fault. The
-        // fault is an in-process panic, so a commit only has to reach the
-        // operating system. `synchronous=FULL` (SQLite's default, and what a
-        // shipping catalog uses below) flushes every statement; on NTFS that
-        // flush is most of the Windows fault-matrix time. `cfg(test)` is off
-        // when this crate is compiled as a dependency, so the app's tests
-        // and the shipping binary stay `FULL`.
-        #[cfg(test)]
-        db.execute_batch("PRAGMA synchronous=OFF;")?;
+        #[cfg(any(test, feature = "test-support"))]
+        if tests_skip_flush() {
+            db.execute_batch("PRAGMA synchronous=OFF;")?;
+        }
         db.execute_batch(&format!(
             "PRAGMA application_id={APPLICATION_ID}; PRAGMA user_version={VERSION};"
         ))?;
@@ -119,12 +146,12 @@ impl Db {
             "Unsupported RAWmakase catalog version; file left unchanged"
         );
         db.busy_timeout(Duration::from_secs(5))?;
-        // See `create`: this crate's unit tests skip the durability flush.
-        // Split so a shipping open cannot compile the OFF pragma.
-        #[cfg(test)]
-        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=OFF;")?;
-        #[cfg(not(test))]
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+        // A shipping build cannot compile the OFF pragma.
+        #[cfg(any(test, feature = "test-support"))]
+        if tests_skip_flush() {
+            db.execute_batch("PRAGMA synchronous=OFF;")?;
+        }
         Ok(Self {
             backend: Backend::Sqlite(db),
             location: location.clone(),
