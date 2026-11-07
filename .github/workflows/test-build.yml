@@ -1,0 +1,190 @@
+# Unsigned test builds of this fork, attached to the run as artifacts: an
+# Apple Silicon app, a Linux x86_64 tarball and a Windows x86_64 folder. It
+# reuses the release workflow's build steps without signing, notarizing or
+# publishing, uses no secrets and touches no tags or releases. Fork-only: it
+# is not part of the series sent upstream. How to run it and open the builds:
+# packaging/RELEASING.md, "Test builds".
+name: Test build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build
+        type: string
+        default: main
+  # Only so a change to this file proves itself in its pull request.
+  pull_request:
+    paths:
+      - '.github/workflows/test-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-build-${{ github.event_name }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RETENTION_DAYS: 14
+
+jobs:
+  macos-icon:
+    name: Compile macOS icon
+    # As in release.yml: Icon Composer's asset runtime crashes on macOS 15, so
+    # only the icon is compiled on macOS 26.
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Compile the Liquid Glass icon
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+        run: |
+          mkdir -p compiled-icon
+          xcrun actool packaging/macos/RAWmakase.icon --compile compiled-icon \
+            --app-icon RAWmakase --platform macosx --minimum-deployment-target 15.0 \
+            --output-partial-info-plist compiled-icon/partial.plist
+          test -s compiled-icon/Assets.car
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-macos-icon
+          path: compiled-icon/Assets.car
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS (arm64)
+    needs: macos-icon
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-macos-icon
+          path: compiled-icon
+      - name: Version and commit
+        run: |
+          echo "VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+      - name: Build the app
+        run: |
+          # rsvg-convert renders the flat icon; it is not shipped.
+          brew install librsvg
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          toolchain_bin=$(dirname "$(rustup which --toolchain 1.98.1 rustc)")
+          export PATH="$toolchain_bin:$PATH"
+          cargo build --release --locked
+          # The updater only replaces a bundle whose identifier is the
+          # release's, and skips the publisher check for an ad-hoc signed app.
+          # Another identifier keeps a pch/rawmakase release from installing
+          # itself over this build; the notice then points at the release page.
+          # Another name keeps it from replacing RAWmakase.app in Applications.
+          plutil -replace CFBundleIdentifier -string io.github.pch.rawmakase.test packaging/macos/Info.plist
+          plutil -replace CFBundleName -string 'RAWmakase Test' packaging/macos/Info.plist
+          plutil -replace CFBundleDisplayName -string 'RAWmakase Test' packaging/macos/Info.plist
+          # Bundles the pinned ONNX Runtime and ad-hoc signs everything.
+          python3 packaging/macos/bundle.py target/release/rawmakase "dist/RAWmakase Test.app" "$VERSION" \
+            --minimum-macos "$MACOSX_DEPLOYMENT_TARGET" --icon-assets compiled-icon/Assets.car
+      - name: Check the app
+        run: |
+          app="dist/RAWmakase Test.app"
+          codesign --verify --deep --strict "$app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = io.github.pch.rawmakase.test
+          test -s "$app/Contents/Frameworks/libonnxruntime.dylib"
+          "$app/Contents/MacOS/rawmakase" --version
+          mkdir -p dist/upload
+          # ditto keeps the bundle's symlinks, permissions and signatures.
+          ditto -c -k --keepParent "$app" "dist/upload/rawmakase-test-$SHORT_SHA-macos-arm64.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rawmakase-test-${{ env.SHORT_SHA }}-macos-arm64
+          path: dist/upload/*
+          if-no-files-found: error
+          retention-days: ${{ env.RETENTION_DAYS }}
+
+  linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Version and commit
+        run: echo "SHORT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config patchelf libvulkan1 libxkbcommon-dev libwayland-dev
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          toolchain_bin=$(dirname "$(rustup which --toolchain 1.98.1 rustc)")
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+      - name: Build and stage portable payload
+        run: |
+          cargo build --release --locked
+          # Bundles the pinned ONNX Runtime. Like the release tarball it has no
+          # updater marker, so it is told about releases and never replaced.
+          python3 packaging/linux/bundle.py target/release/rawmakase dist/linux-root
+          dist/linux-root/usr/bin/rawmakase --version
+          mkdir -p dist/upload
+          tar -C dist/linux-root -czf "dist/upload/rawmakase-test-$SHORT_SHA-linux-x86_64.tar.gz" usr
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rawmakase-test-${{ env.SHORT_SHA }}-linux-x86_64
+          path: dist/upload/*
+          if-no-files-found: error
+          retention-days: ${{ env.RETENTION_DAYS }}
+
+  windows:
+    name: Windows (x86_64)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Version and commit
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          "SHORT_SHA=$(git rev-parse --short=12 HEAD)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Build and stage app
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          packaging/windows/toolchain.ps1
+          cargo build --release --locked
+          # Bundles the pinned ONNX Runtime. Like the release archive it has
+          # no updater marker, so it is told about releases and never replaced.
+          packaging/windows/stage.ps1 target\release\rawmakase.exe dist\windows
+          # A GUI-subsystem program: piping its output makes PowerShell wait.
+          $reported = (& dist\windows\rawmakase.exe --version | Out-String).Trim()
+          if ($reported -notlike 'rawmakase *') { throw "rawmakase.exe --version printed '$reported'" }
+          $reported
+      # The artifact's own zip is the portable archive: unpacked, it is the
+      # folder the release's zip holds.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rawmakase-test-${{ env.SHORT_SHA }}-windows-x86_64
+          path: dist/windows
+          if-no-files-found: error
+          retention-days: ${{ env.RETENTION_DAYS }}
