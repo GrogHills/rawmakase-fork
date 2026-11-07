@@ -11,7 +11,7 @@ RAWmakase is a fast, non-destructive RAW photo developer for Linux, macOS and Wi
   <sub>macOS (Apple Silicon, Intel) · Linux (.deb, .rpm, Arch) · Windows (x86_64, ARM64) · <a href="#install">install notes</a></sub>
 </p>
 
-It is a personal project in active development. It develops photos from almost every current camera, including monochrome DNGs (such as the Leica Monochrom's), linear DNGs (such as iPhone ProRAW) and Lightroom's HDR and panorama merges; the exceptions are Sigma's Foveon cameras, GoPro's GPR files, the Pentax K-3 Mark III Monochrome's PEFs (its DNGs open), and Adobe's older lossy DNGs (JPEG-compressed, as Adobe DNG Converter's "lossy compression" writes them). Rendering aims for close, not exact, Lightroom parity; see [parity gaps](docs/parity-gaps.md).
+It is a personal project in active development. It develops photos from almost every current camera, including monochrome DNGs (such as the Leica Monochrom's), linear DNGs (such as iPhone ProRAW) and Lightroom's HDR and panorama merges; the exceptions are Sigma's Foveon cameras, GoPro's GPR files, the Pentax K-3 Mark III Monochrome's PEFs (its DNGs open), and Adobe's older lossy DNGs (JPEG-compressed, as Adobe DNG Converter's "lossy compression" writes them). Rendering aims for close, not exact, Lightroom parity; see [parity gaps](docs/records/parity-gaps.md).
 
 > [!WARNING]
 > **RAWmakase is early software in active development.** The rendering engine may change from one version to the next, so photos you have already edited can look different after an upgrade. Until 1.0, backwards compatibility is limited and not guaranteed. The contents of your originals are never modified, but keep exports of finished work.
@@ -74,7 +74,7 @@ Update with `brew upgrade --cask rawmakase`.
 
 Or install the DMG directly:
 
-Choose `rawmakase-v<version>-macos-arm64.dmg` for Apple Silicon or `rawmakase-v<version>-macos-x86_64.dmg` for Intel. Open the DMG, drag **RAWmakase** into **Applications**, and launch it there. Release DMGs are signed and notarized, and include their imaging libraries; Homebrew is not required.
+Choose `rawmakase-v<version>-macos-arm64.dmg` for Apple Silicon or `rawmakase-v<version>-macos-x86_64.dmg` for Intel. Open the DMG, drag **RAWmakase** into **Applications**, and launch it there. Release DMGs are signed and notarized and carry the ONNX Runtime library that subject, sky and background selection and AI Denoise need; Homebrew is not required.
 
 ### Linux (x86_64 and aarch64)
 
@@ -96,13 +96,15 @@ makepkg -si
 
 The development recipe is in [packaging/arch/rawmakase-git](packaging/arch/rawmakase-git/PKGBUILD).
 
-The `rawmakase-<version>-<arch>-linux.tar.gz` download contains the same bundled imaging libraries as the DEB/RPM packages. Extract it and run `./usr/bin/rawmakase` from the extracted folder. Keep the whole directory together. It requires the same OS/runtime baseline as the packages above; it is not a fully static build.
+The `rawmakase-<version>-<arch>-linux.tar.gz` download contains the same files as the DEB/RPM packages, including the bundled ONNX Runtime library. Extract it and run `./usr/bin/rawmakase` from the extracted folder. Keep the whole directory together. It requires the same OS/runtime baseline as the packages above; it is not a fully static build.
 
 The `rawmakase-<version>-<arch>.AppImage` download is the same build as a single file: make it executable (`chmod +x`) and run it. It needs the same OS baseline as the packages above (Ubuntu 24.04+, Debian 13+, Fedora 43+; glibc 2.39 or newer), so it does not run on older distributions. On systems without FUSE 2, run it with `APPIMAGE_EXTRACT_AND_RUN=1`. It carries update information, so AppImageUpdate, Gear Lever and similar tools can update it to the newest release, downloading only what changed.
 
 ### Windows (10 or newer on x86_64, 11 on ARM64)
 
 Run `rawmakase-v<version>-x86_64-pc-windows-msvc-setup.exe`, or `rawmakase-v<version>-aarch64-pc-windows-msvc-setup.exe` on an ARM64 PC. It installs for your user account only, without administrator rights, and adds RAWmakase to the Start menu. The installer is not code-signed yet, so Microsoft Defender SmartScreen may warn about an unrecognized app: choose **More info → Run anyway**. For a copy without installing, extract `rawmakase-v<version>-<arch>-pc-windows-msvc.zip` and run `rawmakase.exe` from the extracted folder.
+
+HEIC photos (from phones) are decoded by Windows itself, which needs Microsoft's **HEIF Image Extensions** and **HEVC Video Extensions** from the Microsoft Store; some PCs come with them. Without them HEIC photos are listed but not shown, and opening one says what to install.
 
 ### Updates and verification
 
@@ -124,9 +126,9 @@ make install PREFIX="$HOME/.local"    # binary, desktop entry, icon and licenses
 
 `make install` never builds, so `make && sudo make install PREFIX=/usr` does not compile as root. `make uninstall` removes the installed files.
 
-HEIC photos are decoded by RAWmakase's own HEVC decoder. HEVC is patented, and some distributions leave software HEVC decoders out: `make CARGO_FLAGS=--no-default-features` builds without it, and HEIF photos are then listed, with their metadata, but not shown or edited (see [dependencies](docs/dependencies.md)).
+On Linux, HEIC photos are decoded by the system's libheif with its HEVC decoder (libde265), opened when RAWmakase first needs it: install `libheif` on Arch, `libheif1` and `libheif-plugin-libde265` on Debian or Ubuntu, or `libheif-freeworld` from RPM Fusion on Fedora. Without it HEIC photos are listed with their metadata, and opening one says what to install (see [dependencies](docs/dependencies.md)).
 
-On macOS, `packaging/macos/app.sh` builds `target/release/RAWmakase.app`, which you can open from Finder. It uses the Homebrew libraries installed on your Mac and is not a signed, self-contained distribution.
+On macOS, `packaging/macos/app.sh` builds `target/release/RAWmakase.app`, which you can open from Finder. It is not signed and does not include ONNX Runtime: to run the selection models or AI Denoise on this Mac, place `libonnxruntime.dylib` in the bundle's `Contents/Frameworks` (`packaging/onnxruntime.py` fetches the pinned library).
 
 ## Usage
 
@@ -150,6 +152,7 @@ Useful shortcuts:
 | R or C | Crop |
 | J | Shadow and highlight clipping warnings (click a histogram triangle for one) |
 | Backslash | Before alone |
+| Shift+Backslash | Camera thumbnail: the embedded JPEG, labelled, in place of the photo |
 | Y / Option+Y / Shift+Y | Before and after: left and right / top and bottom / split |
 | I | Photo info over the photo: Info 1, Info 2, off |
 | Shift+R | Reference View: another photo beside the one you edit (drag it from the filmstrip) |
@@ -176,12 +179,13 @@ rawmakase thumbnail photo.dng embedded.jpg
 rawmakase render photo.dng edited.jpg --exposure 0.7 --max-edge 2400
 rawmakase render photo.dng edited.tiff --xmp preset.xmp
 rawmakase render photo.dng edited.jpg --auto
+rawmakase render photo.dng wide.tiff --color-space prophoto
 rawmakase import-catalog Lightroom.lrcat Photos.rawmakase
 rawmakase fingerprint *.NEF        # decode facts per file as JSON lines, for regression checks
 rawmakase help
 ```
 
-`render` starts from the photo's default look, or from an edit a release before 0.1.8 saved as a sidecar (`photo.dng.rawmakase.json` beside the photo, or in the data directory's `sidecars/` folder, whichever is newer). `--recipe` replaces that starting point with a saved RAWmakase preset; `--xmp` applies an XMP preset on top of it, so settings the XMP leaves out keep the starting point's values. For a render that depends on nothing saved, pass `--recipe`. It does not read edits from a catalog yet, so exporting Develop edits is done from the app. It needs `--overwrite` to replace an existing file.
+`render` starts where the app would. With `--catalog Photos.rawmakase` it uses the photo's edit in that catalog: its saved edit, else its Lightroom edit, else the raw defaults. A path names the master, not a virtual copy, and a photo the catalog doesn't have is an error. Without a catalog it uses an edit a release before 0.1.8 saved as a sidecar (`photo.dng.rawmakase.json` beside the photo, or in the data directory's `sidecars/` folder, whichever is newer), else the raw defaults chosen in Preferences. `--recipe` replaces that starting point with a saved RAWmakase preset; `--xmp` applies an XMP preset on top of it, so settings the XMP leaves out keep the starting point's values. For a render that depends on nothing saved, pass `--recipe`. The catalog's export settings don't apply: the output is what the command line asks for. It needs `--overwrite` to replace an existing file.
 
 ### Where data lives
 
@@ -189,16 +193,15 @@ rawmakase help
 - Edits saved beside photos by releases before 0.1.8 (`photo.dng.rawmakase.json`, with spots and masks in `photo.dng.rawmakase-local.json`, or in the data directory's `sidecars/` folder for read-only locations) are brought into the catalog when you add their folder, and left as they are.
 - Profiles, presets, previews and session state: `~/Library/Application Support/RAWmakase` on macOS, `$XDG_DATA_HOME/rawmakase` (default `~/.local/share/rawmakase`) on Linux, `%APPDATA%\RAWmakase` on Windows. `RAWMAKASE_DATA_DIR` overrides it.
 
-Exports are always sRGB. The display defaults to sRGB; pick a monitor ICC profile under **More** only if your compositor does not already manage color.
+Exports are sRGB unless the Export dialog's Color Space says Adobe RGB (1998) or ProPhoto RGB (16-bit TIFF only), each with its own embedded profile; `render` and `render-batch` take `--color-space srgb|adobe-rgb|prophoto`. The preview is always sRGB and is not a soft proof of a wider export. The display defaults to sRGB; pick a monitor ICC profile under **More** only if your compositor does not already manage color.
 
 ## Development
 
-Start with the [code map](docs/code-map.md) and the [architecture guide](docs/architecture.md).
+Start with [CONTRIBUTING.md](CONTRIBUTING.md), the [documentation index](docs/README.md), the [code map](docs/code-map.md) and the [architecture guide](docs/architecture.md).
 The [website source and deployment guide](website/README.md) live in `website/`.
-The [usage stats service](stats/README.md) in `stats/` still counts reports from older releases; the app no longer sends them.
 
 ```sh
-make check    # cargo fmt --check, clippy -D warnings, cargo test
+make check    # every CI check that runs locally: fmt, clippy, tests, MSRV build, scripts
 ```
 
 The repository contains no RAW photos, Lightroom catalogs or camera profiles, so tests that need them are ignored by default. Run them with your own files:
@@ -207,8 +210,8 @@ The repository contains no RAW photos, Lightroom catalogs or camera profiles, so
 | --- | --- | --- |
 | `RAWMAKASE_FIXTURES` | `--test raw_fixtures` | A folder of RAW files (the test currently expects both a Bayer and an X-Trans file) |
 | `RAWMAKASE_PROFILES` | `--test private_profiles` | A folder of DCP files |
-| `RAWMAKASE_TEST_DCP` | `--lib camera_profiles` | A DCP file (the assertions currently match RawTherapee's `SONY ILCE-7M2.dcp`) |
-| `RAWMAKASE_LRCAT` | `--lib catalog` | A Lightroom catalog |
+| `RAWMAKASE_TEST_DCP` | `-p rawmakase-model --lib camera_profiles` | A DCP file (the assertions currently match RawTherapee's `SONY ILCE-7M2.dcp`) |
+| `RAWMAKASE_LRCAT` | `-p rawmakase-catalog --lib catalog` | A Lightroom catalog |
 | `RAWMAKASE_CORPUS` | `--test color` | The private tier of the [color corpus](tests/corpus/README.md): your own RAWs and their Camera Raw renders |
 
 ```sh
@@ -217,12 +220,27 @@ RAWMAKASE_FIXTURES=~/raw-fixtures cargo test --release --test raw_fixtures -- --
 
 The public part of the color corpus runs with every `cargo test`: synthetic chart DNGs rendered on the CPU and compared with committed snapshots and with Camera Raw's renders of the same charts, so a color change beyond its tolerances (ΔE00 0.5 per patch, 0.1 on a case's mean) is noticed. The GPU preview path is covered by the hardware tests below, not by this suite. When a change is intended, `RAWMAKASE_BLESS=1 cargo test --test color` rewrites the snapshots, and also the charts and the Camera Raw baseline (`tests/corpus/camera-raw/baseline.json`). Read the baseline diff on its own before committing: it records how far renders are from Camera Raw, and accepting a larger distance should be a decision, not a side effect. Commit the files with the reason.
 
-GPU tests are ignored as well; run them with `cargo test -p rawmakase-engine --lib gpu -- --ignored` on a machine with a compute adapter.
+GPU tests are ignored as well; run them with `cargo test -p rawmakase-engine --lib gpu -- --ignored` on a machine with a compute adapter. The GPU parity workflow runs them on a macOS runner for pull requests that touch the renderer, the model's colour, profile, optics or preview-overlay maths, or wgpu, and weekly on main.
 
-Application CI runs `make check`, a release build, an Arch package build and a `cargo deny` license and advisory audit. Website-only pushes and pull requests run the Hugo build instead, and stats-only changes run the stats service's tests; edits to either workflow also run the workflow linter. A stable `vX.Y.Z` tag on `main` matching `Cargo.toml` builds both macOS DMGs, the Linux packages and the Windows installer. Publication waits for Apple notarization and package checks, then refreshes the website's download links. See [packaging/RELEASING.md](packaging/RELEASING.md) for credentials, rehearsal runs, supported systems and the AUR pause.
+Application CI runs the checks `make check` runs, on Linux, Windows and macOS, plus a release build, an Arch package build and a `cargo deny` license and advisory audit. Website-only pushes and pull requests run the Hugo build instead; edits to its workflow also run the workflow linter. A stable `vX.Y.Z` tag on `main` matching `Cargo.toml` builds both macOS DMGs, the Linux packages and the Windows installer. Publication waits for Apple notarization and package checks, then refreshes the website's download links. See [packaging/RELEASING.md](packaging/RELEASING.md) for credentials, rehearsal runs, supported systems and the AUR pause.
+
+The RAW decoders have fuzz targets (`fuzz/`: `open`, `preview` and `decode` of `rawmakase-raw`), run nightly by the Fuzz RAW decoders workflow, seeded only from the repository's synthetic DNGs. Locally: `cargo +nightly fuzz run open` from the repository root, with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz).
+
+### Skills
+
+Coding agents follow [AGENTS.md](AGENTS.md). For the recurring maintainer workflows, the repository also has skills in [`.agents/skills/`](.agents/skills) (Codex reads them there; `.claude/skills` links to the same folder for Claude Code). Run one with `/name` in Claude Code or `$name` in Codex, or just ask in plain words: agents pick a skill up from its description.
+
+| Skill | What it does | Example |
+| --- | --- | --- |
+| [`issue`](.agents/skills/issue/SKILL.md) | Reads an issue and everything it links, checks for overlapping PRs, gets sample RAWs, reproduces the bug with a failing test, fixes it and hands off to `ship`. Can also stop at a diagnosis or a status report. | `/issue 812`<br>"#812: investigate, don't fix yet"<br>"where do we stand with #675?" |
+| [`ship`](.agents/skills/ship/SKILL.md) | Has a model from another provider review the change until it approves, then opens the PR, watches CI and bot comments, and merges when green. Can also review a plan before any code is written. | `/ship`<br>"let codex astra medium review, merge when green"<br>"PR only, don't wait for Windows CI"<br>"plan this with codex until you agree, let me approve" |
+| [`release`](.agents/skills/release/SKILL.md) | Waits for the PRs you name, writes the release notes from the tagged range with credits, commits `Release x.y.z`, tags it and follows the build through to publication. | `/release 0.4.12 after #812`<br>"cut 0.4.12, highlights: AI masks, credit contributors, do a tldr"<br>"what would go into the next release?" |
+| [`gh-reply`](.agents/skills/gh-reply/SKILL.md) | Writes issue and PR comments for the maintainer, signed by the model that wrote them. Drafts first when the reply makes a decision: refusing, closing or promising. | "ask the reporter for their system info, they're not technical"<br>"thank the contributor and merge"<br>"decline this PR, cite licensing risk; let me approve before posting" |
+
+The skills call on each other: `issue` hands off to `ship`, and `ship` and `issue` reply on GitHub through `gh-reply`. Each one is a short Markdown file, and the policy it follows stays in `AGENTS.md` and the docs it links.
 
 ## License
 
-RAWmakase is released under the [MIT License](LICENSE). The DNG default tone curve and temperature table come from the Adobe DNG SDK, under the license in [licenses/Adobe-DNG-SDK.txt](licenses/Adobe-DNG-SDK.txt). The interface font, Inter, is under the SIL Open Font License ([licenses/Inter-OFL.txt](licenses/Inter-OFL.txt)), and the icons are Lucide's, under the ISC License ([licenses/Lucide-ISC.txt](licenses/Lucide-ISC.txt)). egui's bundled fallback fonts are compiled into the binary as well: Hack ([licenses/Hack-MIT-BitstreamVera.txt](licenses/Hack-MIT-BitstreamVera.txt)), Noto Emoji ([licenses/NotoEmoji-OFL.txt](licenses/NotoEmoji-OFL.txt)), Ubuntu Light ([licenses/Ubuntu-UFL.txt](licenses/Ubuntu-UFL.txt)) and the emoji icon font ([licenses/emoji-icon-font-MIT.txt](licenses/emoji-icon-font-MIT.txt)). The Rust dependencies and ONNX Runtime keep their own licenses; see [dependencies](docs/dependencies.md).
+RAWmakase is released under the [MIT License](LICENSE). The DNG default tone curve and temperature table come from the Adobe DNG SDK, under the license in [licenses/Adobe-DNG-SDK.txt](licenses/Adobe-DNG-SDK.txt). The Adobe RGB (1998) and ProPhoto RGB profiles exports embed are Compact-ICC-Profiles' public-domain (CC0) files ([licenses/Compact-ICC-Profiles-CC0.txt](licenses/Compact-ICC-Profiles-CC0.txt)). The interface font, Inter, is under the SIL Open Font License ([licenses/Inter-OFL.txt](licenses/Inter-OFL.txt)), and the icons are Lucide's, under the ISC License ([licenses/Lucide-ISC.txt](licenses/Lucide-ISC.txt)). egui's bundled fallback fonts are compiled into the binary as well: Hack ([licenses/Hack-MIT-BitstreamVera.txt](licenses/Hack-MIT-BitstreamVera.txt)), Noto Emoji ([licenses/NotoEmoji-OFL.txt](licenses/NotoEmoji-OFL.txt)), Ubuntu Light ([licenses/Ubuntu-UFL.txt](licenses/Ubuntu-UFL.txt)) and the emoji icon font ([licenses/emoji-icon-font-MIT.txt](licenses/emoji-icon-font-MIT.txt)). The Rust dependencies and ONNX Runtime keep their own licenses; see [dependencies](docs/dependencies.md).
 
 Adobe, Lightroom and Camera Raw are trademarks of Adobe Inc. RAWmakase is not affiliated with or endorsed by Adobe.

@@ -11,8 +11,9 @@
 //! RAWMAKASE_ORT_LIB=/path/to/libonnxruntime.so \
 //! cargo test -p rawmakase-remote --test models -- --ignored
 //! ```
+use rawmakase_cancel::Cancel;
 
-use rawmakase_inference::{Coverage, LoadOptions, Point, Prompt, Provider, RgbImage, Subject};
+use rawmakase_inference::{Coverage, LoadOptions, Point, Prompt, Provider, RgbImage, Sky, Subject};
 use rawmakase_remote::client::RemoteSession;
 use rawmakase_remote::server::{Model, Server};
 use std::net::TcpListener;
@@ -73,11 +74,12 @@ fn the_remote_worker_returns_what_the_local_session_computed() {
 
     // Local, as the app runs it.
     let mut session = Subject::load_with(&dir, &options).expect("the models load");
-    let analysis = session.analyze(&image, &cancel).expect("analyze");
+    let analysis = session
+        .analyze(&image, Cancel::new(&cancel))
+        .expect("analyze");
     let subject = analysis.subject().expect("subject");
-    let sky = analysis.sky().expect("sky");
     let clicked = session
-        .segment(analysis.embedding(), &click(), &cancel)
+        .segment(analysis.embedding(), &click(), Cancel::new(&cancel))
         .expect("segment");
 
     // Remote: the same sessions behind the worker protocol.
@@ -88,11 +90,12 @@ fn the_remote_worker_returns_what_the_local_session_computed() {
     let remote = RemoteSession::new(&endpoint);
     let info = remote.ping().expect("ping");
     assert_eq!(info.provider, "CPU");
-    let analysis = remote.analyze(&image, &cancel).expect("remote analyze");
+    let analysis = remote
+        .analyze(&image, Cancel::new(&cancel))
+        .expect("remote analyze");
     same(&analysis.subject, &subject, "automatic subject");
-    same(&analysis.sky, &sky, "automatic sky");
     let remote_click = remote
-        .segment(&analysis, &click(), &cancel)
+        .segment(&analysis, &click(), Cancel::new(&cancel))
         .expect("remote segment");
     same(&remote_click, &clicked, "clicked selection");
 }
@@ -103,7 +106,7 @@ fn the_remote_worker_returns_what_the_local_session_computed() {
 /// session computed. The photo is read from the caller's disk and never
 /// leaves this machine; the test is ignored unless a path is given.
 #[test]
-#[ignore = "needs RAWMAKASE_TEST_MODEL, RAWMAKASE_ORT_LIB and RAWMAKASE_TEST_RGB (an sRGB JPEG)"]
+#[ignore = "needs RAWMAKASE_TEST_MODEL, RAWMAKASE_TEST_SKY_MODEL, RAWMAKASE_ORT_LIB and RAWMAKASE_TEST_RGB (an sRGB JPEG with sky)"]
 fn a_real_photo_selects_the_same_through_the_worker_process() {
     use image::imageops::FilterType;
 
@@ -131,9 +134,15 @@ fn a_real_photo_selects_the_same_through_the_worker_process() {
 
     // Local, as the app runs it.
     let mut session = Subject::load_with(&dir, &options).expect("the models load");
-    let analysis = session.analyze(&image, &cancel).expect("analyze");
+    let analysis = session
+        .analyze(&image, Cancel::new(&cancel))
+        .expect("analyze");
     let subject = analysis.subject().expect("subject");
-    let sky = analysis.sky().expect("sky");
+    let sky_dir = std::env::var("RAWMAKASE_TEST_SKY_MODEL").unwrap();
+    let sky = Sky::load_with(std::path::Path::new(&sky_dir), &options)
+        .expect("the sky model loads")
+        .select(&image, Cancel::new(&cancel))
+        .expect("sky");
     let chosen = |what: &str, coverage: &Coverage| {
         let share =
             coverage.data.iter().filter(|v| **v >= 128).count() as f32 / coverage.data.len() as f32;
@@ -169,7 +178,7 @@ fn a_real_photo_selects_the_same_through_the_worker_process() {
         }
     };
     let clicked = session
-        .segment(analysis.embedding(), &click, &cancel)
+        .segment(analysis.embedding(), &click, Cancel::new(&cancel))
         .expect("segment");
     assert!(
         chosen("clicked", &clicked) > 0.005,
@@ -181,6 +190,8 @@ fn a_real_photo_selects_the_same_through_the_worker_process() {
         .args([
             "--model",
             dir.to_str().unwrap(),
+            "--sky-model",
+            &sky_dir,
             "--listen",
             "127.0.0.1:0",
             "--provider",
@@ -206,11 +217,19 @@ fn a_real_photo_selects_the_same_through_the_worker_process() {
     let remote = RemoteSession::new(&endpoint);
     let info = remote.ping().expect("ping");
     assert_eq!(info.provider, "CPU", "{info:?}");
-    let analysis = remote.analyze(&image, &cancel).expect("remote analyze");
+    let analysis = remote
+        .analyze(&image, Cancel::new(&cancel))
+        .expect("remote analyze");
     same(&analysis.subject, &subject, "automatic subject");
-    same(&analysis.sky, &sky, "automatic sky");
+    same(
+        &remote
+            .sky(&image, Cancel::new(&cancel))
+            .expect("remote sky"),
+        &sky,
+        "automatic sky",
+    );
     let remote_click = remote
-        .segment(&analysis, &click, &cancel)
+        .segment(&analysis, &click, Cancel::new(&cancel))
         .expect("remote segment");
     same(&remote_click, &clicked, "clicked selection");
     // Stopping is part of the test: nothing is left holding the port.

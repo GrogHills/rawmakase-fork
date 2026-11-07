@@ -112,6 +112,11 @@ pub fn preset(r: &Recipe, shown: &Metadata, info: &PresetInfo, groups: &GroupSel
         .filter(|(key, _)| !attributes.iter().any(|(k, _)| k == key))
         .collect();
     attributes.extend(dormant);
+    // HDR's settings are written only once set; a preset of the group carries them at
+    // their defaults too, so applying it sets HDR as this photo has it.
+    if groups.contains(SettingGroup::HighDynamicRange) && r.hdr.is_default() {
+        attributes.extend(super::write::hdr_settings(r).0);
+    }
     // Each chosen panel's switch as the photo has it, on or off, so applying the
     // preset also sets that panel the same way.
     for panel in crate::model::panels::Panel::ALL {
@@ -128,9 +133,17 @@ pub fn preset(r: &Recipe, shown: &Metadata, info: &PresetInfo, groups: &GroupSel
         .filter(|_| groups.contains(SettingGroup::TreatmentAndProfile));
     // Written once, after the settings, as Lightroom does.
     attributes.push(("HasSettings".into(), "True".into()));
-    let mut out = format!("  <rdf:Description rdf:about=\"\"\n    xmlns:crs=\"{CRS}\"");
+    let mut out = format!(
+        "  <rdf:Description rdf:about=\"\"\n    xmlns:crs=\"{CRS}\"{}",
+        super::rawmakase_namespace(attributes.iter().map(|(k, _)| k.as_str()))
+    );
     for (key, value) in &attributes {
-        let _ = write!(out, "\n   crs:{key}=\"{}\"", escape_text(value));
+        let _ = write!(
+            out,
+            "\n   {}=\"{}\"",
+            super::qualified(key),
+            escape_text(value)
+        );
     }
     out.push_str(">\n");
     for (element, text) in [
@@ -183,46 +196,28 @@ pub fn point_curve(rgb: &ToneCurve, channels: &[ToneCurve; 3]) -> String {
 pub(crate) fn group_of_key(key: &str) -> Option<SettingGroup> {
     use SettingGroup::*;
     let starts = |prefix: &str| key.starts_with(prefix);
+    // A slider's group is the table's; the rest by key, then by family prefix.
+    if let Some(slider) = crate::model::camera_raw::slider(key) {
+        return Some(slider.group);
+    }
     Some(match key {
-        "WhiteBalance" | "Temperature" | "Tint" | "IncrementalTemperature" | "IncrementalTint" => {
-            WhiteBalance
-        }
-        "Exposure2012" => Exposure,
-        "Contrast2012" => Contrast,
-        "Highlights2012" => Highlights,
-        "Shadows2012" => Shadows,
-        "Whites2012" => Whites,
-        "Blacks2012" => Blacks,
-        "Texture" => Texture,
-        "Clarity2012" => Clarity,
-        "Dehaze" => Dehaze,
-        "Vibrance" => Vibrance,
-        "Saturation" => Saturation,
-        "CameraProfile" | "ConvertToGrayscale" => TreatmentAndProfile,
+        "WhiteBalance" => WhiteBalance,
+        "CameraProfile" | "ConvertToGrayscale" | super::FITTED_PROFILE_KEY => TreatmentAndProfile,
         "ProcessVersion" => ProcessVersion,
-        "Sharpness" | "EnableDetail" => Sharpening,
-        "LuminanceSmoothing" => LuminanceNoiseReduction,
-        "ColorNoiseReduction" => ColorNoiseReduction,
+        "EnableDetail" => Sharpening,
         "AutoLateralCA" => ChromaticAberration,
-        "VignetteAmount" | "VignetteMidpoint" => LensVignetting,
         "PerspectiveUpright" => UprightMode,
-        "EnableToneCurve" | "CurveRefineSaturation" => ToneCurve,
-        "LensManualDistortionAmount" => LensProfileCorrections,
+        "EnableToneCurve" => ToneCurve,
         "EnableColorAdjustments" | "PointColors" | "ColorVariance" => ColorAdjustments,
         "EnableGrayscaleMix" => BlackWhiteMix,
         "EnableSplitToning" => ColorGrading,
         "EnableLensCorrections" => LensProfileCorrections,
         "EnableTransform" => TransformAdjustments,
         "EnableEffects" => PostCropVignetting,
-        "EnableCalibration" | "ShadowTint" => Calibration,
+        "EnableCalibration" => Calibration,
         "EnableRetouch" => SpotRemoval,
-        "CropLeft"
-        | "CropTop"
-        | "CropRight"
-        | "CropBottom"
-        | "CropAngle"
-        | "HasCrop"
-        | "CropConstrainToWarp" => Crop,
+        "HasCrop" | "CropConstrainToWarp" => Crop,
+        "HDREditMode" => HighDynamicRange,
         _ if starts("Parametric") || starts("ToneCurve") => ToneCurve,
         _ if starts("HueAdjustment")
             || starts("SaturationAdjustment")
@@ -236,23 +231,13 @@ pub(crate) fn group_of_key(key: &str) -> Option<SettingGroup> {
         _ if starts("LuminanceNoiseReduction") => LuminanceNoiseReduction,
         _ if starts("ColorNoiseReduction") => ColorNoiseReduction,
         _ if starts("LensProfile") => LensProfileCorrections,
+        // The Lensfun lens an edit chose goes with the profile it stands for.
+        _ if starts("rawmakase:Lensfun") => LensProfileCorrections,
         _ if starts("Defringe") => ChromaticAberration,
         _ if starts("Upright") => UprightMode,
         _ if starts("Perspective") => TransformAdjustments,
         _ if starts("PostCropVignette") => PostCropVignetting,
         _ if starts("Grain") => Grain,
-        _ if matches!(
-            key,
-            "RedHue"
-                | "RedSaturation"
-                | "GreenHue"
-                | "GreenSaturation"
-                | "BlueHue"
-                | "BlueSaturation"
-        ) =>
-        {
-            Calibration
-        }
         _ if key.starts_with("Enable") && key.ends_with("Corrections") => Masking,
         _ => return None,
     })

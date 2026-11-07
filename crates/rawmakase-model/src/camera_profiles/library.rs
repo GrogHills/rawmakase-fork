@@ -108,6 +108,40 @@ pub fn library_dirs() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// What the profile library holds, as one hash: each file's path, size and
+/// modification time. Unedited photos' previews follow the library (which profile
+/// a default picks, and whether a photo without colour data gets a fitted look,
+/// depend on it), so importing or removing any profile changes it.
+pub fn fingerprint() -> String {
+    fingerprint_of(&library_dirs())
+}
+pub(crate) fn fingerprint_of(dirs: &[std::path::PathBuf]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for dir in dirs {
+        let mut files = Vec::new();
+        collect(dir, 0, &mut files);
+        for file in files {
+            h.update(file.to_string_lossy().as_bytes());
+            if let Ok(meta) = std::fs::metadata(&file) {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                h.update(meta.len().to_le_bytes());
+                h.update(modified.to_le_bytes());
+            }
+            h.update([0]);
+        }
+    }
+    h.finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 pub fn installed(m: &Metadata) -> (Vec<Arc<CameraProfile>>, Vec<String>) {
     let listed = listed(m);
     (listed.profiles, listed.errors)
@@ -173,7 +207,14 @@ impl Groups {
             .titles
             .iter()
             .find(|(p, _)| p.name == profile.name && p.camera == profile.camera && **p == *profile)
-            .map_or_else(|| profile.name.clone(), |(_, title)| title.clone());
+            .map_or_else(
+                || {
+                    super::fitted::title(profile)
+                        .or_else(|| super::catalogue::catalogue().title(profile))
+                        .unwrap_or_else(|| profile.name.clone())
+                },
+                |(_, title)| title.clone(),
+            );
         MenuEntry {
             group,
             section: None,
@@ -186,8 +227,8 @@ impl Groups {
 pub fn listed_from(dirs: &[PathBuf], m: &Metadata) -> Listed {
     listed_in(dirs, m, &Cameras::default())
 }
-/// [`import_files`] into `destination` instead of the user's library, for tests.
-#[cfg(any(test, feature = "test-support"))]
+/// [`import_files`] into `destination`, a profile library folder: the user's
+/// (`data_dir()/camera-profiles`) or a test's.
 pub fn import_into_dir(
     paths: &[PathBuf],
     destination: &Path,
@@ -514,7 +555,7 @@ fn import_readable_into(paths: &[std::path::PathBuf], destination: &Path) -> Res
     };
     Ok(Imported { imported, skipped })
 }
-fn import_into(
+pub(super) fn import_into(
     paths: &[std::path::PathBuf],
     destination: &Path,
     space: LutSpace,
@@ -534,6 +575,8 @@ fn import_into(
     for name in [
         super::open::STANDARD,
         super::open::COLOR,
+        super::fitted::LOOK,
+        super::fitted::MATRIX_BASE,
         "Adobe Standard",
         "Adobe Color",
     ] {
@@ -1002,20 +1045,71 @@ mod tests {
     #[test]
     fn importing_a_cameras_adobe_profiles_skips_the_unreadable_ones() -> Result<()> {
         // Camera Raw files HDR Camera Matching profiles with the others for newer
-        // bodies (Nikon's Z 8, say); one of them must not stop the rest.
+        // bodies (Nikon's Z 8, say). Tag 52551 (ProfileDynamicRange) is a version, a
+        // dynamic range and a float hint, in the file's byte order: a profile marked
+        // standard dynamic range imports as an ordinary one, one marked HDR imports as
+        // an HDR profile, and an unknown version is refused without stopping the rest.
         let temp = tempfile::tempdir()?;
         let standard = temp.path().join("NIKON Z 8 Adobe Standard.dcp");
         std::fs::write(&standard, dcp("NIKON Z 8", "Adobe Standard"))?;
+        let marked = temp.path().join("Nikon Z 8 Camera Flat.dcp");
+        let sdr = (52551, 7, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(&marked, dcp_with("NIKON Z 8", "Camera Flat", [sdr]))?;
         let hdr = temp.path().join("Nikon Z 8 Camera Flat HDR.dcp");
-        let flag = (52551, 7, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+        let flag = (52551, 7, vec![1, 0, 1, 0, 0, 0, 0, 0]);
         std::fs::write(&hdr, dcp_with("NIKON Z 8", "Camera Flat HDR", [flag]))?;
+        let future = temp.path().join("Nikon Z 8 Camera Future.dcp");
+        let version = (52551, 7, vec![2, 0, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(&future, dcp_with("NIKON Z 8", "Camera Future", [version]))?;
         let dest = temp.path().join("library");
-        let done = import_readable_into(&[standard, hdr.clone()], &dest)?;
-        assert_eq!(done.imported, [dest.join("NIKON Z 8 Adobe Standard.dcp")]);
+        let done = import_readable_into(&[standard, marked, hdr, future.clone()], &dest)?;
+        assert_eq!(
+            done.imported,
+            [
+                dest.join("NIKON Z 8 Adobe Standard.dcp"),
+                dest.join("Nikon Z 8 Camera Flat.dcp"),
+                dest.join("Nikon Z 8 Camera Flat HDR.dcp"),
+            ]
+        );
         assert_eq!(done.skipped.len(), 1, "{:?}", done.skipped);
-        assert_eq!(done.skipped[0].0, hdr);
-        assert!(done.skipped[0].1.contains("HDR"), "{}", done.skipped[0].1);
-        assert!(!dest.join("Nikon Z 8 Camera Flat HDR.dcp").exists());
+        assert_eq!(done.skipped[0].0, future);
+        assert!(
+            done.skipped[0].1.contains("version 2"),
+            "{}",
+            done.skipped[0].1
+        );
+        let marked =
+            super::super::from_bytes(&std::fs::read(dest.join("Nikon Z 8 Camera Flat.dcp"))?)?;
+        assert!(
+            !marked.is_hdr(),
+            "an explicit SDR tag is an ordinary profile"
+        );
+        let hdr =
+            super::super::from_bytes(&std::fs::read(dest.join("Nikon Z 8 Camera Flat HDR.dcp"))?)?;
+        assert!(hdr.is_hdr());
+        assert_eq!(hdr.hdr_tone()?, super::super::hdr_tone::HdrTone::Overrange);
+        Ok(())
+    }
+    #[test]
+    fn an_hdr_profile_is_read_and_saved_only_in_the_hdr_format() -> Result<()> {
+        use crate::model::{recipe::Recipe, saved_format};
+        let flag = (52551, 7, vec![1, 0, 1, 0, 0, 0, 0, 0]);
+        let hdr = super::super::dcp::parse(&dcp_with("NIKON Z 8", "Camera Flat HDR", [flag]))?;
+        assert!(hdr.is_hdr());
+        assert!(hdr.validate().is_ok());
+        let standard = super::super::dcp::from_bytes(&dcp("NIKON Z 8", "Adobe Standard"))?;
+        assert!(!standard.is_hdr());
+        assert!(!serde_json::to_string(&standard)?.contains("dynamic_range"));
+        assert!(serde_json::to_string(&hdr)?.contains(r#""dynamic_range":"high""#));
+        let mut r = Recipe {
+            profile: Some(Arc::new(standard)),
+            ..Default::default()
+        };
+        assert!(!r.uses_hdr());
+        assert!(saved_format::schema_for(&r) < saved_format::HDR_SCHEMA);
+        r.profile = Some(Arc::new(hdr));
+        assert!(r.uses_hdr());
+        assert_eq!(saved_format::schema_for(&r), saved_format::HDR_SCHEMA);
         Ok(())
     }
     #[test]
@@ -1222,6 +1316,25 @@ mod tests {
     /// included), a DCP or RAWmakase's own profiles. A renamed one imports again as
     /// already imported.
     #[test]
+    fn importing_or_removing_any_profile_changes_the_fingerprint() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dest = temp.path().join("library");
+        std::fs::create_dir_all(&dest)?;
+        let dirs = [dest.clone()];
+        let empty = fingerprint_of(&dirs);
+        assert_eq!(fingerprint_of(&dirs), empty, "stable");
+        std::fs::write(
+            dest.join("mine.dcp"),
+            dcp("Test Camera", "Whatever I Called It"),
+        )?;
+        let one = fingerprint_of(&dirs);
+        assert_ne!(one, empty);
+        std::fs::remove_file(dest.join("mine.dcp"))?;
+        assert_eq!(fingerprint_of(&dirs), empty);
+        Ok(())
+    }
+
+    #[test]
     fn a_name_collision_is_renamed_and_reported() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let dest = temp.path().join("library");
@@ -1242,6 +1355,7 @@ mod tests {
             write_cube(&cool_dir, "Adobe Vivid.cube", cool),
             write_cube(&cool_dir, "Camera Neutral.cube", cool),
             write_cube(&cool_dir, "RAWmakase Standard.cube", cool),
+            write_cube(&cool_dir, "Camera Look (fitted).cube", cool),
             // Not imported, but the name Lightroom edits fall back by.
             write_cube(&cool_dir, "Adobe Standard.cube", cool),
         ];
@@ -1254,6 +1368,7 @@ mod tests {
                 "Adobe Vivid (Cool)",
                 "Camera Neutral (Cool)",
                 "RAWmakase Standard (Cool)",
+                "Camera Look (fitted) (Cool)",
                 "Adobe Standard (Cool)"
             ]
         );

@@ -4,9 +4,12 @@ use super::*;
 pub(super) struct CurveSet {
     /// Where the stage stops.
     pub(super) output: PixelOutput,
+    /// The colour space the finished pixels are encoded in: sRGB but for an export
+    /// in another space.
+    pub(super) space: crate::color::OutputSpace,
     pub(super) exposure_gain: f32,
     /// Contrast as a measured Camera Raw curve.
-    pub(super) basic: Option<crate::develop::basic_tone::BasicTone>,
+    pub(super) basic: Option<crate::develop::tone_lut::ToneLut>,
     /// The Shadows/Highlights base level, built per image by `for_image`.
     pub(super) local: Option<crate::develop::local_tone::LocalToneMap>,
     /// The measured color mixer, Saturation and Vibrance.
@@ -25,13 +28,42 @@ pub(super) struct CurveSet {
     /// What Contrast follows of the photo, for the global slider and the masks'.
     pub(super) photo: crate::develop::basic_tone::PhotoTone,
     /// The measured parametric curve, when a region is set.
-    pub(super) parametric: Option<crate::develop::parametric::ParametricCurve>,
+    pub(super) parametric: Option<crate::develop::tone_lut::ToneLut>,
     pub(super) master: CurveLut,
     pub(super) channels: [CurveLut; 3],
     /// What the scene tone stage measured of the photo.
     pub(crate) measures: crate::develop::scene_tone::PhotoMeasures,
     /// The scene tone stage (S3) for these measures.
     pub(super) scene: crate::develop::scene_tone::SceneTone,
+    /// An HDR render's profile stage and limit; `None` renders SDR.
+    pub(super) hdr: Option<HdrFinish>,
+}
+/// How an HDR render finishes after the scene tone stage: the profile's look and
+/// curve unclipped ([`crate::camera_profiles::CameraProfile::finish_hdr`]). The colour stage's controls are not rendered: an HDR
+/// edit that uses them does not validate (`model::hdr::check_recipe`).
+pub(super) struct HdrFinish {
+    tone: crate::camera_profiles::hdr_tone::HdrTone,
+}
+impl HdrFinish {
+    /// For a recipe with HDR on and a profile whose curve renders in HDR.
+    pub(super) fn new(r: &Recipe) -> Option<Self> {
+        if !r.hdr.is_active() {
+            return None;
+        }
+        Some(Self {
+            tone: r.profile.as_ref()?.hdr_tone().ok()?,
+        })
+    }
+    /// Linear ProPhoto RGB from the scene tone stage to the HDR master before its
+    /// limit: linear ProPhoto RGB, 1 = graphics white, not negative.
+    pub(super) fn finish(&self, scene: [f32; 3], r: &Recipe) -> [f32; 3] {
+        let rgb = match &r.profile {
+            Some(profile) => profile.finish_hdr(scene, &self.tone),
+            None => mul(crate::camera_profiles::PRO_TO_RGB, scene),
+        };
+        // The limit applies once, after sharpening and resizing (`render_hdr`).
+        mul(crate::camera_profiles::RGB_TO_PRO, rgb).map(|v| v.max(0.))
+    }
 }
 impl CurveSet {
     /// Curves plus the Shadows/Highlights map of this image (which also carries the
@@ -119,8 +151,9 @@ impl CurveSet {
     pub(super) fn with_photo_measures(im: Source, r: &Recipe, camera: Camera) -> Self {
         Self::measured(im, r, camera).0
     }
-    /// As [`Self::with_photo_measures`], with the stage cache's entry for the measures
-    /// when there is one.
+    /// Curves with the scene tone stage for this image's measures, and Contrast at
+    /// its pivot when the recipe measures it, with the stage cache's entry for the
+    /// measures when there is one.
     fn measured(
         im: Source,
         r: &Recipe,
@@ -164,6 +197,7 @@ impl CurveSet {
         };
         Self {
             output: PixelOutput::Display,
+            space: crate::color::OutputSpace::Srgb,
             exposure_gain: 2f32.powf(r.exposure + r.camera_exposure),
             basic: basic_tone(r, &photo),
             local: None,
@@ -196,6 +230,7 @@ impl CurveSet {
             channels: std::array::from_fn(|c| CurveLut::new(&r.effects.channels[c])),
             measures: Default::default(),
             scene: crate::develop::scene_tone::SceneTone::new(r, &Default::default(), None),
+            hdr: HdrFinish::new(r),
         }
     }
 }
@@ -204,8 +239,8 @@ impl CurveSet {
 fn basic_tone(
     r: &Recipe,
     photo: &crate::develop::basic_tone::PhotoTone,
-) -> Option<crate::develop::basic_tone::BasicTone> {
-    crate::develop::basic_tone::BasicTone::new(r.contrast, photo)
+) -> Option<crate::develop::tone_lut::ToneLut> {
+    crate::develop::basic_tone::contrast_curve(r.contrast, photo)
 }
 /// `photo_measures`, and `photo_haze` when the recipe removes haze
 /// (`scene_tone::needs_haze`), through the stage cache when the source has its
@@ -427,15 +462,15 @@ fn box_reduce(pixels: &[[f32; 3]], width: u32, height: u32, edge: u32) -> Vec<[f
 }
 /// The measured parametric curve: the user's regions, then (layered) a look's own
 /// curve at its Profile Amount, as Camera Raw applies it.
-fn parametric_curve(r: &Recipe) -> Option<crate::develop::parametric::ParametricCurve> {
-    use crate::develop::parametric::ParametricCurve;
-    let user = ParametricCurve::new(r.effects.parametric, r.effects.splits);
+fn parametric_curve(r: &Recipe) -> Option<crate::develop::tone_lut::ToneLut> {
+    use crate::develop::{parametric::curve, tone_lut::ToneLut};
+    let user = curve(r.effects.parametric, r.effects.splits);
     let look = r
         .profile
         .as_ref()
         .and_then(|p| p.enhanced.as_ref())
-        .and_then(|look| ParametricCurve::new(look.settings.parametric, look.settings.splits));
-    ParametricCurve::then(user, look)
+        .and_then(|look| curve(look.settings.parametric, look.settings.splits));
+    ToneLut::then(user, look)
 }
 /// Whether the recipe's Contrast pivots where the photo's own measure puts it.
 pub(crate) fn measures_contrast_pivot(r: &Recipe) -> bool {

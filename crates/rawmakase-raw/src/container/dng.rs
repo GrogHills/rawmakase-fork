@@ -12,8 +12,8 @@ use crate::info::{Cfa, RawInfo, UNSET};
 use crate::io::{Bytes, Order};
 use crate::sensor::Sensor;
 use crate::variant::{Plan, Variant};
+use rawmakase_cancel::Cancel;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 mod opcodes;
 use opcodes::Opcode;
@@ -268,10 +268,16 @@ pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
             info.cam_mul[3] = info.cam_mul[1];
         }
     }
-    info.file_matrix = d65_matrix(
+    let (matrices, illuminants) = (
         [matrix(50721), matrix(50722)],
         [t.int(ifd0, 50778), t.int(ifd0, 50779)],
     );
+    info.file_matrix_source = if tungsten_only(&matrices, illuminants) {
+        crate::info::MatrixSource::FileTungstenOnly
+    } else {
+        crate::info::MatrixSource::File
+    };
+    info.file_matrix = d65_matrix(matrices, illuminants);
     // Linear raw's samples carry AnalogBalance, gains its writer applied
     // (Adobe DNG Converter's for cameras that white balance small RAWs,
     // Apple's): XYZ to the samples is AnalogBalance × ColorMatrix, and
@@ -299,6 +305,7 @@ pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
         let model = crate::names::model("Nikon", &info.make, &info.model);
         if let Some(notes) = crate::vendor::nikon::read_dng(bytes, at, &model) {
             info.lens_id = notes.lens_id;
+            info.lens_info = notes.lens_info;
         }
         // Fujifilm's: the maker note's dynamic range, and the RAF header's
         // exposure bias Adobe DNG Converter keeps.
@@ -458,6 +465,18 @@ fn mix(values: &[Option<Vec<f64>>; 2], g: f64) -> Option<Vec<f64>> {
     }
 }
 
+/// Whether the only colour matrix is of a tungsten calibration (Standard
+/// Light A, tungsten, ISO studio tungsten): the D65 matrix is then that one,
+/// its colour hardly a daylight photo's.
+fn tungsten_only(matrices: &[Option<Vec<f64>>; 2], illuminants: [Option<u32>; 2]) -> bool {
+    let only = match matrices {
+        [Some(_), None] => illuminants[0],
+        [None, Some(_)] => illuminants[1],
+        _ => return false,
+    };
+    matches!(only, Some(3 | 17 | 24))
+}
+
 /// The XYZ-to-camera matrix at D65 from ColorMatrix1 and 2 (rows of three)
 /// and their CalibrationIlluminants (`calibration_weight`): the D65
 /// calibration's when there is one (most files).
@@ -606,7 +625,7 @@ pub(crate) fn decode(
     info: &RawInfo,
     plan: &DngPlan,
     bytes: &[u8],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Sensor> {
     let (width, height) = (plan.width as usize, plan.height as usize);
     let spp = plan.samples as usize;
@@ -631,7 +650,7 @@ pub(crate) fn decode(
         across * height.div_ceil(th)
     };
     for (i, &(offset, len)) in plan.tiles.iter().enumerate().take(tiles) {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let (tx, ty) = ((i % across) * tw, (i / across) * th);
@@ -830,7 +849,7 @@ fn linearize(
     plan: &DngPlan,
     area: [u32; 4],
     whites: &[u32],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<()> {
     let spp = whites.len();
     let [rows, cols] = plan.black_dim.unwrap_or([1, 1]).map(|v| v as usize);
@@ -854,7 +873,7 @@ fn linearize(
     let [left, top, w, h] = area.map(|v| v as usize);
     let width = plan.width as usize;
     for (y, row) in data.chunks_mut(width * spp).enumerate() {
-        if y % 64 == 0 && cancel.load(Ordering::Relaxed) {
+        if y % 64 == 0 && cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let inside = |i: usize, start: usize, len: usize| i >= start && i < start + len;
@@ -931,7 +950,7 @@ const PARALLEL_TILE_SAMPLES: usize = 4 << 20;
 /// in parallel (one at a time for tiles over `PARALLEL_TILE_SAMPLES`), a
 /// tile at a time. Integer samples are rounded to levels; floating-point
 /// ones become levels as other floats do (`to_level`).
-fn jpeg_xl(plan: &DngPlan, file: &Bytes, data: &mut [u16], cancel: &AtomicBool) -> Result<()> {
+fn jpeg_xl(plan: &DngPlan, file: &Bytes, data: &mut [u16], cancel: Cancel<'_>) -> Result<()> {
     let (width, spp) = (plan.width as usize, plan.samples as usize);
     let [tw, th] = [plan.tile[0] as usize, plan.tile[1] as usize];
     let across = width.div_ceil(tw);
@@ -939,7 +958,7 @@ fn jpeg_xl(plan: &DngPlan, file: &Bytes, data: &mut [u16], cancel: &AtomicBool) 
     let band = |(row, band): (usize, &mut [u16])| {
         let rows = band.len() / (width * spp);
         for col in 0..across {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
             let &(offset, len) = plan
@@ -1078,7 +1097,7 @@ fn unpack(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::AtomicBool;
+    use rawmakase_cancel::Cancel;
 
     /// An IFD entry: tag, type, count and value bytes.
     type Entry = (u16, u16, u32, Vec<u8>);
@@ -1167,7 +1186,7 @@ pub(crate) mod tests {
 
     fn decode(f: &[u8]) -> crate::Sensor {
         let info = crate::open(f).unwrap();
-        crate::decode(&info, f, &AtomicBool::new(false)).unwrap()
+        crate::decode(&info, f, Cancel::NEVER).unwrap()
     }
 
     /// A fractional BlackLevel (Google's phones, Sigma fp) is not truncated:
@@ -1392,8 +1411,11 @@ pub(crate) mod tests {
         ];
         let cfa = crate::open(&dng(2, 2, &entries(false))).unwrap();
         assert_ne!(cfa.cam_xyz, file, "the camera has a table matrix");
+        assert_eq!(cfa.matrix_source, crate::MatrixSource::AdobeDng);
         let info = crate::open(&dng(2, 2, &entries(true))).unwrap();
         assert_eq!(info.cam_xyz, file);
+        // One matrix, of no stated illuminant: the file's, not a tungsten one.
+        assert_eq!(info.matrix_source, crate::MatrixSource::File);
         // The white through the file's matrix: neutral, as the image is.
         for m in &info.cam_mul[..3] {
             assert!((m - 1.).abs() < 1e-3, "{:?}", info.cam_mul);
@@ -1800,7 +1822,7 @@ pub(crate) mod tests {
         let info = crate::open(&f).unwrap();
         assert_eq!(info.variant, crate::Variant::DngVc5);
         assert_eq!([info.width, info.height], [4, 2]);
-        let error = crate::decode(&info, &f, &AtomicBool::new(false)).unwrap_err();
+        let error = crate::decode(&info, &f, Cancel::NEVER).unwrap_err();
         assert!(
             matches!(&error, crate::Error::Unsupported(m) if m.contains("VC5")),
             "{error}"
@@ -1842,9 +1864,7 @@ pub(crate) mod tests {
         };
         let decode = |f: Vec<u8>| {
             let info = crate::open(&f).unwrap();
-            crate::decode(&info, &f, &AtomicBool::new(false))
-                .unwrap()
-                .data
+            crate::decode(&info, &f, Cancel::NEVER).unwrap().data
         };
         // Little-endian floats with no predictor keep the file's byte order.
         let floats: Vec<u8> = [1f32, 2., 100., 2358.53]
@@ -1861,7 +1881,7 @@ pub(crate) mod tests {
         let f = dng(4, 2, &[]);
         let info = crate::open(&f).unwrap();
         assert_eq!((info.width, info.height), (4, 2));
-        let s = crate::decode(&info, &f, &AtomicBool::new(false)).unwrap();
+        let s = crate::decode(&info, &f, Cancel::NEVER).unwrap();
         assert_eq!(s.data, vec![0; 8]);
     }
 
@@ -1888,7 +1908,7 @@ pub(crate) mod tests {
         for extra in cases {
             let f = dng(4, 2, &extra);
             if let Ok(info) = crate::open(&f) {
-                let _ = crate::decode(&info, &f, &AtomicBool::new(false));
+                let _ = crate::decode(&info, &f, Cancel::NEVER);
             }
         }
     }

@@ -10,7 +10,7 @@ use crate::{
     color::srgb_decode,
 };
 use anyhow::{Result, bail, ensure};
-use std::sync::atomic::{AtomicBool, Ordering};
+use rawmakase_cancel::Cancel;
 
 /// Long edge of the crop white balance is sampled on.
 const WHITE_BALANCE_EDGE: u32 = 256;
@@ -31,16 +31,8 @@ const AUTO_CONTRAST: f32 = 0.06;
 const CHROMA_FLOOR: f32 = 0.02;
 
 /// `base` with white balance chosen so the photo's near-neutral areas render neutral.
-pub fn auto_white_balance(im: &CameraImage, base: &Recipe) -> Result<Recipe> {
-    auto_white_balance_cancellable(im, base, &AtomicBool::new(false))
-}
-
-/// [`auto_white_balance`] that stops with an error once `cancel` is set.
-pub fn auto_white_balance_cancellable(
-    im: &CameraImage,
-    base: &Recipe,
-    cancel: &AtomicBool,
-) -> Result<Recipe> {
+/// Stops with an error once `cancel` is set.
+pub fn auto_white_balance(im: &CameraImage, base: &Recipe, cancel: Cancel<'_>) -> Result<Recipe> {
     check_cancel(cancel)?;
     // Camera pixels as decoded: highlight recovery invents colour where a channel
     // clipped, which must not count as a neutral.
@@ -55,18 +47,15 @@ pub fn auto_white_balance_cancellable(
 /// `base` with Exposure, Contrast, Highlights, Shadows, Whites, Blacks and Vibrance
 /// estimated from the photo before its adjustments (see [`auto_tone_basis`]), as the
 /// Basic panel's Auto button applies them. White balance and every other setting of
-/// `base` are kept, as in Lightroom.
-pub fn auto_tone(im: &CameraImage, base: &Recipe) -> Result<Recipe> {
-    auto_tone_cancellable(im, base, &AtomicBool::new(false))
-}
-
-/// [`auto_tone`] that stops with an error once `cancel` is set.
-pub fn auto_tone_cancellable(
-    im: &CameraImage,
-    base: &Recipe,
-    cancel: &AtomicBool,
-) -> Result<Recipe> {
+/// `base` are kept, as in Lightroom. Stops with an error once `cancel` is set.
+pub fn auto_tone(im: &CameraImage, base: &Recipe, cancel: Cancel<'_>) -> Result<Recipe> {
     let t = auto_tone_basis(base);
+    // The reduced copy shares the photo's Auto CA measurement. Measure it on the
+    // photo first, as rendering the photo would, so rendering the copy uses it.
+    if t.as_rendered().resolved(&im.metadata).lens_ca {
+        check_cancel(cancel)?;
+        crate::lens::auto_ca::prime(im);
+    }
     let small = tone_copy(im, &t, cancel)?;
     let mut r = base.clone();
     AutoTone::predict(&Measure::of(&small, &t, cancel)?).apply(&mut r);
@@ -126,8 +115,8 @@ pub fn auto_tone_basis(r: &Recipe) -> Recipe {
     }
 }
 
-fn check_cancel(cancel: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::Relaxed) {
+fn check_cancel(cancel: Cancel<'_>) -> Result<()> {
+    if cancel.is_cancelled() {
         bail!("Cancelled");
     }
     Ok(())
@@ -151,7 +140,7 @@ fn analysis_edge(im: &CameraImage, r: &Recipe, edge: u32) -> u32 {
 /// The copy is reduced from the recovered image, as the app's preview and exports
 /// are, so a small clipped highlight is recovered before averaging hides it. The copy
 /// is marked as already recovered, so rendering it does not recover it again.
-fn tone_copy(im: &CameraImage, r: &Recipe, cancel: &AtomicBool) -> Result<CameraImage> {
+fn tone_copy(im: &CameraImage, r: &Recipe, cancel: Cancel<'_>) -> Result<CameraImage> {
     let edge = analysis_edge(im, r, TONE_EDGE);
     let small = preview(&*recovered(im, cancel)?, edge);
     let _ = small.recovered.set(std::sync::Arc::new(small.clone()));
@@ -239,7 +228,7 @@ struct Measure {
     chroma: Vec<f32>,
 }
 impl Measure {
-    fn of(im: &CameraImage, r: &Recipe, cancel: &AtomicBool) -> Result<Self> {
+    fn of(im: &CameraImage, r: &Recipe, cancel: Cancel<'_>) -> Result<Self> {
         check_cancel(cancel)?;
         // The render the fit measured (`Stage::AutoBasis`), at the copy's size.
         let out = crate::develop::quality::render_stage(
@@ -360,15 +349,15 @@ fn round(v: f32, steps: f32) -> f32 {
 }
 
 /// The measurements applying XMP settings asks of a decoded photo (see
-/// [`crate::xmp::PhotoMeasures`]).
+/// [`crate::model::measures::PhotoMeasures`]).
 pub struct Measures<'a>(pub &'a CameraImage);
 
-impl crate::xmp::PhotoMeasures for Measures<'_> {
+impl crate::model::measures::PhotoMeasures for Measures<'_> {
     fn auto_tone(&self, base: &Recipe) -> Result<Recipe> {
-        auto_tone(self.0, base)
+        auto_tone(self.0, base, Cancel::NEVER)
     }
     fn auto_white_balance(&self, base: &Recipe) -> Result<Recipe> {
-        auto_white_balance(self.0, base)
+        auto_white_balance(self.0, base, Cancel::NEVER)
     }
     fn auto_gray_mix(&self, r: &Recipe, m: &Metadata) -> [f32; 8] {
         let spread = super::ColorSpread::measure(self.0);
@@ -384,6 +373,7 @@ impl crate::xmp::PhotoMeasures for Measures<'_> {
 mod tests {
     use super::*;
     use crate::camera_data::Metadata;
+    use std::sync::atomic::AtomicBool;
 
     /// A 96 × 64 scene of smooth gradients, all channels scaled by `cast`.
     fn scene(cast: [f32; 3], level: f32) -> CameraImage {
@@ -410,7 +400,54 @@ mod tests {
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         }
+    }
+    /// Auto CA is measured on the photo itself: Auto Tone, whose reduced copy shares
+    /// the photo's measurement, run before any render leaves the measurement a render
+    /// of the photo makes, not one of the copy (#868).
+    #[test]
+    fn auto_tone_leaves_auto_ca_measured_on_the_photo() {
+        let (width, height) = (1500u32, 1000u32);
+        // Soft discs on a grid, red magnified and blue shrunk about the centre, as a
+        // lens's lateral chromatic aberration does.
+        let (cx, cy) = (width as f32 / 2., height as f32 / 2.);
+        let disc = |x: f32, y: f32| {
+            let (gx, gy) = ((x / 37.).fract() - 0.5, (y / 37.).fract() - 0.5);
+            let d = (gx * gx + gy * gy).sqrt() * 37.;
+            0.1 + 0.6 * (1. / (1. + ((d - 11.) / 1.2).exp()))
+        };
+        let pixels = (0..width * height)
+            .map(|i| {
+                let (dx, dy) = ((i % width) as f32 + 0.5 - cx, (i / width) as f32 + 0.5 - cy);
+                let at = |k: f32| disc(cx + dx / k + 1000., cy + dy / k + 1000.);
+                [at(1.0008), at(1.), at(0.9995)]
+            })
+            .collect();
+        let im = CameraImage {
+            pixels,
+            width,
+            height,
+            metadata: Metadata {
+                width,
+                height,
+                ..scene([1.; 3], 0.5).metadata
+            },
+            ..scene([1.; 3], 0.5)
+        };
+        let r = Recipe {
+            lens_ca: true,
+            ..Default::default()
+        };
+        auto_tone(&im, &r, Cancel::NEVER).unwrap();
+        let photo = crate::lens::auto_ca::estimate(
+            &im.pixels,
+            width,
+            height,
+            crate::lens::auto_ca::centre(&im.metadata),
+        );
+        assert!(photo.is_some());
+        assert_eq!(crate::lens::auto_ca::measured(&im), photo.as_ref());
     }
     /// Auto measures every photo with the same sharpening, whichever Detail settings
     /// the edit uses.
@@ -448,7 +485,7 @@ mod tests {
         // A camera matrix gives the recipe the default camera-matrix profile.
         im.metadata.cam_xyz = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
         let base = Recipe::for_metadata(&im.metadata);
-        let auto = auto_white_balance(&im, &base).unwrap();
+        let auto = auto_white_balance(&im, &base, Cancel::NEVER).unwrap();
         let mut gray = base;
         gray.wb = gray_world(&im.pixels).unwrap();
         gray.sync_white_balance_controls(&im.metadata);
@@ -468,7 +505,7 @@ mod tests {
         let mut im = scene([1.2, 1., 0.8], 0.5);
         im.metadata.source = crate::camera_data::Source::Rendered;
         let base = Recipe::for_rendered(&im.metadata);
-        let auto = auto_white_balance(&im, &base).unwrap();
+        let auto = auto_white_balance(&im, &base, Cancel::NEVER).unwrap();
         // Kelvin stays as a rendered file keeps it; the relative controls carry it.
         assert_eq!((auto.temperature, auto.tint), (base.temperature, base.tint));
         // A warm cast is cooled.
@@ -490,7 +527,8 @@ mod tests {
         for cast in [[0.3, 1., 3.], [3., 1., 0.3], [1., 0.5, 1.], [1., 2., 1.]] {
             let mut im = scene(cast, 0.3);
             im.metadata.cam_xyz = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
-            let auto = auto_white_balance(&im, &Recipe::for_metadata(&im.metadata)).unwrap();
+            let auto = auto_white_balance(&im, &Recipe::for_metadata(&im.metadata), Cancel::NEVER)
+                .unwrap();
             assert!(
                 (AUTO_TEMPERATURE.0..=AUTO_TEMPERATURE.1).contains(&auto.temperature)
                     && (AUTO_TINT.0..=AUTO_TINT.1).contains(&auto.tint),
@@ -519,9 +557,10 @@ mod tests {
             .map(|i| im.pixels[((i / big.width / 10) * im.width + i % big.width / 10) as usize])
             .collect();
         let out = crate::develop::render(
-            &tone_copy(&big, &r, &AtomicBool::new(false)).unwrap(),
+            &tone_copy(&big, &r, Cancel::NEVER).unwrap(),
             &r.checked().unwrap(),
             0,
+            Cancel::NEVER,
         )
         .unwrap();
         // Under TONE_EDGE, so every source pixel of the crop is measured.
@@ -548,7 +587,7 @@ mod tests {
             crop: [0.5, 0.5, 0.51, 0.51],
             ..Default::default()
         };
-        let copy = tone_copy(&im, &r, &AtomicBool::new(false)).unwrap();
+        let copy = tone_copy(&im, &r, Cancel::NEVER).unwrap();
         assert_eq!(copy.width.max(copy.height), ANALYSIS_SOURCE_MAX);
     }
 
@@ -582,9 +621,9 @@ mod tests {
         // Red clips across the bright side, so highlight recovery changes those pixels.
         let im = scene([1.4, 1., 1.], 1.);
         let r = Recipe::default();
-        let recovered = super::super::quality::recover_highlights(&im);
+        let recovered = super::super::quality::recover_highlights(&im, Cancel::NEVER).unwrap();
         assert_ne!(recovered.pixels, im.pixels);
-        let copy = tone_copy(&im, &r, &AtomicBool::new(false)).unwrap();
+        let copy = tone_copy(&im, &r, Cancel::NEVER).unwrap();
         let expected = preview(&recovered, copy.width.max(copy.height));
         assert_eq!(copy.pixels, expected.pixels);
         // Rendering the copy does not recover it a second time.
@@ -624,14 +663,16 @@ mod tests {
     fn a_cancelled_white_balance_estimate_stops_with_an_error() {
         let im = scene([1.; 3], 0.5);
         let cancel = AtomicBool::new(true);
-        assert!(auto_white_balance_cancellable(&im, &Recipe::default(), &cancel).is_err());
+        assert!(auto_white_balance(&im, &Recipe::default(), Cancel::new(&cancel)).is_err());
     }
 
     #[test]
     fn white_balance_ignores_colour_invented_by_highlight_recovery() {
         // A warm left half where every other pixel clipped in red and green, and a
-        // cool right half. Recovery rebuilds the clipped pixels as warm, below the
-        // clipping cutoff, which would weigh the warm half double.
+        // cool right half. Recovery raises the clipped pixels' blue from 0.4 to
+        // about 0.433; red and green stay at 1, so those pixels remain excluded by
+        // the gray-world clipping cutoff. Auto WB must use the decoded samples
+        // rather than recovery-altered colours.
         let mut im = scene([1.; 3], 0.5);
         let width = im.width as usize;
         for (i, p) in im.pixels.iter_mut().enumerate() {
@@ -645,12 +686,12 @@ mod tests {
             };
         }
         let r = Recipe::for_metadata(&im.metadata);
-        let recovered = super::super::quality::recover_highlights(&im);
+        let recovered = super::super::quality::recover_highlights(&im, Cancel::NEVER).unwrap();
         assert_ne!(recovered.pixels, im.pixels);
         let mut decoded = r.clone();
         fit_white_balance_to(&crop_samples(&im, &r), &im.metadata, &mut decoded).unwrap();
         let decoded = decoded.wb;
-        let estimated = auto_white_balance(&im, &r).unwrap().wb;
+        let estimated = auto_white_balance(&im, &r, Cancel::NEVER).unwrap().wb;
         for c in 0..3 {
             assert!(
                 (estimated[c] / decoded[c] - 1.).abs() < 1e-4,
@@ -700,7 +741,7 @@ mod tests {
     fn a_cancelled_estimate_stops_with_an_error() {
         let im = scene([1.; 3], 0.5);
         let cancel = AtomicBool::new(true);
-        assert!(auto_tone_cancellable(&im, &Recipe::default(), &cancel).is_err());
+        assert!(auto_tone(&im, &Recipe::default(), Cancel::new(&cancel)).is_err());
     }
 
     #[test]
@@ -720,9 +761,14 @@ mod tests {
             crop: [0., 0., 0.45, 1.],
             ..Default::default()
         };
-        let auto = auto_white_balance(&im, &base).unwrap();
+        let auto = auto_white_balance(&im, &base, Cancel::NEVER).unwrap();
         // As if the whole photo were under the warm light.
-        let warm = auto_white_balance(&scene([1.3, 1., 0.7], 0.5), &Recipe::default()).unwrap();
+        let warm = auto_white_balance(
+            &scene([1.3, 1., 0.7], 0.5),
+            &Recipe::default(),
+            Cancel::NEVER,
+        )
+        .unwrap();
         for c in 0..3 {
             assert!(
                 (auto.wb[c] / warm.wb[c] - 1.).abs() < 0.02,
@@ -743,7 +789,7 @@ mod tests {
     fn exposure_raises_dark_photos_and_lowers_bright_ones() {
         for (level, brighter) in [(0.04, true), (3., false)] {
             let im = scene([1.; 3], level);
-            let auto = auto_tone(&im, &Recipe::default()).unwrap();
+            let auto = auto_tone(&im, &Recipe::default(), Cancel::NEVER).unwrap();
             assert_eq!(auto.exposure > 0., brighter, "exposure {}", auto.exposure);
         }
     }
@@ -754,7 +800,7 @@ mod tests {
         // opens Shadows, darkens Blacks, sets Contrast to +6 and adds Vibrance and, for a
         // photo without colour, Saturation (see docs/tone-controls.md); these are the
         // fitted model's values, so a change to it shows here.
-        let auto = auto_tone(&scene([1.; 3], 0.5), &Recipe::default()).unwrap();
+        let auto = auto_tone(&scene([1.; 3], 0.5), &Recipe::default(), Cancel::NEVER).unwrap();
         let got = [
             auto.exposure,
             auto.contrast,
@@ -776,7 +822,7 @@ mod tests {
     fn contrast_is_the_same_for_every_photo_as_in_lightroom() {
         // Lightroom's current Auto gives Contrast +5 to +7 whatever the photo.
         for (cast, level) in [([1.; 3], 0.04), ([1.; 3], 3.), ([1.6, 1., 0.4], 0.5)] {
-            let auto = auto_tone(&scene(cast, level), &Recipe::default()).unwrap();
+            let auto = auto_tone(&scene(cast, level), &Recipe::default(), Cancel::NEVER).unwrap();
             assert_eq!(auto.contrast, AUTO_CONTRAST, "{cast:?} at {level}");
         }
     }
@@ -784,7 +830,7 @@ mod tests {
     #[test]
     fn muted_photos_get_more_saturation_than_colourful_ones() {
         let saturation = |cast| {
-            auto_tone(&scene(cast, 0.5), &Recipe::default())
+            auto_tone(&scene(cast, 0.5), &Recipe::default(), Cancel::NEVER)
                 .unwrap()
                 .saturation
         };
@@ -804,8 +850,8 @@ mod tests {
             *p = [8.; 3];
         }
         let base = Recipe::default();
-        let clean = auto_tone(&clean, &base).unwrap().exposure;
-        let bright = auto_tone(&bright, &base).unwrap().exposure;
+        let clean = auto_tone(&clean, &base, Cancel::NEVER).unwrap().exposure;
+        let bright = auto_tone(&bright, &base, Cancel::NEVER).unwrap().exposure;
         assert!(bright < clean - 0.1, "{bright} vs {clean}");
     }
 
@@ -819,8 +865,8 @@ mod tests {
             *p = [0.; 3];
         }
         let base = Recipe::default();
-        let open = auto_tone(&open, &base).unwrap().blacks;
-        let crushed = auto_tone(&crushed, &base).unwrap().blacks;
+        let open = auto_tone(&open, &base, Cancel::NEVER).unwrap().blacks;
+        let crushed = auto_tone(&crushed, &base, Cancel::NEVER).unwrap().blacks;
         assert!(crushed > open, "{crushed} vs {open}");
         assert!(crushed < 0., "{crushed}");
     }
@@ -839,7 +885,7 @@ mod tests {
             ..Default::default()
         };
         base.effects.clarity = -0.2;
-        let auto = auto_tone(&im, &base).unwrap();
+        let auto = auto_tone(&im, &base, Cancel::NEVER).unwrap();
         auto.validate().unwrap();
         assert_ne!(auto.exposure, base.exposure);
         // White balance, even a manual one, and everything else is as it was.
@@ -859,7 +905,7 @@ mod tests {
             contrast: 0.,
             ..base
         };
-        let fresh = auto_tone(&im, &untouched).unwrap();
+        let fresh = auto_tone(&im, &untouched, Cancel::NEVER).unwrap();
         assert_eq!(fresh.exposure, auto.exposure);
         assert_eq!(fresh.whites, auto.whites);
     }
@@ -880,8 +926,8 @@ mod tests {
         adjusted.effects.dehaze = 0.3;
         adjusted.effects.channels[2].points = vec![[0., 0.], [0.3, 0.2], [1., 1.]];
         adjusted.effects.vignette = -0.5;
-        let a = auto_tone(&im, &plain).unwrap();
-        let b = auto_tone(&im, &adjusted).unwrap();
+        let a = auto_tone(&im, &plain, Cancel::NEVER).unwrap();
+        let b = auto_tone(&im, &adjusted, Cancel::NEVER).unwrap();
         assert_eq!(AutoTone::of(&a), AutoTone::of(&b));
         // The adjustments themselves are kept.
         assert_eq!(b.curve, adjusted.curve);
@@ -893,7 +939,7 @@ mod tests {
     fn empty_or_black_photos_are_errors() {
         let mut im = scene([1.; 3], 0.5);
         im.pixels.iter_mut().for_each(|p| *p = [0.; 3]);
-        assert!(auto_white_balance(&im, &Recipe::default()).is_err());
+        assert!(auto_white_balance(&im, &Recipe::default(), Cancel::NEVER).is_err());
     }
 
     /// An XMP packet with `attrs` on its settings.
@@ -935,6 +981,7 @@ mod tests {
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         };
         // Measured on the preset's crop: the warm half.
         let attrs = r#"c:WhiteBalance="Auto" c:CropLeft="0" c:CropTop="0" c:CropRight="0.45" c:CropBottom="1""#;
@@ -944,8 +991,8 @@ mod tests {
             crop: result.crop,
             ..Default::default()
         };
-        let auto = auto_white_balance(&im, &cropped)?;
-        let whole = auto_white_balance(&im, &Recipe::default())?;
+        let auto = auto_white_balance(&im, &cropped, Cancel::NEVER)?;
+        let whole = auto_white_balance(&im, &Recipe::default(), Cancel::NEVER)?;
         assert_ne!(auto.wb, whole.wb);
         assert_eq!(
             (result.wb, result.temperature, result.tint),
@@ -980,6 +1027,7 @@ mod tests {
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         };
         let attrs = r#"c:ConvertToGrayscale="True" c:AutoGrayscaleMix="True""#;
         let preset = crate::xmp::parse(std::path::Path::new("auto.xmp"), &packet(attrs))?;

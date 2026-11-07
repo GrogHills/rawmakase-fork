@@ -6,8 +6,8 @@ use crate::catalog::{Catalog, PhotoId, ReadChecksum};
 use crate::storage::{ChecksumRead, FileChecksum, Identity};
 use crate::{export_settings::ExportOptions, model::recipe::Recipe};
 use anyhow::Result;
+use rawmakase_cancel::Cancel;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 
 /// Distinct synthetic bytes, larger than the quick hash's three blocks.
 fn bytes(seed: u8) -> Vec<u8> {
@@ -106,7 +106,7 @@ impl Fixture {
         online: &dyn Fn(&Path) -> bool,
     ) -> Result<SyncPlan> {
         let inputs = self.cat.find_inputs(id, file)?;
-        find_on_disk(&inputs, online, &AtomicBool::new(false), &|_| {})
+        find_on_disk(&inputs, online, Cancel::NEVER, &|_| {})
     }
     fn apply(&mut self, plan: &SyncPlan, accepted: &Accepted) -> Result<Applied> {
         self.cat
@@ -124,6 +124,7 @@ impl Fixture {
         self.cat.save_edit(
             id,
             &path,
+            &crate::storage::Identity::read(&path)?,
             &recipe,
             &ExportOptions::default(),
             crate::catalog::HistoryUpdate::Keep,
@@ -359,8 +360,9 @@ fn the_picked_file_without_a_checksum_is_ticked_but_not_verified() -> Result<()>
     assert_eq!(plan.default_accepted().moves.len(), 1);
     f.apply(&plan, &plan.default_accepted())?;
     assert_eq!(f.path_of(a), out.join("IMG_1001.dng"));
-    // Its edit stays protected, as after a probable move.
-    assert!(f.cat.load_edit(a, &out.join("IMG_1001.dng")).is_err());
+    // Not verified, but the same photo (`Identity::same_photo`): its edit
+    // still applies.
+    assert!(f.cat.load_edit(a, &out.join("IMG_1001.dng"))?.is_some());
     Ok(())
 }
 

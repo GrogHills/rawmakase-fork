@@ -10,6 +10,7 @@
 //! against their last accepted renders.
 //!
 //! RAWMAKASE_BLESS=1 rewrites charts, snapshots and baselines instead of comparing.
+use rawmakase_cancel::Cancel;
 mod black_render;
 mod chart;
 mod dng;
@@ -28,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
 };
 
 pub fn corpus() -> PathBuf {
@@ -214,7 +215,7 @@ pub fn develop(path: &Path) -> CameraImage {
         .and_then(|r| {
             r.develop(
                 rawmakase::camera_data::Decode::full(Default::default()),
-                &AtomicBool::new(false),
+                Cancel::NEVER,
             )
         })
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -236,7 +237,7 @@ pub fn render(
         profiles,
         Some(&rawmakase::develop::Measures(im)),
     )?;
-    rawmakase::develop::render(im, &recipe.checked()?, max_edge)
+    rawmakase::develop::render(im, &recipe.checked()?, max_edge, Cancel::NEVER)
 }
 
 /// The DNG's own embedded profile, and nothing from the user's library. A DNG

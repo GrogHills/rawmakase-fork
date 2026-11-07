@@ -4,7 +4,7 @@
 //! command for the shared undo log, which puts back each photo's rows as they
 //! were, absent ones included.
 use super::{Library, Place};
-use crate::app::widgets::plural;
+use crate::app::ui::widgets::plural;
 use crate::catalog::{MetadataSnapshot, PhotoId};
 use crate::metadata::TextField;
 use anyhow::{Result, ensure};
@@ -149,7 +149,7 @@ impl Library {
             1 => what.to_string(),
             n => format!("{n} photos · {what}"),
         };
-        self.message = summary.clone();
+        self.messages.note(summary.clone());
         self.descriptive_done.push(DescriptiveCommand::new(
             before,
             after,
@@ -195,21 +195,21 @@ impl Library {
         let wanted: std::collections::HashSet<PhotoId> = ids.iter().copied().collect();
         let photos: Vec<(PhotoId, std::path::PathBuf)> = self
             .session
-            .photos
+            .photos()
             .iter()
             .filter(|p| wanted.contains(&p.id) && p.master.is_none())
             .map(|p| (p.id, p.path.clone()))
             .collect();
         if photos.is_empty() {
-            self.message = "Virtual copies are never read from files".into();
+            self.messages
+                .warn("Virtual copies are never read from files");
             return Ok(());
         }
         if self.reread.is_some() {
-            self.message = "Still reading metadata from files; try again when it's done".into();
+            self.messages
+                .warn("Still reading metadata from files; try again when it's done");
             return Ok(());
         }
-        let n = photos.len();
-        self.message = format!("Reading metadata from {}…", plural(n, "file", "files"));
         self.reread = Some(Reread {
             paths: photos.iter().cloned().collect(),
             reader: crate::catalog_session::background::Reader::start(
@@ -228,7 +228,8 @@ impl Library {
     /// change that may give photos' ids to others.
     pub(in crate::app) fn cancel_reread(&mut self) {
         if self.reread.take().is_some() {
-            self.message = "Read Metadata from Files stopped; nothing was read".into();
+            self.messages
+                .note("Read Metadata from Files stopped; nothing was read");
             self.reread_finished = true;
         }
     }
@@ -258,13 +259,14 @@ impl Library {
         }
         let reread = self.reread.take().unwrap();
         if let Err(e) = self.finish_reread(reread) {
-            self.message = format!("Metadata not read: {e:#}");
+            self.messages.fail(format!("Metadata not read: {e:#}"));
         }
         self.reread_finished = true;
     }
     fn finish_reread(&mut self, reread: Reread) -> Result<()> {
         if reread.generation != self.session.generation() {
-            self.message = "The catalog changed while its files were read; nothing was read".into();
+            self.messages
+                .warn("The catalog changed while its files were read; nothing was read");
             return Ok(());
         }
         // Photos removed, or made copies, while their files were read are
@@ -281,14 +283,14 @@ impl Library {
             .filter(|id| self.photo(*id).is_some())
             .collect();
         let wanted: std::collections::HashSet<PhotoId> = ids.iter().copied().collect();
-        let before = self.session.catalog.metadata_snapshot(&ids)?;
+        let before = self.session.catalog().metadata_snapshot(&ids)?;
         let ratings_before = self.ratings_by_id(&wanted);
         let mut report = reread.report;
         let written = self.session.apply_file_metadata(&ids, &read)?;
         report.unreadable.extend(written.unreadable);
         self.resort_by_capture_time();
         self.filter();
-        let after = self.session.catalog.metadata_snapshot(&ids)?;
+        let after = self.session.catalog().metadata_snapshot(&ids)?;
         let ratings_after = self.ratings_by_id(&wanted);
         let n = ids.len();
         let mut summary = format!("Read metadata from {}", plural(n, "file", "files"));
@@ -296,7 +298,13 @@ impl Library {
             summary.push_str(" · ");
             summary.push_str(&problems);
         }
-        self.set_message_with_detail(summary.clone(), report.details());
+        if report.summary().is_some() {
+            self.messages
+                .warn_with_detail(summary.clone(), report.details());
+        } else {
+            self.messages
+                .done_with_detail(summary.clone(), report.details());
+        }
         self.fields.reload();
         if before != after || ratings_before != ratings_after {
             self.descriptive_done.push(
@@ -310,7 +318,7 @@ impl Library {
     fn ratings_by_id(&self, wanted: &std::collections::HashSet<PhotoId>) -> Vec<super::Metadata> {
         let mut found = super::metadata::ratings_of(
             self.session
-                .photos
+                .photos()
                 .iter()
                 .filter(|p| wanted.contains(&p.id)),
         );

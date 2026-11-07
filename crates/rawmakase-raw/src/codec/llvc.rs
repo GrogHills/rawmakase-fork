@@ -11,7 +11,7 @@
 //! reconstructs to the middle of the quantisation step.
 use super::bits::Msb;
 use crate::error::{Error, Result, corrupt};
-use std::sync::atomic::{AtomicBool, Ordering};
+use rawmakase_cancel::Cancel;
 
 /// The deepest coefficient bit depth decoded.
 const MAX_DEPTH: u32 = 24;
@@ -23,17 +23,17 @@ pub(crate) struct Half<'a> {
 }
 
 impl<'a> Half<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Self {
             bits: Msb::new(data),
             len: data.len() as u64 * 8,
         }
     }
     /// The bits read so far.
-    pub fn consumed(&self) -> u64 {
+    pub(crate) fn consumed(&self) -> u64 {
         self.bits.consumed()
     }
-    pub fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         self.len
     }
     fn check(&self) -> Result<()> {
@@ -193,17 +193,17 @@ pub(crate) struct Plane {
 }
 
 impl Plane {
-    pub fn zeros(width: usize, height: usize) -> Self {
+    pub(crate) fn zeros(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
             data: vec![0; width * height],
         }
     }
-    pub fn row(&self, y: usize) -> &[i32] {
+    pub(crate) fn row(&self, y: usize) -> &[i32] {
         &self.data[y * self.width..(y + 1) * self.width]
     }
-    pub fn row_mut(&mut self, y: usize) -> &mut [i32] {
+    pub(crate) fn row_mut(&mut self, y: usize) -> &mut [i32] {
         &mut self.data[y * self.width..(y + 1) * self.width]
     }
 }
@@ -243,12 +243,12 @@ fn lift(l: &[i32], h: &[i32], phase: usize, even: &mut Vec<i32>, out: &mut [i32]
 }
 
 /// The vertical inverse of a low and a high band of equal width.
-fn vertical(low: &Plane, high: &Plane, phase: usize, cancel: &AtomicBool) -> Result<Plane> {
+fn vertical(low: &Plane, high: &Plane, phase: usize, cancel: Cancel<'_>) -> Result<Plane> {
     let (w, n) = (low.width, low.height + high.height);
     let mut out = Plane::zeros(w, n);
     let (mut l, mut h, mut col, mut even) = (vec![], vec![], vec![0; n], vec![]);
     for x in 0..w {
-        if x % 4 == 0 && cancel.load(Ordering::Relaxed) {
+        if x % 4 == 0 && cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         l.clear();
@@ -265,12 +265,12 @@ fn vertical(low: &Plane, high: &Plane, phase: usize, cancel: &AtomicBool) -> Res
 
 /// The horizontal inverse of a low and a high band of equal height, low
 /// samples at even columns.
-fn horizontal(low: &Plane, high: &Plane, cancel: &AtomicBool) -> Result<Plane> {
+fn horizontal(low: &Plane, high: &Plane, cancel: Cancel<'_>) -> Result<Plane> {
     let (n, rows) = (low.width + high.width, low.height);
     let mut out = Plane::zeros(n, rows);
     let mut even = vec![];
     for y in 0..rows {
-        if y % 16 == 0 && cancel.load(Ordering::Relaxed) {
+        if y % 16 == 0 && cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         lift(low.row(y), high.row(y), 0, &mut even, out.row_mut(y));
@@ -288,7 +288,7 @@ pub(crate) struct Level<'a> {
 
 /// One level's 2-D inverse (RDD 34 figure 6.10): vertical on LL with LH and
 /// on HL with HH (low rows at `phase`), then horizontal.
-pub(crate) fn inverse(b: &Level, phase: usize, cancel: &AtomicBool) -> Result<Plane> {
+pub(crate) fn inverse(b: &Level, phase: usize, cancel: Cancel<'_>) -> Result<Plane> {
     let fits = b.ll.width == b.lh.width
         && b.hl.width == b.hh.width
         && b.ll.height == b.hl.height

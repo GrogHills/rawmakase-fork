@@ -14,7 +14,7 @@ use std::{
     thread::JoinHandle,
 };
 
-/// Textures kept per cache; older ones are dropped first.
+/// Textures kept per cache; older ones not shown are dropped first.
 const KEPT: usize = 192;
 /// Photos asked for ahead at once; looked at for it in a frame; whose edit
 /// is read from the catalog for it in a frame, on the UI thread; and asked
@@ -63,6 +63,14 @@ pub(super) struct PreviewTextures {
     /// Photos one view shows at once, e.g. a large survey; never fewer
     /// textures are kept, so none is dropped while it is shown.
     pub(super) shown_at_once: usize,
+    /// Files whose thumbnail is shown this frame, by every view together.
+    pub(super) thumb_seen: HashSet<PathBuf>,
+    /// The files and photos shown in the last frame, by every view together
+    /// (the grid and the filmstrip below it). Never fewer textures are kept,
+    /// and these are never the ones dropped, so a grid of more cells than
+    /// [`KEPT`] doesn't drop thumbnails it shows.
+    shown_files: HashSet<PathBuf>,
+    shown_photos: HashSet<PhotoId>,
     /// The two workers, to wait for at exit.
     threads: [Option<JoinHandle<()>>; 2],
 }
@@ -99,6 +107,9 @@ impl PreviewTextures {
             edited_order: VecDeque::new(),
             progress: Progress::default(),
             shown_at_once: 0,
+            thumb_seen: HashSet::new(),
+            shown_files: HashSet::new(),
+            shown_photos: HashSet::new(),
             threads: [Some(thumbs), Some(edits)],
         }
     }
@@ -169,8 +180,14 @@ impl PreviewTextures {
     }
     /// Hands the worker the photos shown last frame. Call once per frame.
     pub(super) fn publish_shown(&mut self) {
-        let shown = std::mem::take(&mut self.edit_seen);
-        *self.edit_wanted.lock().unwrap() = shown;
+        self.shown_files = std::mem::take(&mut self.thumb_seen);
+        self.shown_photos = std::mem::take(&mut self.edit_seen);
+        *self.edit_wanted.lock().unwrap() = self.shown_photos.clone();
+    }
+    /// How many textures of each kind are kept: [`KEPT`], or as many as are
+    /// shown at once.
+    fn kept(&self) -> usize {
+        KEPT.max(self.shown_at_once).max(self.shown_photos.len())
     }
     pub(super) fn insert_thumb(
         &mut self,
@@ -179,11 +196,21 @@ impl PreviewTextures {
         im: &image::RgbImage,
     ) {
         if !self.thumbs.contains_key(&path) {
-            while self.thumbs.len() >= KEPT.max(self.shown_at_once) {
-                let Some(old) = self.thumb_order.pop_front() else {
-                    break;
-                };
-                self.thumbs.remove(&old);
+            while self.thumbs.len() >= self.kept() {
+                match oldest_not_shown(&mut self.thumb_order, &self.shown_files) {
+                    Some(old) => {
+                        self.thumbs.remove(&old);
+                    }
+                    // Every one kept is shown and this one isn't: it is the
+                    // one not kept, asked for again once shown.
+                    None if !self.shown_files.contains(&path) => return,
+                    None => match self.thumb_order.pop_front() {
+                        Some(old) => {
+                            self.thumbs.remove(&old);
+                        }
+                        None => break,
+                    },
+                }
             }
             self.thumb_order.push_back(path.clone());
         }
@@ -192,9 +219,18 @@ impl PreviewTextures {
     }
     pub(super) fn insert_edited(&mut self, ctx: &egui::Context, id: PhotoId, im: &image::RgbImage) {
         if !self.edited.contains_key(&id) {
-            while self.edited.len() >= KEPT.max(self.shown_at_once) {
-                let Some(old) = self.edited_order.pop_front() else {
-                    break;
+            while self.edited.len() >= self.kept() {
+                let old = match oldest_not_shown(&mut self.edited_order, &self.shown_photos) {
+                    Some(old) => old,
+                    // As for thumbnails: not kept, so asked for again.
+                    None if !self.shown_photos.contains(&id) => {
+                        self.edited_requested.remove(&id);
+                        return;
+                    }
+                    None => match self.edited_order.pop_front() {
+                        Some(old) => old,
+                        None => break,
+                    },
                 };
                 self.edited.remove(&old);
                 self.edited_requested.remove(&old);
@@ -211,6 +247,11 @@ impl PreviewTextures {
     fn ticket(&mut self) -> u64 {
         self.next_ticket += 1;
         self.next_ticket
+    }
+    /// Asks for the photo's edited preview again the next time it is shown,
+    /// keeping the one shown until then.
+    pub(super) fn ask_again(&mut self, id: PhotoId) {
+        self.edited_requested.remove(&id);
     }
     /// Forgets a removed photo's previews, so a later photo given its id
     /// starts afresh.
@@ -251,6 +292,7 @@ impl PreviewTextures {
         self.request_edited(photo, edit);
     }
     pub(super) fn request_thumbnail(&mut self, path: &Path, ctx: &egui::Context) {
+        self.thumb_seen.insert(path.to_path_buf());
         if !self.thumbs.contains_key(path)
             && !self.pending.contains(path)
             && !self.failed.contains(path)
@@ -367,20 +409,29 @@ impl PreviewTextures {
         }
     }
     /// Shows Develop's latest render as the photo's thumbnail and caches it
-    /// under the edit it was rendered with. Renders still in flight are older.
+    /// under `tag`, the preview tag of the edit it was rendered with, for the
+    /// file as `stamp` gives it when it was rendered (none: it is shown, not
+    /// cached). Renders still in flight are older.
     pub(super) fn store_edited(
         &mut self,
         ctx: &egui::Context,
         id: PhotoId,
         path: PathBuf,
+        stamp: Option<crate::catalog::preview_cache::Stamp>,
+        tag: String,
         image: image::RgbImage,
-        recipe_json: String,
     ) {
-        let tag = EditSource::Recipe(recipe_json).preview_tag();
         let ticket = self.ticket();
         self.edited_requested.insert(id, ticket);
         self.insert_edited(ctx, id, &image);
-        let _ = self.edit_tx.send(EditJob::Store { path, tag, image });
+        if let Some(stamp) = stamp {
+            let _ = self.edit_tx.send(EditJob::Store {
+                path,
+                tag,
+                stamp,
+                image,
+            });
+        }
     }
     /// Worth a status line: still working, or something could not be prepared.
     pub(super) fn progress_active(&self) -> bool {
@@ -390,6 +441,15 @@ impl PreviewTextures {
         self.progress
             .show(ui, self.edits_pending, !self.ahead.is_empty());
     }
+}
+/// Takes the oldest of `order` not shown in the last frame; `None` when all
+/// are. Dropping one shown would have it asked for again at once.
+fn oldest_not_shown<K: Eq + std::hash::Hash>(
+    order: &mut VecDeque<K>,
+    shown: &HashSet<K>,
+) -> Option<K> {
+    let at = order.iter().position(|k| !shown.contains(k))?;
+    order.remove(at)
 }
 fn texture(ctx: &egui::Context, name: String, im: &image::RgbImage) -> egui::TextureHandle {
     ctx.load_texture(

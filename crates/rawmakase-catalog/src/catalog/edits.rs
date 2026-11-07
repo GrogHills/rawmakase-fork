@@ -4,6 +4,7 @@ use super::db::{Reads, Write, sql};
 use super::value::row;
 use super::{Catalog, PhotoId};
 use crate::edits::{SavedEdit, local_edits};
+use crate::storage::Identity;
 use crate::{export_settings::ExportOptions, model::recipe::Recipe};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -18,12 +19,18 @@ pub enum EditChange<'a, 'b> {
 pub struct EditToSave<'a> {
     pub id: PhotoId,
     pub path: &'a Path,
+    /// The file the edit was made for, as read when its photo was opened or its
+    /// settings read: a save to a file at `path` that is no longer the same photo
+    /// ([`Identity::same_photo`]) is refused, even with no saved edit there to
+    /// protect.
+    pub source: &'a Identity,
     pub recipe: &'a Recipe,
     pub export: &'a ExportOptions,
     pub history: super::HistoryUpdate<'a>,
 }
 
 impl Catalog {
+    #[cfg(any(test, feature = "test-support"))]
     /// Stores `bitmap` once and returns the hash that refers to it.
     pub fn put_bitmap(&mut self, bitmap: &crate::storage::bitmaps::Bitmap) -> Result<String> {
         let hash = bitmap.hash();
@@ -43,6 +50,7 @@ impl Catalog {
         &mut self,
         id: PhotoId,
         path: &Path,
+        source: &Identity,
         recipe: &Recipe,
         export: &ExportOptions,
         history: super::HistoryUpdate<'_>,
@@ -50,6 +58,7 @@ impl Catalog {
         self.save_edits(&[EditToSave {
             id,
             path,
+            source,
             recipe,
             export,
             history,
@@ -76,10 +85,28 @@ impl Catalog {
             }
             Ok(())
         };
-        // Saving a recipe upgrades an earlier catalog with the write; clearing
-        // stores none.
+        // Saving a recipe upgrades an earlier catalog with the write, to the format
+        // for Lensfun lenses when the edit or any state of its History names one;
+        // clearing stores none.
         if changes.iter().any(|c| matches!(c, EditChange::Save(_))) {
-            self.write_recipes(write)?;
+            let recipes = changes.iter().flat_map(|c| match c {
+                EditChange::Save(e) => {
+                    let history = match e.history {
+                        super::HistoryUpdate::Replace(h) => Some(h),
+                        super::HistoryUpdate::Keep => None,
+                    };
+                    std::iter::once(e.recipe)
+                        .chain(history.map(|h| &h.origin))
+                        .chain(
+                            history
+                                .into_iter()
+                                .flat_map(|h| h.steps.iter().map(|s| &s.recipe)),
+                        )
+                        .collect::<Vec<_>>()
+                }
+                EditChange::Clear { .. } => Vec::new(),
+            });
+            self.write_recipes(super::format_upgrade::Stores::of(recipes), write)?;
         } else {
             self.db.write(write)?;
         }

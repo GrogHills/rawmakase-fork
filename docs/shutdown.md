@@ -37,14 +37,16 @@ changes what one waits on, updates its row here.
 "Stop" is the signal the worker checks; "Join" is what the exit hook may do.
 
 Each worker the exit hook waits for keeps its `JoinHandle`, and hands it over as a
-`task::Stopping` when asked to stop.
+`task::Stopping` when asked to stop. AI Denoise's service, shared with the command
+line, hands back its `JoinHandle` itself, and the app wraps it.
 
 Workers that read or decode photos behind the user's back start from
 `raw::spawn_background` or `raw::background_pool` (`crates/rawmakase-decode`):
 their threads run at a lower scheduling priority (Linux and Windows), and parallel
 work they start runs on a pool of two background threads, never the shared pool.
 The Library's edited previews use a wider pool while the Library is in front
-with nothing else rendering (up to four renders on every core but one; see
+with nothing else rendering (up to four renders on every core but one, one per
+4 GB of memory; see
 `previews::Pace`), and drop back to one render on two threads, cancelling the
 wider renders under way, when it is not. Its thumbnail workers (two to four, by
 core count) run at normal priority, as the one worker before them did, so the
@@ -58,29 +60,41 @@ that drops it.
 | Develop loader, with its full-size loader and prefetcher | `app/worker/loader.rs` | A job; file I/O, RAW decodes and JPEG, PNG or TIFF decodes (cancellable between rows); decode cache reads and writes | All three `Latest`s stopped, between jobs; the load `Task`'s cancel within one; `prefetch_cancel` for a prefetch | Yes, all three, after cancelling the load and the prefetch |
 | Preview renderer | `app/worker/renderer.rs` | A job; CPU and GPU renders, up to 10 s per GPU submission; the egui renderer lock, briefly | `Latest` stopped; the After and Before render `Task`s | Yes, before the painter and device are dropped |
 | Reference View loader | `app/worker/reference.rs` | A job; file I/O and decodes | `Latest` stopped; the reference `Task` | Yes |
-| Autosave | `app/autosave.rs` | The job channel; one SQLite commit | Its job sender dropped | Yes, after the save at exit and dropping the job sender, which lets a save in flight finish |
+| Autosave | `app/develop/autosave.rs` | The job channel; one SQLite commit | Its job sender dropped | Yes, after the save at exit and dropping the job sender, which lets a save in flight finish |
 | Export queue | `export/queue.rs` | A batch: decodes, renders and file writes | `closed`, between batches; the running batch's cancel, between photos and stages | Yes, after cancelling the running batch |
-| Preview builds | `app/preview_build.rs` | A queue of photos: decodes, renders and one SQLite write each | `closed`, between photos; the running build's cancel, inside the decode and render | Yes, after cancelling |
-| Command output jobs | `app/commands/output.rs` | One export or preview job | Each job's cancel, between stages | Yes, after cancelling; the close guard waits for them |
-| MIDI listener | `app/automation/midi.rs` | A 2 s wait on its stop channel between port scans | The device dropped, which closes the channel | Yes; it stops at once |
-| Control socket listener | `app/automation/socket.rs` | A blocking `accept`; then its connections, which it joins | The stop flag, seen after a wake-up connection | Yes, under the deadline: if the wake-up connection fails, `accept` never returns |
-| Control socket connections | `app/automation/socket.rs` | A 5 s read; **a wait for the UI thread's reply: 3 s, or up to 8 s for a `wait` command**; a 5 s write | The stop flag; the request queue's receiver dropped, which answers the wait at once | Through the listener, after the request queue's receiver is dropped |
-| Library thumbnails | `app/library/previews.rs` | Two to four workers side by side (scoped threads), each with its own preview cache connection: the shared request channel; preview cache and file reads; **a send on a result channel bounded at 24** | Its channels dropped; the thread joined returns once every worker has | Yes, after dropping the result receiver |
-| Stored preview readers (opening, neighbour) | `app/stand_in.rs` | A job; one preview cache read and JPEG decode | Both `Latest`s stopped, between jobs | Yes, both |
-| Library edited previews | `app/library/previews.rs` | A queue of renders, one or several under way on its pools; the preview cache's lock, briefly | Its queue closed (`EditQueue::close`, or dropped), which cancels every render under way; the worker returns once they have stopped | Yes, after closing |
+| Preview builds | `app/library/preview_build.rs` | A queue of photos: decodes, renders and one SQLite write each | `closed`, between photos; the running build's cancel, inside the decode and render | Yes, after cancelling |
+| Command output jobs | `app/shell/commands/output.rs` | One export or preview job | Each job's cancel, between stages | Yes, after cancelling; the close guard waits for them |
+| MIDI listener | `app/shell/automation/midi.rs` | A 2 s wait on its stop channel between port scans | The device dropped, which closes the channel | Yes; it stops at once |
+| Control socket listener | `app/shell/automation/socket.rs` | A blocking `accept`; then its connections, which it joins | The stop flag, seen after a wake-up connection | Yes, under the deadline: if the wake-up connection fails, `accept` never returns |
+| Control socket connections | `app/shell/automation/socket.rs` | A 5 s read; **a wait for the UI thread's reply: 3 s, or up to 8 s for a `wait` command**; a 5 s write | The stop flag; the request queue's receiver dropped, which answers the wait at once | Through the listener, after the request queue's receiver is dropped |
+| Library thumbnails | `app/library/previews/thumbnails.rs` | Two to four workers side by side (scoped threads), each with its own preview cache connection: the shared request channel; preview cache and file reads; **a send on a result channel bounded at 24** | Its channels dropped; the thread joined returns once every worker has | Yes, after dropping the result receiver |
+| Stored preview readers (opening, neighbour) | `app/develop/stand_in.rs` | A job; one preview cache read and JPEG decode | Both `Latest`s stopped, between jobs | Yes, both |
+| Library edited previews | `app/library/previews/edits.rs` | A queue of renders, one or several under way on its pools; the preview cache's lock, briefly | Its queue closed (`EditQueue::close`, or dropped), which cancels every render under way; the worker returns once they have stopped | Yes, after closing |
 | Library screen previews | `app/library/screen.rs` | A job; renders | `ScreenPreviews` closed, which cancels the renders under way | Yes, after closing |
 | Library background readers | `catalog_session/background.rs` | File reads in batches, possibly on a network share | The reader's cancel, per batch | No: a stalled share can hang a read |
-| Synchronize Folder scan | `app/folder_sync.rs` | Listing folders and hashing files, possibly on a network share | Its cancel flag, between files and hash chunks | Yes, under the deadline: a stalled read can't be interrupted |
+| Synchronize Folder scan | `app/catalog/folder_sync.rs` | Listing folders and hashing files, possibly on a network share | Its cancel flag, between files and hash chunks | Yes, under the deadline: a stalled read can't be interrupted |
 | Checksum reader | `catalog_session/checksums.rs` | Reading one file in 1 MiB chunks, possibly on a network share; the rate limit's sleeps; a pause | The reader's cancel, between chunks and while paused | No: a stalled share can hang a read |
-| Volume probe | `app/library/volumes.rs` | Each root's mount (`statfs`, the volume's name, mountinfo or `GetVolumePathNameW`), whether each drive is mounted and its free space; writing `drives.json` | None (one check per thread) | No: it can hang on a stalled mount |
-| Subject selection | `app/subject_mask/worker.rs` | A job: the input render, then the photo's analysis (a few seconds: embedding, saliency, a grid of decodes) when not kept, then a decode for a click — locally, or over the remote worker, where every wait is a bounded socket read (at most 3 min) and the cancel flag is forwarded to the worker, which stops its model run; it keeps its session until it ends | Its cancel flag, raised at exit and forwarded mid-request; its mailbox dropped | Yes, under the deadline; the thread owns the runtime, which is never unloaded under a running call, and no socket wait outlasts the deadline without the cancel ending it |
-| Selection model install | `app/subject_mask/models.rs` | HTTP for five files, as requests resuming where the file stopped (connect 20 s, 30 s per response, 60 s for each body in total, 2 min each request) and file writes, in 256 KB chunks | Its cancel flag, between chunks and requests, and while waiting for another window's install | Yes, under the deadline; a partial download is kept for the next install to resume, under the folder's install lock |
+| Volume probe | `app/library/volumes.rs` | Each root's mount (`statfs`, the volume's name, mountinfo or `GetVolumePathNameW` and the serial number), whether each drive is mounted and its free space; writing `drives.json` | None (one check per thread) | No: it can hang on a stalled mount |
+| Subject selection | `app/develop/tools/subject_mask/worker.rs` | A job: the input render, then the photo's analysis (a few seconds: embedding, saliency, a grid of decodes) when not kept, then a decode for a click — locally, or over the remote worker, where every wait is a bounded socket read (at most 3 min) and the cancel flag is forwarded to the worker, which stops its model run; it keeps its session until it ends | Its cancel flag, raised at exit and forwarded mid-request; its mailbox dropped | Yes, under the deadline; the thread owns the runtime, which is never unloaded under a running call, and no socket wait outlasts the deadline without the cancel ending it |
+| Selection and AI Denoise model install | `app/develop/tools/subject_mask/models.rs` (the work is `model_install/`) | One thread per pack (Subject's five files, Sky's one, AI Denoise's model with its `LICENSE`, `NOTICE` and model card). HTTP for its files, as requests resuming where the file stopped (connect 20 s, 30 s per response, 60 s for each body in total, 2 min each request) and file writes, in 256 KB chunks | Its cancel flag, between chunks and requests, and while waiting for another window's install | Yes, under the deadline; a partial download is kept for the next install to resume, under the folder's install lock |
+| AI Denoise | `ai_denoise/mod.rs` (`Service`, thread `ai-denoise`) | Its queue (a condition variable); one job at a time: opening and packing the RAW (a full decode for X-Trans), ONNX Runtime tile runs (about 0.3 s each on an M1 Pro's CPU, with the default thread count less two), and writing its cache entry (150–370 MB). Export waiters block on the queue in 100 ms waits, checking their own cancel and the stop flag | The stop flag, between jobs; the running job's cancel, between tiles and inside a run (ONNX Runtime terminates it); queued jobs dropped. A waiting export fails at once | Yes, under the deadline; the thread owns its ONNX session, never unloaded under a running call; removing the model cancels the running job and has the worker drop its sessions between jobs, waited for up to 5 s off the UI thread. A cancel stores nothing. The CLI's `CommandLine` has no exit hook: dropping it at the end of `render` or `render-batch` signals its worker and waits for it at most 3 s, the one wait in a `Drop` here |
+| The Loupe's AI Denoise loader | `app/develop/ai_denoise.rs` (`cached_loader`) | A job; reading one finished result from the AI Denoise cache (150–370 MB), assembling it over the photo's full-size image and recovering its highlights. It never runs the model | `Latest` stopped, between jobs; the photo's load cancel, set when the photo is left or another load replaces it, between the cache read, the assembly and the recovery | Yes |
+| Lensfun profiles | `app/develop/lensfun.rs` (the work is `lensfun_install.rs`) | One job: `versions.json` and the archive over HTTPS (connect 20 s, 30 s per response, 60 s for the body, 2 min each request), unpacking and checking it in memory, writing one version folder and the manifest; or removing the folder; or waiting for another instance's install lock (at most 5 min) | Its cancel flag, between download chunks, archive entries and files written, before the version folder is renamed and before the manifest is written, and while waiting for the lock | Yes, under the deadline; a cancel before the manifest leaves the version in use, and a crash leaves a staging folder the next install removes |
+| Camera-profile download | `app/develop/profile_download.rs` | One HTTPS request (connect 10 s, response 15 s, body 20 s, total 30 s), bounded reads and atomic profile import | Cancel claims the task before publication; checked between reads and before import. An install already publishing finishes atomically | No: a one-shot task stays detached; network waits are bounded, staging files are temporary and the library importer never clobbers an existing file. Dropping its task signals cancellation; a panic reports failure through the normal task wrapper |
 | Availability check | `app/library/availability.rs` | File metadata for every photo | None | No, for the same reason |
-| Update checker | `app/updates.rs` | Up to an hour between checks; a check or download of up to 15 min | Its request sender dropped, between requests | No: a download has no cancel |
+| Update checker | `app/shell/updates.rs` | Up to an hour between checks; a check or download of up to 15 min | Its request sender dropped, between requests | No: a download has no cancel |
 | Installation probe | `diagnostics.rs` | `updates::installation()`, which can run the package manager | None; the system probe stops waiting for it after 10 s and reports it unavailable | No |
 | GVFS bridge reaper (Linux) | `platform/network.rs` | The bridge process, which outlives the app | None | Never |
 
-One-shot jobs stay detached: Auto, Upright, Auto straighten, the Point Color and
+The Develop loader, Reference View, Library previews, preview builds, exports and
+Sync also fit the default Camera Look of a photo without colour data, once per file
+and build (seconds; a fit cache hit otherwise, and nothing for every other photo).
+The fit takes the job's cancel flag inside its renders and between its stages, so it
+stops as a decode does; a fit stopped that way is neither used nor cached. A job
+waiting for another's fit of the same file sees its own cancel within 50 ms.
+
+One-shot jobs stay detached: Auto, Upright, Auto straighten, Profile → Fit Camera
+Look, the Point Color and
 Targeted Adjustment samples, the onboarding scan, catalog open and import, file
 dialogs, bulk import, the preset scan, batch edits (Sync Settings, Auto Settings or a
 preset on the Library's selection; their Cancel is taken between photos and right
@@ -108,7 +122,8 @@ macOS run their panel on the main thread, so they are never joined from it.
    2. Close: drop the update request sender, the control request receiver and the
       library's channels.
    3. Stop: the `Latest` workers, the export queue, the command output jobs, the
-      library's previews, MIDI and the control socket.
+      library's previews, selection, AI Denoise (its stop flag and the running
+      run's cancel), the model installs, Lensfun, MIDI and the control socket.
    4. Save the edit, if the close guard did not, as it does, while those wind down;
       a failure, or a save still running at the deadline, is written to stderr.
       Then drop the autosave job sender.
@@ -119,6 +134,21 @@ macOS run their panel on the main thread, so they are never joined from it.
       its own waited for 0.5 s: they are on the folder an export may have stalled on.
 3. eframe drops the editor, then the painter. The detached workers end with the
    process.
+4. The process exits. Where HEIC photos decode through the system's libheif (Linux
+   and other Unix systems but macOS), its static destructors would crash a decode
+   still running on a detached worker, so an exit function registered when
+   libheif is first opened (`decode::raster::heic::libheif`) runs first: no decode,
+   or libheif initialization, starts after it, and it waits for those running up to
+   2 s, then ends the process at once with status 1 rather than run the
+   destructors under them. It is registered before libheif's initialization (an
+   exit during it waits for it) and again after it and the HEVC decoder check,
+   because the initialization loads decoder plugins whose destructors register
+   then, and the process runs exit functions and destructors in the reverse order
+   of their registration: once the initialization is done, the wait runs before
+   the plugins' destructors. An exit that begins during the initialization still
+   waits for it, but may run the destructors of plugins loaded by then first. This
+   ordering is hardening: no build has been shown to crash with the wait
+   registered before the plugins load.
 
 ## Quit on macOS
 
@@ -155,7 +185,9 @@ operation began, and nothing may be written while it holds the catalog.
 
 ## Where the code stands
 
-The exit hook (`app/exit.rs`) runs the sequence above (#269, #270, #330). Two
+The exit hook (`app/shell/exit.rs`) runs the sequence above (#269, #270, #330). The
+workers it stops, and their order, are the stop steps of the work-policy table in
+`app/work.rs`, which also says what closing waits for. Two
 writes still happen on the UI thread without a deadline: a Copy Name or metadata
 field being typed in the Library, which the close guard and the exit hook save
 through the catalog session before the edit, and the session file. Neither is

@@ -1,13 +1,18 @@
 //! Minimal bounded TIFF directory reading for RAW containers (ARW, DNG, the TIFF
 //! inside RAF) and the EXIF embedded in JPEGs, PNGs, WebPs, AVIFs, HEIFs and
 //! JPEG XL files. Reads only the directories and tags it is asked for.
+#![forbid(unsafe_code)]
+// Every public item says what it is for: this crate is a contract other crates
+// and clients build on (#808 step 4.13).
+#![warn(missing_docs)]
 use std::{
     collections::BTreeMap,
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
 
-/// TIFF field types.
+/// TIFF field types: the codes TIFF 6.0 gives them, under its names.
+#[allow(missing_docs)]
 pub mod kind {
     pub const BYTE: u16 = 1;
     pub const ASCII: u16 = 2;
@@ -26,9 +31,14 @@ pub mod kind {
 }
 use kind::*;
 
+/// One directory entry as stored.
 pub struct Entry {
+    /// Its field type ([`kind`]).
     pub kind: u16,
+    /// How many values of that type it has.
     pub count: u32,
+    /// The four bytes after the count, in the file's byte order: the values
+    /// themselves when they fit, else where they are, from `base`.
     pub value: [u8; 4],
 }
 impl Entry {
@@ -50,7 +60,9 @@ pub struct Tiff<R = File> {
     base: u64,
     /// How many bytes from `base` the TIFF may span; `None` to the file's end.
     len: Option<u64>,
+    /// Little-endian (`II`), else big-endian (`MM`).
     pub little: bool,
+    /// Where the first directory is, from `base`.
     pub first: u64,
 }
 impl<R: Read + Seek> Tiff<R> {
@@ -77,6 +89,30 @@ impl<R: Read + Seek> Tiff<R> {
             first: 0,
         }
     }
+    /// Headless directories in the `len` bytes at `offset` from this TIFF's
+    /// base (to its end when `None`), read through its source: a maker note
+    /// too large to read whole. Nothing outside them is read; `None` when
+    /// they run past this TIFF.
+    pub fn part(&mut self, offset: u64, len: Option<u64>, little: bool) -> Option<Tiff<&mut R>> {
+        let len = match (len, self.len) {
+            (Some(len), max) => {
+                let end = offset.checked_add(len)?;
+                if max.is_some_and(|max| end > max) {
+                    return None;
+                }
+                Some(len)
+            }
+            (None, Some(max)) => Some(max.checked_sub(offset)?),
+            (None, None) => None,
+        };
+        Some(Tiff {
+            f: &mut self.f,
+            base: self.base.checked_add(offset)?,
+            len,
+            little,
+            first: 0,
+        })
+    }
     fn start(f: R, base: u64, len: Option<u64>) -> Option<Self> {
         let mut t = Self {
             f,
@@ -96,6 +132,7 @@ impl<R: Read + Seek> Tiff<R> {
         t.first = t.u32(&h[4..8]) as u64;
         Some(t)
     }
+    /// `b`'s first two bytes as a number, in this TIFF's byte order.
     pub fn u16(&self, b: &[u8]) -> u16 {
         let a = [b[0], b[1]];
         if self.little {
@@ -104,6 +141,7 @@ impl<R: Read + Seek> Tiff<R> {
             u16::from_be_bytes(a)
         }
     }
+    /// `b`'s first four bytes as a number, in this TIFF's byte order.
     pub fn u32(&self, b: &[u8]) -> u32 {
         let a = [b[0], b[1], b[2], b[3]];
         if self.little {
@@ -125,6 +163,8 @@ impl<R: Read + Seek> Tiff<R> {
         self.f.read_exact(&mut b).ok()?;
         Some(b)
     }
+    /// The directory at `offset` from `base`, by tag; `None` when it can't be
+    /// read, or has no entries or more than 1,000.
     pub fn ifd(&mut self, offset: u64) -> Option<BTreeMap<u16, Entry>> {
         let count = self.bytes(offset, 2)?;
         let n = self.u16(&count) as usize;

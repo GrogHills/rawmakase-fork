@@ -5,14 +5,14 @@
 use super::disk::{Disk, Real, parent};
 use super::*;
 use crate::catalog::Catalog;
+use crate::fsops::{Entry, FsError};
 use crate::storage::Identity;
-use crate::storage::fsops::{Entry, FsError};
 use anyhow::Result;
+use rawmakase_cancel::Cancel;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 
 /// Distinct synthetic bytes for a file, from its name.
 pub(super) fn bytes(name: &str) -> Vec<u8> {
@@ -60,7 +60,7 @@ pub(super) fn fixture(files: &[&str]) -> Fx {
 
 impl Fx {
     /// The master named `name` (its path below the root).
-    pub fn photo(&self, name: &str) -> PhotoId {
+    pub(super) fn photo(&self, name: &str) -> PhotoId {
         let path = self.root.join(name);
         self.cat
             .photos()
@@ -72,7 +72,7 @@ impl Fx {
     }
     /// The root, as the catalog has it: the one added at `root`, whatever
     /// others a test adds.
-    pub fn root_id(&self) -> crate::catalog::RootId {
+    pub(super) fn root_id(&self) -> crate::catalog::RootId {
         self.cat
             .roots()
             .unwrap()
@@ -82,11 +82,11 @@ impl Fx {
             .0
     }
     /// The root of catalog folder `folder`.
-    pub fn root_of(&self, folder: FolderId) -> crate::catalog::RootId {
+    pub(super) fn root_of(&self, folder: FolderId) -> crate::catalog::RootId {
         self.place(folder).0
     }
     /// The logical path of catalog folder `folder` in its root.
-    pub fn logical(&self, folder: FolderId) -> String {
+    pub(super) fn logical(&self, folder: FolderId) -> String {
         self.place(folder).1
     }
     fn place(&self, folder: FolderId) -> (crate::catalog::RootId, String) {
@@ -101,7 +101,7 @@ impl Fx {
             .unwrap()
     }
     /// The catalog folder at `relative` below the root ("" is the root).
-    pub fn folder(&self, relative: &str) -> FolderId {
+    pub(super) fn folder(&self, relative: &str) -> FolderId {
         let path = if relative.is_empty() {
             self.root.clone()
         } else {
@@ -116,7 +116,7 @@ impl Fx {
             .id
     }
     /// The catalog folder at `path`, of whichever root.
-    pub fn folder_at(&self, path: &Path) -> FolderId {
+    pub(super) fn folder_at(&self, path: &Path) -> FolderId {
         self.cat
             .folders()
             .unwrap()
@@ -127,7 +127,7 @@ impl Fx {
     }
     /// Every file below the folder the fixture is in, by path relative to
     /// it, with its bytes: where every original is.
-    pub fn files(&self) -> BTreeMap<String, Vec<u8>> {
+    pub(super) fn files(&self) -> BTreeMap<String, Vec<u8>> {
         let mut out = BTreeMap::new();
         let base = self.dir.path().canonicalize().unwrap();
         fn walk(dir: &Path, base: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
@@ -152,7 +152,7 @@ impl Fx {
         out
     }
     /// Where each photo row says its file is, relative to the root.
-    pub fn rows(&self) -> BTreeMap<PhotoId, String> {
+    pub(super) fn rows(&self) -> BTreeMap<PhotoId, String> {
         self.cat
             .photos()
             .unwrap()
@@ -166,7 +166,7 @@ impl Fx {
     /// A photo row `filename` in folder `logical` of the root added at
     /// `root` (a new root when there is none), written as an older release
     /// or another tool might have: no checks, no file read.
-    pub fn add_row(&mut self, root: &Path, logical: &str, filename: &str) -> PhotoId {
+    pub(super) fn add_row(&mut self, root: &Path, logical: &str, filename: &str) -> PhotoId {
         use crate::catalog::db::{Reads, sql};
         let original = root.to_str().unwrap().to_string();
         let path = root.join(logical).join(filename);
@@ -197,39 +197,32 @@ impl Fx {
             .unwrap()
     }
     /// Opens the catalog again, as a restart does.
-    pub fn reopen(&mut self) {
+    pub(super) fn reopen(&mut self) {
         self.cat = Catalog::open(&self.catalog).unwrap();
     }
-    pub fn plan(&self, op: FileOp) -> Plan {
+    pub(super) fn plan(&self, op: FileOp) -> Plan {
         plan(&self.cat, op).unwrap()
     }
     /// Plans `op` with the volumes and folders as `disk` sees them.
-    pub fn plan_on(&self, op: FileOp, disk: &dyn Disk) -> Result<Plan, FileOpError> {
+    pub(super) fn plan_on(&self, op: FileOp, disk: &dyn Disk) -> Result<Plan, FileOpError> {
         plan::plan_with(&self.cat, op, disk)
     }
     /// Plans, confirms and executes `op` with `trash` on `disk`.
-    pub fn run(&mut self, op: FileOp, trash: &dyn Trash, disk: &dyn Disk) -> Outcome {
+    pub(super) fn run(&mut self, op: FileOp, trash: &dyn Trash, disk: &dyn Disk) -> Outcome {
         let plan = self.plan(op);
-        execute::execute_with(
-            &mut self.cat,
-            plan.confirm(),
-            trash,
-            &AtomicBool::new(false),
-            disk,
-        )
-        .unwrap()
+        execute::execute_with(&mut self.cat, plan.confirm(), trash, Cancel::NEVER, disk).unwrap()
     }
     /// Recovers on `disk`.
-    pub fn recover(&mut self, disk: &dyn Disk) -> Recovery {
+    pub(super) fn recover(&mut self, disk: &dyn Disk) -> Recovery {
         self.recover_with(disk, &NoTrash)
     }
     /// Recovers on `disk`, with `trash`.
-    pub fn recover_with(&mut self, disk: &dyn Disk, trash: &dyn Trash) -> Recovery {
+    pub(super) fn recover_with(&mut self, disk: &dyn Disk, trash: &dyn Trash) -> Recovery {
         let _lock = lock::acquire(&self.cat).unwrap();
         recover::run(&mut self.cat, disk, trash).unwrap()
     }
     /// Installs trigger `body` (after its name) for the connection's life.
-    pub fn fail_journal_with(&self, body: &str) {
+    pub(super) fn fail_journal_with(&self, body: &str) {
         self.cat
             .db_for_tests()
             .execute_batch(&format!("CREATE TEMP TRIGGER injected {body}"))
@@ -237,7 +230,7 @@ impl Fx {
     }
     /// Installs a trigger making `when` fail, as a full disk would: for
     /// the connection's life, so a reopen clears it.
-    pub fn fail_journal(&self, when: &str) {
+    pub(super) fn fail_journal(&self, when: &str) {
         self.cat
             .db_for_tests()
             .execute_batch(&format!(
@@ -321,11 +314,11 @@ pub(super) struct FakeTrash {
 }
 
 impl FakeTrash {
-    pub fn new(fx: &Fx) -> Self {
+    pub(super) fn new(fx: &Fx) -> Self {
         Self::at(&fx.dir.path().canonicalize().unwrap().join("trash"))
     }
     /// A Trash keeping what it takes in folder `dir`.
-    pub fn at(dir: &Path) -> Self {
+    pub(super) fn at(dir: &Path) -> Self {
         std::fs::create_dir_all(dir).unwrap();
         Self {
             dir: dir.to_path_buf(),
@@ -389,7 +382,7 @@ impl Trash for FakeTrash {
         ));
         // A volume that can't rename exclusively (exFAT on macOS) moves it
         // plainly: the name in the Trash is this one's alone.
-        match crate::storage::fsops::rename_exclusive(path, &location) {
+        match crate::fsops::rename_exclusive(path, &location) {
             Err(FsError::Unsupported) if !location.exists() => {
                 std::fs::rename(path, &location).map_err(|e| TrashError::Failed(e.to_string()))?
             }
@@ -430,13 +423,13 @@ macro_rules! passes_on {
         fn volume_facts(
             &self,
             path: &std::path::Path,
-        ) -> Result<crate::storage::fsops::VolumeFacts, crate::storage::fsops::FsError> {
+        ) -> Result<crate::fsops::VolumeFacts, crate::fsops::FsError> {
             self.$inner.volume_facts(path)
         }
         fn create_file(
             &self,
             path: &std::path::Path,
-        ) -> Result<std::fs::File, crate::storage::fsops::FsError> {
+        ) -> Result<std::fs::File, crate::fsops::FsError> {
             self.$inner.create_file(path)
         }
         fn copy_into(
@@ -445,34 +438,34 @@ macro_rules! passes_on {
             to: &std::path::Path,
             into: &mut std::fs::File,
             go_on: &mut dyn FnMut(u64) -> bool,
-        ) -> Result<crate::storage::fsops::ContentHash, crate::storage::fsops::CopyError> {
+        ) -> Result<crate::fsops::ContentHash, crate::fsops::CopyError> {
             self.$inner.copy_into(from, to, into, go_on)
         }
         fn handle_id(
             &self,
             at: &std::path::Path,
             file: &std::fs::File,
-        ) -> Result<crate::storage::fsops::FileId, crate::storage::fsops::FsError> {
+        ) -> Result<crate::fsops::FileId, crate::fsops::FsError> {
             self.$inner.handle_id(at, file)
         }
         fn hash_prefix(
             &self,
             path: &std::path::Path,
             len: u64,
-        ) -> Result<crate::storage::fsops::ContentHash, crate::storage::fsops::FsError> {
+        ) -> Result<crate::fsops::ContentHash, crate::fsops::FsError> {
             self.$inner.hash_prefix(path, len)
         }
         fn created(
             &self,
             path: &std::path::Path,
-        ) -> Result<std::time::SystemTime, crate::storage::fsops::FsError> {
+        ) -> Result<std::time::SystemTime, crate::fsops::FsError> {
             self.$inner.created(path)
         }
         fn sync_file(
             &self,
             at: &std::path::Path,
             file: &std::fs::File,
-        ) -> Result<(), crate::storage::fsops::FsError> {
+        ) -> Result<(), crate::fsops::FsError> {
             self.$inner.sync_file(at, file)
         }
         fn copy_extras(
@@ -480,7 +473,7 @@ macro_rules! passes_on {
             from: &std::path::Path,
             to: &std::path::Path,
             into: Option<&std::fs::File>,
-        ) -> Result<(), crate::storage::fsops::FsError> {
+        ) -> Result<(), crate::fsops::FsError> {
             self.$inner.copy_extras(from, to, into)
         }
         fn copy_times(
@@ -488,28 +481,25 @@ macro_rules! passes_on {
             from: &std::path::Path,
             to: &std::path::Path,
             into: Option<&std::fs::File>,
-        ) -> Result<(), crate::storage::fsops::FsError> {
+        ) -> Result<(), crate::fsops::FsError> {
             self.$inner.copy_times(from, to, into)
         }
         fn extras(
             &self,
             path: &std::path::Path,
-        ) -> Result<crate::storage::fsops::ContentHash, crate::storage::fsops::FsError> {
+        ) -> Result<crate::fsops::ContentHash, crate::fsops::FsError> {
             self.$inner.extras(path)
         }
         fn hash(
             &self,
             path: &std::path::Path,
-        ) -> Result<crate::storage::fsops::ContentHash, crate::storage::fsops::FsError> {
+        ) -> Result<crate::fsops::ContentHash, crate::fsops::FsError> {
             self.$inner.hash(path)
         }
-        fn remove_file(
-            &self,
-            path: &std::path::Path,
-        ) -> Result<(), crate::storage::fsops::FsError> {
+        fn remove_file(&self, path: &std::path::Path) -> Result<(), crate::fsops::FsError> {
             self.$inner.remove_file(path)
         }
-        fn remove_dir(&self, path: &std::path::Path) -> Result<(), crate::storage::fsops::FsError> {
+        fn remove_dir(&self, path: &std::path::Path) -> Result<(), crate::fsops::FsError> {
             self.$inner.remove_dir(path)
         }
     };
@@ -559,7 +549,7 @@ pub(super) enum Op {
 
 impl Op {
     /// The steps of a copy to another volume.
-    pub const COPYING: [Op; 9] = [
+    pub(super) const COPYING: [Op; 9] = [
         Op::CreateFile,
         Op::Copy,
         Op::SyncFile,
@@ -672,7 +662,7 @@ pub(super) struct Faulty {
     pub renumber_on_rename: bool,
     /// The number `elsewhere` gives each real file object, where it gave
     /// it another than its own.
-    pub numbers: RefCell<BTreeMap<crate::storage::fsops::FileId, crate::storage::fsops::FileId>>,
+    pub numbers: RefCell<BTreeMap<crate::fsops::FileId, crate::fsops::FileId>>,
     pub renumbered: RefCell<u64>,
     /// Every listing in reverse order, so nothing may rely on the order a
     /// folder lists its names in.
@@ -691,22 +681,22 @@ pub(super) struct Faulty {
 }
 
 impl Faulty {
-    pub fn at(op: Op, nth: usize, fault: Fault) -> Self {
+    pub(super) fn at(op: Op, nth: usize, fault: Fault) -> Self {
         Self::with(&[(op, nth, fault)])
     }
-    pub fn with(faults: &[(Op, usize, Fault)]) -> Self {
+    pub(super) fn with(faults: &[(Op, usize, Fault)]) -> Self {
         Self {
             faults: faults.to_vec(),
             ..Self::default()
         }
     }
     /// This disk with `dir` taken for another volume.
-    pub fn elsewhere(mut self, dir: &Path) -> Self {
+    pub(super) fn elsewhere(mut self, dir: &Path) -> Self {
         self.elsewhere = Some(dir.to_path_buf());
         self
     }
     /// How many calls of `op` it saw.
-    pub fn count(&self, op: Op) -> usize {
+    pub(super) fn count(&self, op: Op) -> usize {
         self.seen
             .borrow()
             .get(&format!("{op:?}"))
@@ -827,7 +817,7 @@ impl Faulty {
         }
     }
     /// The number `elsewhere` gives real file object `real`.
-    fn number(&self, real: crate::storage::fsops::FileId) -> crate::storage::fsops::FileId {
+    fn number(&self, real: crate::fsops::FileId) -> crate::fsops::FileId {
         self.numbers
             .borrow()
             .get(&real)
@@ -852,7 +842,7 @@ impl Faulty {
     }
     /// A remount of `elsewhere`: each of `files` gets a new number, and the
     /// file at `reuse.1` the number the file at `reuse.0` had before.
-    pub fn remount(&self, files: &[&Path], reuse: Option<(&Path, &Path)>) {
+    pub(super) fn remount(&self, files: &[&Path], reuse: Option<(&Path, &Path)>) {
         let before = reuse.map(|(a, _)| self.number(Real.entry(a).unwrap().id));
         for f in files {
             self.renumber(f);
@@ -869,7 +859,7 @@ impl Faulty {
         }
         self.calls.borrow_mut().push(call);
     }
-    pub fn renames(&self) -> Vec<(PathBuf, PathBuf)> {
+    pub(super) fn renames(&self) -> Vec<(PathBuf, PathBuf)> {
         self.calls
             .borrow()
             .iter()
@@ -880,7 +870,7 @@ impl Faulty {
             .collect()
     }
     /// How many chunks its copies wrote.
-    pub fn chunks(&self) -> usize {
+    pub(super) fn chunks(&self) -> usize {
         self.calls
             .borrow()
             .iter()
@@ -977,7 +967,7 @@ impl Disk for Faulty {
     fn canonical(&self, path: &Path) -> Result<PathBuf, FsError> {
         Real.canonical(&self.found(path))
     }
-    fn volume_facts(&self, path: &Path) -> Result<crate::storage::fsops::VolumeFacts, FsError> {
+    fn volume_facts(&self, path: &Path) -> Result<crate::fsops::VolumeFacts, FsError> {
         if self.far(path)
             && let Some(fail) = &self.facts_fail
             && fail.load(std::sync::atomic::Ordering::Relaxed)
@@ -993,7 +983,7 @@ impl Disk for Faulty {
         // real detection is `fsops`'s to test.
         facts.stable_ids = !self.unstable_ids.iter().any(|d| d == path);
         if self.fat(path) {
-            use crate::storage::fsops::VolumeKind;
+            use crate::fsops::VolumeKind;
             facts.kind = if self.share {
                 VolumeKind::Smb
             } else {
@@ -1003,10 +993,10 @@ impl Disk for Faulty {
             facts.stable_ids = false;
             facts.exclusive_rename = !self.no_exclusive_rename && !self.share;
         } else if !facts.stable_ids {
-            facts.kind = crate::storage::fsops::VolumeKind::Other;
+            facts.kind = crate::fsops::VolumeKind::Other;
         }
         if self.network {
-            facts.kind = crate::storage::fsops::VolumeKind::Other;
+            facts.kind = crate::fsops::VolumeKind::Other;
             facts.local = false;
             facts.stable_ids = false;
         }
@@ -1039,8 +1029,8 @@ impl Disk for Faulty {
         to: &Path,
         into: &mut std::fs::File,
         go_on: &mut dyn FnMut(u64) -> bool,
-    ) -> Result<crate::storage::fsops::ContentHash, crate::storage::fsops::CopyError> {
-        use crate::storage::fsops::CopyError;
+    ) -> Result<crate::fsops::ContentHash, crate::fsops::CopyError> {
+        use crate::fsops::CopyError;
         self.record(Call::Copy(from.into(), to.into()));
         let (from, to) = (&self.found(from), &self.found(to));
         let (n, fault) = self.fault(Op::Copy);
@@ -1086,11 +1076,7 @@ impl Disk for Faulty {
         }
         copied
     }
-    fn handle_id(
-        &self,
-        at: &Path,
-        file: &std::fs::File,
-    ) -> Result<crate::storage::fsops::FileId, FsError> {
+    fn handle_id(&self, at: &Path, file: &std::fs::File) -> Result<crate::fsops::FileId, FsError> {
         let id = Real.handle_id(at, file)?;
         Ok(match self.far(at) {
             true => self.number(id),
@@ -1120,7 +1106,7 @@ impl Disk for Faulty {
             }
         })
     }
-    fn extras(&self, path: &Path) -> Result<crate::storage::fsops::ContentHash, FsError> {
+    fn extras(&self, path: &Path) -> Result<crate::fsops::ContentHash, FsError> {
         let n = {
             let mut read = self.extras_read.borrow_mut();
             let n = read.entry(path.to_path_buf()).or_default();
@@ -1167,7 +1153,7 @@ impl Disk for Faulty {
             Ok(())
         })
     }
-    fn hash(&self, path: &Path) -> Result<crate::storage::fsops::ContentHash, FsError> {
+    fn hash(&self, path: &Path) -> Result<crate::fsops::ContentHash, FsError> {
         self.record(Call::Hash(path.into()));
         self.step(Op::Hash, || Real.hash(&self.found(path)))
     }
@@ -1189,11 +1175,7 @@ impl Disk for Faulty {
         self.forget_apple_double(at, removed.is_ok());
         removed
     }
-    fn hash_prefix(
-        &self,
-        path: &Path,
-        len: u64,
-    ) -> Result<crate::storage::fsops::ContentHash, FsError> {
+    fn hash_prefix(&self, path: &Path, len: u64) -> Result<crate::fsops::ContentHash, FsError> {
         Real.hash_prefix(&self.found(path), len)
     }
     fn created(&self, path: &Path) -> Result<std::time::SystemTime, FsError> {
@@ -1218,7 +1200,7 @@ impl Disk for Faulty {
 /// file system keeps none (overlayfs in some containers), for the test to
 /// end there.
 pub(super) fn tagged(path: &Path, name: &str, value: &[u8]) -> bool {
-    match crate::storage::fsops::set_extra(path, name, value) {
+    match crate::fsops::set_extra(path, name, value) {
         Ok(()) => true,
         Err(FsError::Unsupported) => {
             eprintln!("{}: no extended attributes here", path.display());
@@ -1233,10 +1215,10 @@ pub(super) fn tagged(path: &Path, name: &str, value: &[u8]) -> bool {
 /// Windows an SMB share only where its server keeps alternate data streams
 /// (Samba needs `streams_xattr`), as a file made there to try tells.
 pub(super) fn keeps_extras(dir: &Path) -> bool {
-    use crate::storage::fsops::{VolumeKind, volume_facts};
+    use crate::fsops::{VolumeKind, volume_facts};
     let tried = || {
         tempfile::NamedTempFile::new_in(dir)
-            .is_ok_and(|f| crate::storage::fsops::set_extra(f.path(), "tried", b"1").is_ok())
+            .is_ok_and(|f| crate::fsops::set_extra(f.path(), "tried", b"1").is_ok())
     };
     cfg!(target_vendor = "apple")
         || volume_facts(dir).is_ok_and(|f| match f.kind {

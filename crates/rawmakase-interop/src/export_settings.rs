@@ -1,8 +1,9 @@
 //! The choices of Lightroom's Export dialog: where the file goes, its name, format,
 //! size and metadata. Saved as `export.json` in the data folder, so the next
 //! export (and Export with Previous) starts from them.
+use crate::color::OutputSpace;
 use crate::storage::RasterFormat;
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -83,16 +84,19 @@ pub enum Format {
     Jpeg,
     Tiff,
     Png,
+    /// JPEG XL, lossless: 8-bit sRGB, or an HDR export's 16-bit PQ or HLG.
+    Jxl,
 }
 impl Format {
     /// The formats an export can be written in.
-    pub const ALL: [Self; 3] = [Self::Jpeg, Self::Tiff, Self::Png];
+    pub const ALL: [Self; 4] = [Self::Jpeg, Self::Tiff, Self::Png, Self::Jxl];
 
     pub fn raster(self) -> RasterFormat {
         match self {
             Format::Jpeg => RasterFormat::Jpeg,
             Format::Tiff => RasterFormat::Tiff,
             Format::Png => RasterFormat::Png,
+            Format::Jxl => RasterFormat::Jxl,
         }
     }
     /// The extension an export is named with.
@@ -107,6 +111,52 @@ impl Format {
     pub fn from_path(path: &Path) -> Option<Format> {
         let raster = RasterFormat::of(path)?;
         Self::ALL.into_iter().find(|f| f.raster() == raster)
+    }
+    /// Whether an export in this format can be in `space`: ProPhoto RGB is written
+    /// only as 16-bit TIFF, as 8 bits band in so wide a gamut.
+    pub fn supports(self, space: OutputSpace) -> Result<()> {
+        if self == Format::Jxl && space != OutputSpace::Srgb {
+            bail!("JPEG XL exports are sRGB, or HDR; choose sRGB, HDR export or another format");
+        }
+        if space.needs_sixteen_bits() && self != Format::Tiff {
+            bail!(
+                "{} exports only as 16-bit TIFF; choose TIFF or another color space",
+                space.label()
+            );
+        }
+        Ok(())
+    }
+    /// Whether an HDR export can be written in this format: TIFF and JPEG XL hold
+    /// HDR pixels, JPEG a gain map.
+    pub fn holds_hdr(self) -> bool {
+        matches!(self, Format::Tiff | Format::Jxl | Format::Jpeg)
+    }
+    /// Refuses an HDR export of `output` that `format` can't hold: a gain map in
+    /// anything but JPEG (and in another gamut than Rec. 709, its sRGB base's), HDR
+    /// pixels in anything but TIFF and JPEG XL, and linear light in anything but TIFF.
+    pub fn check_hdr(format: Format, output: crate::color::hdr_output::HdrOutput) -> Result<()> {
+        use crate::color::hdr_output::HdrGamut;
+        if output.gain_map {
+            ensure!(
+                matches!(format, Format::Jpeg | Format::Jxl),
+                "Gain maps are written as JPEG or JPEG XL; choose one, or HDR pixels in TIFF"
+            );
+            ensure!(
+                output.gamut == HdrGamut::Rec709,
+                "A gain map's base is sRGB: choose the Rec. 709 gamut"
+            );
+            return Ok(());
+        }
+        ensure!(
+            matches!(format, Format::Tiff | Format::Jxl),
+            "HDR pixels are written as TIFF or JPEG XL; choose one, or a gain map for JPEG"
+        );
+        ensure!(
+            format == Format::Tiff
+                || output.transfer != crate::color::hdr_output::HdrTransfer::Linear,
+            "Linear HDR is written as 32-bit float TIFF only; choose TIFF, PQ or HLG"
+        );
+        Ok(())
     }
     /// Every extension an export can have, as a sentence lists them:
     /// ".jpg, .jpeg, .tif, .tiff or .png".
@@ -223,6 +273,10 @@ pub struct NameFields {
     pub captured: Option<String>,
     /// A virtual copy's name.
     pub copy_name: String,
+    /// The name its file had when it entered the catalog (its master's for
+    /// a virtual copy), with its extension; `None` when the catalog doesn't
+    /// know it, and the Original filename token then gives the current name.
+    pub original_name: Option<String>,
     /// Lens, exposure, focal length, ISO and dimensions; its camera is not
     /// used, see `camera`.
     pub info: crate::metadata::PhotoInfo,
@@ -276,6 +330,7 @@ impl NameFields {
     pub const NONE: NameFields = NameFields {
         captured: None,
         copy_name: String::new(),
+        original_name: None,
         info: crate::metadata::PhotoInfo {
             camera: None,
             lens: None,
@@ -513,6 +568,27 @@ pub struct ExportSettings {
     pub format: Format,
     #[serde(skip)]
     pub later_format: LaterFormat,
+    /// The colour space of the pixels and the embedded profile; sRGB in settings
+    /// saved before there was a choice, and standing in for one only a later
+    /// release knows (see [`LaterColorSpace`]), which is refused rather than
+    /// exported as sRGB.
+    #[serde(deserialize_with = "known_or_default")]
+    pub color_space: OutputSpace,
+    #[serde(skip)]
+    pub later_color_space: LaterColorSpace,
+    /// An HDR export's encoding (docs/hdr.md#hdr-export): the edit's HDR master in
+    /// place of its SDR rendition, written as a TIFF. `None`, the default, exports
+    /// SDR in `color_space`. Omitted when `None`, so releases that predate it read the
+    /// settings. One only a later release knows reads as `None` here and is kept
+    /// (see [`LaterHdr`]), refused rather than exported as SDR.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_or_default"
+    )]
+    pub hdr: Option<crate::color::hdr_output::HdrOutput>,
+    #[serde(skip)]
+    pub later_hdr: LaterHdr,
     pub quality: u8,
     pub resize: bool,
     pub long_edge: u32,
@@ -556,6 +632,10 @@ impl Default for ExportSettings {
             uppercase: false,
             format: Format::Jpeg,
             later_format: LaterFormat::default(),
+            color_space: OutputSpace::Srgb,
+            later_color_space: LaterColorSpace::default(),
+            hdr: None,
+            later_hdr: LaterHdr::default(),
             quality: 92,
             resize: false,
             long_edge: 2048,
@@ -579,6 +659,18 @@ impl Default for ExportSettings {
 /// still finds its choice after this one saves the settings.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaterFormat(Option<serde_json::Value>);
+
+/// The saved colour space when only a later release knows it. Kept and saved
+/// back until a space is chosen, as [`LaterFormat`] is, but never exported as
+/// another: [`ExportSettings::output_space`] refuses it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LaterColorSpace(Option<serde_json::Value>);
+
+/// The saved HDR export when only a later release knows its encoding. Kept and
+/// saved back until HDR export is chosen here, as [`LaterColorSpace`] is, and never
+/// exported as SDR: [`ExportSettings::hdr_output`] refuses it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LaterHdr(Option<serde_json::Value>);
 
 /// The saved Rename To when only a later release knows it, as
 /// [`LaterFormat`] is for the format.
@@ -667,6 +759,33 @@ impl ExportSettings {
         self.format = format;
         self.later_format = LaterFormat::default();
     }
+    /// The HDR export the user picks (`None` for SDR), which replaces one from a
+    /// later release.
+    pub fn choose_hdr(&mut self, hdr: Option<crate::color::hdr_output::HdrOutput>) {
+        self.hdr = hdr;
+        self.later_hdr = LaterHdr::default();
+    }
+    /// The colour space the user picks, which replaces one from a later release.
+    pub fn choose_color_space(&mut self, space: OutputSpace) {
+        self.color_space = space;
+        self.later_color_space = LaterColorSpace::default();
+    }
+    /// The saved colour space only a later release knows, as saved.
+    pub fn later_color_space(&self) -> Option<&serde_json::Value> {
+        self.later_color_space.0.as_ref()
+    }
+    /// The colour space to export in, checked with the format before anything
+    /// renders: refused when only a later release knows it, and for ProPhoto RGB in
+    /// a format other than TIFF. Every export checks its settings with this.
+    pub fn output_space(&self) -> Result<OutputSpace> {
+        if let Some(later) = self.later_color_space() {
+            bail!(
+                "The color space {later} is from a later version of RAWmakase; choose another in the Export dialog"
+            );
+        }
+        self.format.supports(self.color_space)?;
+        Ok(self.color_space)
+    }
     /// The Rename To preset the user picks, which replaces a custom template
     /// and a choice from a later release.
     pub fn choose_naming(&mut self, naming: Naming) {
@@ -705,6 +824,11 @@ impl ExportSettings {
             .then(|| template.tokens())
             .flatten()
     }
+    /// The settings saved at `path`, read as [`ExportSettings::load`] reads them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn load_file(path: &Path) -> Option<Self> {
+        Self::load_from(path)
+    }
     fn load_from(path: &Path) -> Option<Self> {
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
@@ -712,12 +836,22 @@ impl ExportSettings {
             .get("format")
             .filter(|format| Format::deserialize(*format).is_err())
             .cloned();
+        let later_color_space = saved
+            .get("color_space")
+            .filter(|space| OutputSpace::deserialize(*space).is_err())
+            .cloned();
         let later_naming = saved
             .get("naming")
             .filter(|naming| Option::<Naming>::deserialize(*naming).is_err())
             .cloned();
+        let later_hdr = saved
+            .get("hdr")
+            .filter(|hdr| Option::<crate::color::hdr_output::HdrOutput>::deserialize(*hdr).is_err())
+            .cloned();
         let mut settings = Self::deserialize(saved).ok()?;
+        settings.later_hdr = LaterHdr(later_hdr);
         settings.later_format = LaterFormat(later_format);
+        settings.later_color_space = LaterColorSpace(later_color_space);
         settings.later_naming = LaterNaming(later_naming);
         Some(settings)
     }
@@ -729,10 +863,20 @@ impl ExportSettings {
         {
             saved["format"] = later.clone();
         }
+        if let LaterColorSpace(Some(later)) = &self.later_color_space
+            && self.color_space == OutputSpace::default()
+        {
+            saved["color_space"] = later.clone();
+        }
         if let LaterNaming(Some(later)) = &self.later_naming
             && self.naming.is_none()
         {
             saved["naming"] = later.clone();
+        }
+        if let LaterHdr(Some(later)) = &self.later_hdr
+            && self.hdr.is_none()
+        {
+            saved["hdr"] = later.clone();
         }
         crate::storage::atomic_json(path, &saved)
     }
@@ -796,6 +940,29 @@ impl ExportSettings {
         }
         let (file, note) = self.file_name_for(source, at);
         Some((folder.join(file), note))
+    }
+    /// The HDR encoding these settings export, if any: refused in a format that
+    /// can't hold it (an HDR export is a TIFF until HDR JPEG XL is written).
+    pub fn hdr_output(&self) -> Result<Option<crate::color::hdr_output::HdrOutput>> {
+        if let LaterHdr(Some(later)) = &self.later_hdr {
+            bail!(
+                "The HDR export {later} is from a later version of RAWmakase; choose another in the Export dialog"
+            );
+        }
+        if let Some(output) = self.hdr {
+            Format::check_hdr(self.format, output)?;
+            return Ok(Some(output));
+        }
+        Ok(None)
+    }
+    /// What every export checks before anything renders: an HDR export's encoding in
+    /// its format, else the SDR colour space in its format ([`Self::output_space`]).
+    /// An HDR export never uses the SDR colour space, so that is not checked then.
+    pub fn check_output(&self) -> Result<()> {
+        if self.hdr_output()?.is_none() {
+            self.output_space()?;
+        }
+        Ok(())
     }
     pub fn options(&self) -> ExportOptions {
         ExportOptions {
@@ -982,7 +1149,7 @@ mod tests {
         assert_eq!((read.format, read.quality), (Format::Jpeg, 70));
         assert_eq!(read.folder, Some(PathBuf::from("/x")));
         // A format chosen here replaces it, JPEG too.
-        let mut png = read.clone();
+        let mut png = read;
         png.format = Format::Png;
         png.save_to(&file)?;
         assert_eq!(saved_format(&file)?, "Png");
@@ -1032,6 +1199,145 @@ mod tests {
         assert_eq!(written["newer_flag"], true);
         Ok(())
     }
+    /// Settings saved before the choice export sRGB; each space reads back as saved.
+    #[test]
+    fn the_color_space_is_srgb_unless_chosen_and_reads_back() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("export.json");
+        std::fs::write(&file, r#"{"format":"Tiff","folder":"/x"}"#)?;
+        let read = ExportSettings::load_from(&file).unwrap();
+        assert_eq!(read.color_space, OutputSpace::Srgb);
+        assert_eq!(read.output_space()?, OutputSpace::Srgb);
+        for space in OutputSpace::ALL {
+            let mut settings = read.clone();
+            settings.choose_color_space(space);
+            settings.save_to(&file)?;
+            let back = ExportSettings::load_from(&file).unwrap();
+            assert_eq!(back.output_space()?, space);
+            assert_eq!(back, settings);
+        }
+        Ok(())
+    }
+    /// ProPhoto RGB is written only as 16-bit TIFF: with JPEG or PNG it is refused,
+    /// before anything renders. A JPEG XL is sRGB.
+    #[test]
+    fn prophoto_needs_tiff_and_the_others_take_any_format() {
+        for format in Format::ALL {
+            for space in OutputSpace::ALL {
+                let mut s = ExportSettings::default();
+                s.choose_format(format);
+                s.choose_color_space(space);
+                let allowed = if format == Format::Jxl {
+                    space == OutputSpace::Srgb
+                } else {
+                    space != OutputSpace::ProPhoto || format == Format::Tiff
+                };
+                assert_eq!(s.output_space().is_ok(), allowed, "{format:?} {space:?}");
+                assert_eq!(format.supports(space).is_ok(), allowed);
+            }
+        }
+        let mut s = ExportSettings::default();
+        s.choose_color_space(OutputSpace::ProPhoto);
+        let error = s.output_space().unwrap_err().to_string();
+        assert!(
+            error.contains("ProPhoto RGB") && error.contains("TIFF"),
+            "{error}"
+        );
+    }
+    /// An HDR export only a later release knows, or one with a field only it knows,
+    /// is kept and saved back and refused, never exported as SDR, until HDR export
+    /// is chosen here.
+    #[test]
+    fn an_hdr_export_from_a_later_release_is_kept_and_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("export.json");
+        let saved = |file: &Path| -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::from_str(&std::fs::read_to_string(file)?)?)
+        };
+        for later in [
+            r#"{"gamut":"rec2020","transfer":"future"}"#,
+            r#"{"gamut":"rec2020","transfer":"pq","peak":1000}"#,
+        ] {
+            std::fs::write(&file, format!(r#"{{"format":"Tiff","hdr":{later}}}"#))?;
+            let mut read = ExportSettings::load_from(&file).unwrap();
+            assert!(read.hdr.is_none());
+            let error = read.hdr_output().unwrap_err().to_string();
+            assert!(error.contains("later version"), "{error}");
+            read.quality = 70;
+            read.save_to(&file)?;
+            let back: serde_json::Value = serde_json::from_str(later)?;
+            assert_eq!(saved(&file)?["hdr"], back);
+            read.choose_hdr(None);
+            assert!(read.hdr_output()?.is_none());
+            read.save_to(&file)?;
+            assert!(saved(&file)?.get("hdr").is_none());
+        }
+        // A null HDR export is none, not a later one.
+        std::fs::write(&file, r#"{"format":"Jpeg","hdr":null}"#)?;
+        let read = ExportSettings::load_from(&file).unwrap();
+        assert_eq!(read.hdr_output()?, None);
+        // A gain map only in JPEG, over an sRGB (Rec. 709) base; HDR pixels never in
+        // JPEG.
+        use crate::color::hdr_output::{HdrGamut, HdrOutput};
+        let gain = HdrOutput {
+            gamut: HdrGamut::Rec709,
+            gain_map: true,
+            ..Default::default()
+        };
+        assert!(Format::check_hdr(Format::Jpeg, gain).is_ok());
+        assert!(Format::check_hdr(Format::Tiff, gain).is_err());
+        assert!(Format::check_hdr(Format::Jxl, gain).is_ok());
+        assert!(
+            Format::check_hdr(
+                Format::Jpeg,
+                HdrOutput {
+                    gamut: HdrGamut::Rec2020,
+                    ..gain
+                }
+            )
+            .is_err()
+        );
+        assert!(Format::check_hdr(Format::Jpeg, HdrOutput::default()).is_err());
+        // One this release knows round-trips.
+        let mut known = ExportSettings::default();
+        known.choose_format(Format::Tiff);
+        known.choose_hdr(Some(Default::default()));
+        known.save_to(&file)?;
+        let read = ExportSettings::load_from(&file).unwrap();
+        assert_eq!(read.hdr_output()?, Some(Default::default()));
+        Ok(())
+    }
+    /// A space only a later release knows is kept and saved back, as a later
+    /// format is, but never exported as another: an export refuses it until a space
+    /// is chosen here.
+    #[test]
+    fn a_color_space_from_a_later_release_is_kept_and_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("export.json");
+        let saved = |file: &Path| -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::from_str(&std::fs::read_to_string(file)?)?)
+        };
+        std::fs::write(&file, r#"{"color_space":"DisplayP3","quality":80}"#)?;
+        let mut read = ExportSettings::load_from(&file).unwrap();
+        assert_eq!(read.quality, 80);
+        assert!(read.later_color_space().is_some());
+        let error = read.output_space().unwrap_err().to_string();
+        assert!(
+            error.contains("DisplayP3") && error.contains("color space"),
+            "{error}"
+        );
+        read.quality = 70;
+        read.save_to(&file)?;
+        assert_eq!(saved(&file)?["color_space"], "DisplayP3");
+        assert_eq!(saved(&file)?["quality"], 70);
+        let mut read = ExportSettings::load_from(&file).unwrap();
+        assert!(read.output_space().is_err());
+        read.choose_color_space(OutputSpace::AdobeRgb);
+        assert_eq!(read.output_space()?, OutputSpace::AdobeRgb);
+        read.save_to(&file)?;
+        assert_eq!(saved(&file)?["color_space"], "AdobeRgb");
+        Ok(())
+    }
     #[test]
     fn settings_this_release_knows_are_saved_as_they_were() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1048,6 +1354,7 @@ mod tests {
             "start_number",
             "uppercase",
             "format",
+            "color_space",
             "quality",
             "resize",
             "long_edge",
@@ -1090,16 +1397,17 @@ mod tests {
             ("a.tiff", Format::Tiff),
             ("a.Tiff", Format::Tiff),
             ("a.png", Format::Png),
+            ("a.JXL", Format::Jxl),
         ] {
             assert_eq!(Format::from_path(Path::new(name)), Some(format), "{name}");
         }
         assert_eq!(
             Format::ALL.map(Format::mime_type),
-            ["image/jpeg", "image/tiff", "image/png"]
+            ["image/jpeg", "image/tiff", "image/png", "image/jxl"]
         );
         assert_eq!(
             Format::extensions_listed(),
-            ".jpg, .jpeg, .tif, .tiff or .png"
+            ".jpg, .jpeg, .tif, .tiff, .png or .jxl"
         );
     }
     #[test]

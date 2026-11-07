@@ -29,10 +29,12 @@ fn everything_changed() -> Recipe {
         lens_profile: true,
         lens_profile_choice: crate::lens::choice::LensProfileChoice {
             setup: crate::lens::choice::LensProfileSetup::Custom,
-            id: Some(crate::lens::choice::LensProfileId {
-                name: "Adobe (Test 35mm)".into(),
-                ..Default::default()
-            }),
+            id: Some(crate::lens::choice::LensProfileRef::Adobe(
+                crate::lens::choice::LensProfileId {
+                    name: "Adobe (Test 35mm)".into(),
+                    ..Default::default()
+                },
+            )),
         },
         lens_distortion: 0.5,
         lens_vignetting: 1.5,
@@ -69,6 +71,20 @@ fn everything_changed() -> Recipe {
         grading: [[0.5, 0.2, 0.1]; 3],
         noise_luma: 0.3,
         noise_chroma: 0.4,
+        ai_denoise: crate::model::ai_denoise::AiDenoise {
+            enabled: true,
+            amount: 0.7,
+        },
+        // Values kept while HDR is off: HDR on is refused until it renders.
+        hdr: crate::model::hdr::HdrSettings {
+            enabled: false,
+            limit: 3.5,
+            sdr: crate::model::hdr::SdrRendition {
+                brightness: 0.2,
+                blend: -0.3,
+                ..Default::default()
+            },
+        },
         sharpening: 0.5,
         crop: [0.1, 0.1, 0.9, 0.9],
         straighten: 2.,
@@ -235,7 +251,8 @@ fn each_group_transfers_exactly_its_settings() {
             // The source has Detail switched off.
             SettingGroup::Sharpening
             | SettingGroup::LuminanceNoiseReduction
-            | SettingGroup::ColorNoiseReduction => {
+            | SettingGroup::ColorNoiseReduction
+            | SettingGroup::AiDenoise => {
                 expected.insert("panels".into());
             }
             _ => {}
@@ -672,11 +689,13 @@ fn a_lens_profile_the_target_cannot_use_is_reported() {
     );
     // So is the camera's own profile on a photo whose RAW has none.
     let mut embedded = source.clone();
-    embedded.lens_profile_choice.id = Some(crate::lens::choice::LensProfileId {
-        name: "Camera Settings".into(),
-        embedded: true,
-        ..Default::default()
-    });
+    embedded.lens_profile_choice.id = Some(crate::lens::choice::LensProfileRef::Adobe(
+        crate::lens::choice::LensProfileId {
+            name: "Camera Settings".into(),
+            embedded: true,
+            ..Default::default()
+        },
+    ));
     let out = transfer(
         from(&embedded, &m),
         &Recipe::default(),
@@ -736,7 +755,7 @@ fn masks_made_from_a_selection_stay_on_their_photo() {
     assert_eq!(out.recipe.masks, vec![gradient.clone(), own.clone()]);
     // Even when the source fills every slot, the target's own selection survives.
     let full = Recipe {
-        masks: vec![gradient.clone(); crate::model::masks::MAX_GROUPS],
+        masks: vec![gradient; crate::model::masks::MAX_GROUPS],
         ..Default::default()
     };
     let out = transfer(from(&full, &m), &to, &selection, target);
@@ -798,6 +817,71 @@ fn syncing_from_a_raw_to_a_jpeg_keeps_the_jpegs_white_balance_and_profile() {
     assert_eq!(out.notes, vec![SEPARATE.to_string()]);
 }
 
+/// AI Denoise runs on a RAW's mosaic: syncing it onto a JPEG keeps the JPEG's own
+/// setting (off) and says so; between RAWs it transfers.
+#[test]
+fn ai_denoise_is_not_synced_onto_a_rendered_file() {
+    let raw = camera("Sony", "ILCE-7M2");
+    let jpeg = jpeg();
+    let source = Recipe {
+        ai_denoise: crate::model::ai_denoise::AiDenoise {
+            enabled: true,
+            amount: 0.8,
+        },
+        exposure: 0.5,
+        ..Default::default()
+    };
+    let to = Recipe::for_rendered(&jpeg);
+    let mut selection = GroupSelection::none();
+    selection.set(SettingGroup::AiDenoise, GroupInclusion::Included);
+    selection.set(SettingGroup::Exposure, GroupInclusion::Included);
+    let out = transfer(
+        from(&source, &raw),
+        &to,
+        &selection,
+        Target {
+            metadata: &jpeg,
+            profiles: &[],
+        },
+    );
+    assert_eq!(out.recipe.ai_denoise, to.ai_denoise);
+    assert_eq!(out.recipe.exposure, 0.5);
+    assert_eq!(
+        out.notes,
+        vec!["AI Denoise applies to RAW files only".to_string()]
+    );
+    // Skipped whole: a source with Detail off does not switch the JPEG's Detail off.
+    let mut detail_off = source.clone();
+    detail_off.panels.set(
+        crate::model::panels::Panel::Detail,
+        crate::model::panels::PanelState::Off,
+    );
+    let mut ai_only = GroupSelection::none();
+    ai_only.set(SettingGroup::AiDenoise, GroupInclusion::Included);
+    let out = transfer(
+        from(&detail_off, &raw),
+        &to,
+        &ai_only,
+        Target {
+            metadata: &jpeg,
+            profiles: &[],
+        },
+    );
+    assert_eq!(out.recipe, to);
+    let other = camera("Canon", "EOS R10");
+    let out = transfer(
+        from(&source, &raw),
+        &Recipe::default(),
+        &selection,
+        Target {
+            metadata: &other,
+            profiles: &[],
+        },
+    );
+    assert_eq!(out.recipe.ai_denoise, source.ai_denoise);
+    assert!(out.notes.is_empty());
+}
+
 #[test]
 fn syncing_from_a_jpeg_to_a_raw_keeps_the_raws_white_balance_and_profile() {
     use crate::camera_profiles::open;
@@ -857,4 +941,47 @@ fn syncing_from_a_jpeg_to_a_raw_keeps_the_raws_white_balance_and_profile() {
     );
     assert_eq!(out.recipe.exposure, 0.5);
     assert!(out.notes.is_empty(), "{:?}", out.notes);
+}
+
+/// A fitted camera look belongs to the photo it was fitted to: Sync copies the
+/// source's, never a same-named fit of the target, and not to another camera.
+#[test]
+fn a_fitted_look_moves_as_the_sources_own() {
+    use crate::camera_profiles::fitted;
+    let m = camera("Fujifilm", "X100F");
+    let fit = |shift: f32| {
+        let mut look = fitted::FittedLook::identity();
+        look.table[9][0] = shift;
+        Arc::new(fitted::with_look(&fitted::standard_base(&m).unwrap(), &look).unwrap())
+    };
+    let (source_fit, target_fit) = (fit(5.), fit(-5.));
+    let source = Recipe {
+        profile: Some(source_fit.clone()),
+        ..Default::default()
+    };
+    let profiles = [target_fit];
+    let out = transfer(
+        from(&source, &m),
+        &Recipe::default(),
+        &GroupSelection::default(),
+        Target {
+            metadata: &m,
+            profiles: &profiles,
+        },
+    );
+    assert_eq!(out.recipe.profile.as_deref(), Some(&*source_fit));
+    // Another camera keeps its own profile, with a note.
+    let other = camera("Fujifilm", "X-T5");
+    let kept = Recipe::default();
+    let out = transfer(
+        from(&source, &m),
+        &kept,
+        &GroupSelection::default(),
+        Target {
+            metadata: &other,
+            profiles: &profiles,
+        },
+    );
+    assert_eq!(out.recipe.profile, kept.profile);
+    assert!(!out.notes.is_empty());
 }

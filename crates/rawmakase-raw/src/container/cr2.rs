@@ -16,7 +16,7 @@ use crate::info::{Cfa, RawInfo};
 use crate::sensor::Sensor;
 use crate::variant::{Plan, Variant};
 use crate::vendor::canon::SmallRaw;
-use std::sync::atomic::{AtomicBool, Ordering};
+use rawmakase_cancel::Cancel;
 
 /// Where a CR2's sensor data is and how it is laid out.
 #[derive(Clone, Debug)]
@@ -71,11 +71,15 @@ pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
     let strip = (t.base + u64::from(at), u64::from(len));
     let file = crate::io::Bytes::new(bytes, crate::io::Order::Little);
     let jpeg = ljpeg::header(file.slice(strip.0, strip.1)?)?;
-    let notes = t
+    let note = t
         .exif
         .as_ref()
         .and_then(|e| e.entries.get(&37500))
-        .and_then(|e| t.ifd_at(t.offset_of(e)?))
+        .and_then(|e| t.ifd_at(t.offset_of(e)?));
+    let camera_look = note
+        .as_ref()
+        .and_then(|note| crate::vendor::canon::picture_style(&t, note));
+    let notes = note
         .map(|note| crate::vendor::canon::read(&t, &note))
         .unwrap_or_default();
     let per_mcu = jpeg.samples_per_mcu();
@@ -155,6 +159,7 @@ pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
     } else {
         Variant::Cr2LosslessJpeg
     });
+    info.camera_look = camera_look;
     info.raw_width = width;
     info.raw_height = height;
     info.sraw = sraw.is_some();
@@ -312,7 +317,7 @@ pub(crate) fn open_tif(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
 /// Decodes the strip into the sample grid, laying its samples out slice by
 /// slice: each slice filled top to bottom, row by row, then the next to its
 /// right.
-fn grid(plan: &Cr2Plan, bytes: &[u8], cancel: &AtomicBool) -> Result<(Vec<u16>, u8)> {
+fn grid(plan: &Cr2Plan, bytes: &[u8], cancel: Cancel<'_>) -> Result<(Vec<u16>, u8)> {
     let file = crate::io::Bytes::new(bytes, crate::io::Order::Little);
     let strip = file.slice(plan.strip.0, plan.strip.1)?;
     let mut header = ljpeg::header(strip)?;
@@ -326,7 +331,7 @@ fn grid(plan: &Cr2Plan, bytes: &[u8], cancel: &AtomicBool) -> Result<(Vec<u16>, 
     if count as u64 > (strip.len() as u64).saturating_mul(8) {
         return Err(corrupt("CR2 strip too short for its image"));
     }
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
     let mut stream = crate::io::zeroed(count)?;
@@ -342,7 +347,7 @@ fn grid(plan: &Cr2Plan, bytes: &[u8], cancel: &AtomicBool) -> Result<(Vec<u16>, 
     let mut at = 0usize;
     let mut x0 = 0usize;
     for &w in &plan.slices {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let w = w as usize;
@@ -374,7 +379,7 @@ fn small_raw(
     visible: usize,
     conversion: &SmallRaw,
     white: u32,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Vec<u16>> {
     let (width, height) = (plan.width as usize, plan.height as usize);
     let per_mcu = h * v + 2;
@@ -395,7 +400,7 @@ fn small_raw(
     };
     let mean = |a: [i32; 2], b: [i32; 2]| [(a[0] + b[0] + 1) >> 1, (a[1] + b[1] + 1) >> 1];
     for my in 0..rows {
-        if my % 64 == 0 && cancel.load(Ordering::Relaxed) {
+        if my % 64 == 0 && cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         for mx in 0..across {
@@ -486,7 +491,7 @@ pub(crate) fn decode(
     info: &RawInfo,
     plan: &Cr2Plan,
     bytes: &[u8],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Sensor> {
     let (data, precision) = grid(plan, bytes, cancel)?;
     let size = [plan.width, plan.height];
@@ -589,6 +594,7 @@ pub(crate) fn decode(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use rawmakase_cancel::Cancel;
     use std::sync::atomic::AtomicBool;
 
     /// An IFD entry: tag, type, count and value bytes.
@@ -680,7 +686,7 @@ pub(crate) mod tests {
         // Up to the limit the slices still lay the image out whole.
         let bytes = cr2(&jpeg, &[(0xc640, 3, 3, shorts(&[64, 1, 2]))], &[]);
         let info = crate::open(&bytes).unwrap();
-        let sensor = crate::decode(&info, &bytes, &AtomicBool::new(false)).unwrap();
+        let sensor = crate::decode(&info, &bytes, Cancel::NEVER).unwrap();
         assert_eq!(sensor.data, image);
     }
 
@@ -713,7 +719,7 @@ pub(crate) mod tests {
             .windows(8)
             .position(|w| w == [0x40, 0xc6, 3, 0, 3, 0, 0, 0])
             .unwrap();
-        let mut past = bytes.clone();
+        let mut past = bytes;
         past[at + 8..at + 12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(crate::open(&past), Err(crate::Error::Corrupt(_))));
     }
@@ -740,7 +746,7 @@ pub(crate) mod tests {
         let info = crate::open(&bytes).unwrap();
         assert_eq!((info.raw_width, info.raw_height), (8, 8));
         assert_eq!(info.lens.len(), 256);
-        let sensor = crate::decode(&info, &bytes, &AtomicBool::new(false)).unwrap();
+        let sensor = crate::decode(&info, &bytes, Cancel::NEVER).unwrap();
         assert_eq!(sensor.data, image);
     }
 
@@ -773,7 +779,7 @@ pub(crate) mod tests {
         assert_eq!(info.model, "EOS T1");
         // GBRG seen from row 1, column 4: R G / G B.
         assert_eq!(info.cfa.as_ref().unwrap().colors, [0, 1, 3, 2]);
-        let sensor = crate::decode(&info, &bytes, &AtomicBool::new(false)).unwrap();
+        let sensor = crate::decode(&info, &bytes, Cancel::NEVER).unwrap();
         assert_eq!(sensor.data, image);
         assert_eq!(sensor.white, 4095);
     }
@@ -799,7 +805,7 @@ pub(crate) mod tests {
             ];
             let bytes = cr2(&jpeg, &[], &note);
             let info = crate::open(&bytes).unwrap();
-            let sensor = crate::decode(&info, &bytes, &AtomicBool::new(false)).unwrap();
+            let sensor = crate::decode(&info, &bytes, Cancel::NEVER).unwrap();
             (sensor.black, sensor.white, info.levels)
         };
         // Red, green, blue, second green from red, green, green, blue; the
@@ -846,7 +852,7 @@ pub(crate) mod tests {
         bytes[at..at + 12].copy_from_slice(b"Canon EOS 5D");
         let info = crate::open(&bytes).unwrap();
         assert_eq!(info.model, "EOS 5D");
-        let sensor = crate::decode(&info, &bytes, &AtomicBool::new(false)).unwrap();
+        let sensor = crate::decode(&info, &bytes, Cancel::NEVER).unwrap();
         assert_eq!(sensor.white, 3692);
         assert_eq!(info.levels, Some([110, 3692, 4095]));
     }
@@ -871,19 +877,19 @@ pub(crate) mod tests {
         ];
         let bytes = cr2(&jpeg, &[(0xc640, 3, 3, shorts(&[1, 4, 4]))], &note);
         if let Ok(info) = crate::open(&bytes) {
-            let _ = crate::decode(&info, &bytes, &AtomicBool::new(false));
+            let _ = crate::decode(&info, &bytes, Cancel::NEVER);
         }
         let note = [(0x00e0, 3, 9, shorts(&[0, 8, 8, 0, 0, 7, 1, 0xffff, 0xffff]))];
         let bytes = cr2(&jpeg, &[], &note);
         let info = crate::open(&bytes).unwrap();
         assert_eq!(info.frame, [crate::UNSET, crate::UNSET, 0, 0]);
         // A frame header claiming far more samples than the strip can code.
-        let mut huge = jpeg.clone();
+        let mut huge = jpeg;
         let sof = huge.windows(2).position(|w| w == [0xff, 0xc3]).unwrap();
         huge[sof + 5..sof + 9].copy_from_slice(&[0x40, 0, 0x40, 0]);
         let bytes = cr2(&huge, &[], &[]);
         if let Ok(info) = crate::open(&bytes) {
-            assert!(crate::decode(&info, &bytes, &AtomicBool::new(false)).is_err());
+            assert!(crate::decode(&info, &bytes, Cancel::NEVER).is_err());
         }
     }
 
@@ -894,7 +900,7 @@ pub(crate) mod tests {
         let bytes = cr2(&jpeg, &[], &[]);
         let info = crate::open(&bytes).unwrap();
         assert_eq!(
-            crate::decode(&info, &bytes, &AtomicBool::new(true)).unwrap_err(),
+            crate::decode(&info, &bytes, Cancel::new(&AtomicBool::new(true))).unwrap_err(),
             crate::Error::Cancelled
         );
     }
@@ -907,15 +913,15 @@ pub(crate) mod tests {
         assert!(crate::open(&bytes).is_ok());
         for end in 0..bytes.len() {
             if let Ok(info) = crate::open(&bytes[..end]) {
-                let _ = crate::decode(&info, &bytes[..end], &AtomicBool::new(false));
+                let _ = crate::decode(&info, &bytes[..end], Cancel::NEVER);
             }
         }
-        let mut garbage = bytes.clone();
+        let mut garbage = bytes;
         for (i, b) in garbage.iter_mut().enumerate().skip(16) {
             *b ^= (i * 131 % 251) as u8;
         }
         if let Ok(info) = crate::open(&garbage) {
-            let _ = crate::decode(&info, &garbage, &AtomicBool::new(false));
+            let _ = crate::decode(&info, &garbage, Cancel::NEVER);
         }
     }
 
@@ -967,21 +973,21 @@ pub(crate) mod tests {
         assert_eq!((info.raw_width, info.raw_height), (4, 4));
         assert_eq!(info.model, "EOS-1D");
         assert_eq!(info.cam_mul, [829., 512., 700., 512.]);
-        let s = crate::decode(&info, &f, &AtomicBool::new(false)).unwrap();
+        let s = crate::decode(&info, &f, Cancel::NEVER).unwrap();
         // Each line's samples, in order, are two rows of four.
         assert_eq!(s.data, order);
         assert_eq!((s.black, s.white), ([0; 4], 3500));
         assert_eq!(
-            crate::decode(&info, &f, &AtomicBool::new(true)).unwrap_err(),
+            crate::decode(&info, &f, Cancel::new(&AtomicBool::new(true))).unwrap_err(),
             crate::error::Error::Cancelled
         );
         for end in 0..f.len() {
             if let Ok(info) = crate::open(&f[..end]) {
-                let _ = crate::decode(&info, &f[..end], &AtomicBool::new(false));
+                let _ = crate::decode(&info, &f[..end], Cancel::NEVER);
             }
         }
         // RawDataOffset past the file's end is an error.
-        let mut far = f.clone();
+        let mut far = f;
         let at = far.windows(4).position(|w| w == [0x81, 0, 4, 0]).unwrap();
         far[at + 8..at + 12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(crate::open(&far).is_err());

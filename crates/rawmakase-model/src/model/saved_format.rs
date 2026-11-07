@@ -17,6 +17,36 @@ pub const SCHEMA: u32 = 11;
 /// The newest version the releases before the one engine read. Look Amounts,
 /// RGB-table looks and matrix-profile signatures were written as 8, 9 and 10.
 pub const BEFORE_ONE_ENGINE: u32 = 10;
+/// The version a recipe holding a Lensfun lens choice is written as (chosen, switched
+/// off or unresolved alike): releases before Lensfun read up to [`SCHEMA`] and refuse
+/// it, keeping it "preserved without changes" rather than rendering or saving it
+/// without its lens. Every other recipe stays [`SCHEMA`], so they still read it.
+pub const LENSFUN_SCHEMA: u32 = 12;
+/// The version a recipe with AI Denoise on, or its Amount moved from the default, is
+/// written as: releases before it read up to [`LENSFUN_SCHEMA`] and refuse it rather
+/// than render it without AI Denoise (or drop the setting when saving). Every other
+/// recipe keeps its version.
+pub const AI_DENOISE_SCHEMA: u32 = 13;
+/// The version a recipe with HDR editing on is written as: releases before it read up
+/// to [`AI_DENOISE_SCHEMA`] and refuse it rather than render it as SDR (or drop the
+/// setting when saving). HDR values kept while HDR is off don't need it: those
+/// releases keep them as unknown settings and render the edit as it should.
+pub const HDR_SCHEMA: u32 = 14;
+/// The newest version this release reads.
+pub const NEWEST: u32 = HDR_SCHEMA;
+
+/// The version to save `recipe` as: the newest any of its settings needs.
+pub fn schema_for(recipe: &super::recipe::Recipe) -> u32 {
+    if recipe.uses_hdr() {
+        HDR_SCHEMA
+    } else if !recipe.ai_denoise.is_default() {
+        AI_DENOISE_SCHEMA
+    } else if recipe.uses_lensfun() {
+        LENSFUN_SCHEMA
+    } else {
+        SCHEMA
+    }
+}
 
 /// Recipe settings of earlier releases that chose a rendering engine or an
 /// operator for a control: the process version, five opt-in flags and the
@@ -83,7 +113,8 @@ pub(crate) fn unknown_settings<'de, D: serde::Deserializer<'de>>(
 }
 
 /// Whether a reader of versions up to `newest` reads the envelope in `value`: this
-/// release with [`SCHEMA`], the releases before the one engine with
+/// release with [`NEWEST`], the releases before Lensfun with [`SCHEMA`], those before
+/// the one engine with
 /// [`BEFORE_ONE_ENGINE`] (their check, exactly).
 pub fn reads(value: &serde_json::Value, newest: u32) -> bool {
     let schema = value["schema"].as_u64();
@@ -97,7 +128,7 @@ pub fn reads(value: &serde_json::Value, newest: u32) -> bool {
 /// reads and brings its recipe up to date.
 pub fn migrate_recipe(value: &mut serde_json::Value) -> Result<()> {
     ensure!(
-        reads(value, SCHEMA),
+        reads(value, NEWEST),
         "Unsupported saved recipe version: preserved without changes"
     );
     let pipeline = value["pipeline"].as_u64();
@@ -127,7 +158,11 @@ mod tests {
             assert!(v["recipe"].get("engine").is_none(), "{version}");
             assert_eq!(v["recipe"]["exposure"], 0.5);
         }
-        let mut v = serde_json::json!({"schema": 12, "pipeline": 12, "recipe": {}});
+        for version in [12, 13, 14] {
+            let mut v = serde_json::json!({"schema": version, "pipeline": version, "recipe": {}});
+            assert!(super::migrate_recipe(&mut v).is_ok());
+        }
+        let mut v = serde_json::json!({"schema": 15, "pipeline": 15, "recipe": {}});
         assert!(super::migrate_recipe(&mut v).is_err());
         let mut v = serde_json::json!({"schema": 5, "pipeline": 6, "recipe": {}});
         assert!(super::migrate_recipe(&mut v).is_err());
@@ -346,5 +381,83 @@ mod tests {
         super::migrate_recipe(&mut v).unwrap();
         let old: Recipe = serde_json::from_value(v["recipe"].clone()).unwrap();
         assert_eq!(old.retouch, r.retouch);
+    }
+
+    /// AI Denoise needs schema 13 whenever it is not the default, switched off with a
+    /// moved Amount too; a recipe without it keeps the version it had.
+    #[test]
+    fn ai_denoise_is_saved_as_its_own_schema_only_when_set() {
+        use super::super::{ai_denoise::AiDenoise, recipe::Recipe};
+        let mut r = Recipe::default();
+        assert_eq!(super::schema_for(&r), super::SCHEMA);
+        assert!(
+            serde_json::to_value(&r)
+                .unwrap()
+                .get("ai_denoise")
+                .is_none()
+        );
+        for setting in [
+            AiDenoise {
+                enabled: true,
+                amount: 0.5,
+            },
+            AiDenoise {
+                enabled: false,
+                amount: 0.7,
+            },
+        ] {
+            r.ai_denoise = setting;
+            assert_eq!(super::schema_for(&r), super::AI_DENOISE_SCHEMA);
+            let saved = serde_json::to_value(&r).unwrap();
+            let read: Recipe = serde_json::from_value(saved).unwrap();
+            assert_eq!(read.ai_denoise, setting);
+            assert!(read.unknown.is_empty());
+        }
+        // A release that knows nothing of it reads up to 12 only.
+        const { assert!(super::AI_DENOISE_SCHEMA > super::LENSFUN_SCHEMA) };
+    }
+
+    /// HDR on needs schema 14, over AI Denoise's 13, and a release that reads up to 13
+    /// refuses it. Values kept while HDR is off keep the version the recipe had: such a
+    /// release keeps them as unknown settings, and they come back unchanged.
+    #[test]
+    fn active_hdr_is_saved_as_its_own_schema_and_kept_values_are_not() {
+        use super::super::{hdr::HdrSettings, recipe::Recipe};
+        let mut r = Recipe::default();
+        assert!(serde_json::to_value(&r).unwrap().get("hdr").is_none());
+        r.hdr = HdrSettings {
+            limit: 3.,
+            ..Default::default()
+        };
+        r.hdr.sdr.brightness = 0.3;
+        assert_eq!(super::schema_for(&r), super::SCHEMA);
+        r.ai_denoise.enabled = true;
+        assert_eq!(super::schema_for(&r), super::AI_DENOISE_SCHEMA);
+        let envelope = |r: &Recipe| {
+            serde_json::json!({
+                "schema": super::schema_for(r),
+                "pipeline": super::schema_for(r),
+                "recipe": serde_json::to_value(r).unwrap(),
+            })
+        };
+        // An earlier release reads it, keeping `hdr` as an unknown setting.
+        let kept = envelope(&r);
+        assert!(super::reads(&kept, super::AI_DENOISE_SCHEMA));
+        assert!(kept["recipe"]["hdr"].is_object());
+        let read: Recipe = serde_json::from_value(kept["recipe"].clone()).unwrap();
+        assert_eq!(read.hdr, r.hdr);
+        assert!(read.validate().is_ok());
+
+        r.hdr.enabled = true;
+        assert_eq!(super::schema_for(&r), super::HDR_SCHEMA);
+        let active = envelope(&r);
+        assert!(!super::reads(&active, super::AI_DENOISE_SCHEMA));
+        assert!(super::reads(&active, super::NEWEST));
+        let read: Recipe = serde_json::from_value(active["recipe"].clone()).unwrap();
+        assert_eq!(read.hdr, r.hdr);
+        assert!(read.unknown.is_empty());
+        // This release reads and renders it.
+        assert!(read.validate().is_ok());
+        const { assert!(super::HDR_SCHEMA > super::AI_DENOISE_SCHEMA) };
     }
 }

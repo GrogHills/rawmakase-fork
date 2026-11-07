@@ -6,9 +6,9 @@
 //! and kept, within a budget, until it is shown. An offline photo shows its
 //! cached preview.
 use super::{Action, Library, thumbnails};
-use crate::app::design::{Tone, text};
-use crate::app::navigator::Zoom;
-use crate::app::theme;
+use crate::app::ui::design::{Tone, text};
+use crate::app::ui::theme;
+use crate::app::view::navigator::Zoom;
 use crate::app::worker::Latest;
 use crate::catalog::{Photo, PhotoId};
 use eframe::egui::{self, Color32, Vec2};
@@ -81,6 +81,8 @@ pub(super) struct Loupe {
     /// double-click to undo.
     before_click: Option<(bool, f64, Option<PhotoId>)>,
     pub state: State,
+    /// The photo's failure, until the Library says it in the top bar.
+    unreported: Option<String>,
 }
 impl Loupe {
     pub(super) fn new(ctx: &egui::Context) -> Self {
@@ -133,7 +135,14 @@ impl Loupe {
             view: Vec2::ZERO,
             before_click: None,
             state: State::Loading,
+            unreported: None,
         }
+    }
+    /// A new request: the earlier one's result, and its failure not yet
+    /// said, are dropped.
+    fn next_ticket(&mut self) {
+        self.ticket += 1;
+        self.unreported = None;
     }
     /// Asks for `photo` at `edge` pixels, unless that is already on its way;
     /// from its stored preview with that identity when `stored` says so.
@@ -148,7 +157,7 @@ impl Loupe {
         if let Some(at) = self.prefetched.iter().position(|(k, _)| *k == wanted) {
             let (_, prepared) = self.prefetched.remove(at).unwrap();
             self.cancel.store(true, Ordering::Relaxed);
-            self.ticket += 1;
+            self.next_ticket();
             self.requested = Some(wanted);
             self.show(ctx, prepared);
             return;
@@ -162,7 +171,7 @@ impl Loupe {
         // Moving on cancels the photo being prepared; its result is dropped.
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Default::default();
-        self.ticket += 1;
+        self.next_ticket();
         if !same_photo {
             self.texture = None;
             self.full = None;
@@ -224,6 +233,12 @@ impl Loupe {
         self.full = None;
         self.texture = None;
         self.state = State::Loading;
+        // A result on its way is the forgotten photo's.
+        self.next_ticket();
+    }
+    /// The photo's failure, once, for the top bar.
+    pub(super) fn take_failure(&mut self) -> Option<String> {
+        self.unreported.take()
     }
     fn poll(&mut self, ctx: &egui::Context) {
         self.regions.poll(ctx);
@@ -245,9 +260,17 @@ impl Loupe {
             }
             match done.result {
                 Ok(prepared) => self.show(ctx, prepared),
-                Err(e) => self.state = State::Failed(e),
+                Err(e) => {
+                    self.unreported = Some(e.clone());
+                    self.state = State::Failed(e);
+                }
             }
         }
+    }
+    /// Takes the results that have come in, as a frame does.
+    #[cfg(test)]
+    pub(super) fn poll_now(&mut self, ctx: &egui::Context) {
+        self.poll(ctx);
     }
     #[cfg(test)]
     pub(super) fn wait(&mut self, ctx: &egui::Context) {
@@ -298,7 +321,7 @@ impl Library {
     /// E, Return or a double-click: the active photo, large.
     pub(crate) fn open_loupe(&mut self) {
         if self.selection.active.is_none() {
-            self.select(self.visible.first().map(|i| self.session.photos[*i].id));
+            self.select(self.visible.first().map(|i| self.session.photos()[*i].id));
         }
         self.loupe.open = self.selection.active.is_some();
         if self.loupe.open {
@@ -336,7 +359,7 @@ impl Library {
     /// it has an edit of its own.
     pub(super) fn develops(&self, photo: &Photo) -> bool {
         crate::storage::is_raw(&photo.path)
-            || self.session.catalog.has_edit(photo.id).unwrap_or(false)
+            || self.session.catalog().has_edit(photo.id).unwrap_or(false)
     }
     /// The zoom level at which the photo in the Loupe's own view fits, for
     /// stepping through the levels from it.
@@ -366,7 +389,7 @@ impl Library {
     /// preview, and the part in view when zoomed.
     pub(in crate::app) fn loupe_minimap(
         &self,
-    ) -> Option<(crate::app::navigator::Photo, Option<[f32; 4]>)> {
+    ) -> Option<(crate::app::view::navigator::Photo, Option<[f32; 4]>)> {
         let photo = self.selection.active.and_then(|id| self.photo(id))?;
         // The Loupe's own preview once it is this photo's; until then the
         // grid's.
@@ -429,7 +452,7 @@ impl Library {
         &mut self,
         ui: &mut egui::Ui,
         zoom: &mut Zoom,
-        magnifier: Option<&mut crate::app::magnifier::Magnifier>,
+        magnifier: Option<&mut crate::app::view::magnifier::Magnifier>,
     ) -> Action {
         let palette = theme::palette(ui.ctx());
         self.loupe.poll(ui.ctx());
@@ -450,7 +473,10 @@ impl Library {
         ui.painter().rect_filled(rect, 0., palette.photo_backdrop());
         let ppp = ui.ctx().pixels_per_point();
         // The photo fits within the margin, as drawn below.
-        self.loupe.view = rect.shrink(crate::app::workspace::PHOTO_MARGIN).size() * ppp;
+        self.loupe.view = rect
+            .shrink(crate::app::shell::workspace::PHOTO_MARGIN)
+            .size()
+            * ppp;
         let available = self.is_available(&photo.path);
         let edge = (rect.width().max(rect.height()) * ppp) as u32;
         // An offline RAW with a stored Standard preview shows it.
@@ -478,8 +504,13 @@ impl Library {
         } else if self.loupe.requested.is_some() {
             self.loupe.reset();
         }
+        // Said once the photo shown is the one asked for: a failure of the
+        // photo stepped away from was dropped by the request above.
+        if let Some(e) = self.loupe.take_failure() {
+            self.messages.warn(format!("Preview unavailable: {e}"));
+        }
         self.request_previews(&photo, ui.ctx());
-        let inset = rect.shrink(crate::app::workspace::PHOTO_MARGIN);
+        let inset = rect.shrink(crate::app::shell::workspace::PHOTO_MARGIN);
         // Until its own preview is in, the grid's stands in, enlarged.
         let own = available
             || stored.is_some()
@@ -604,7 +635,8 @@ impl Library {
                 .filter(|_| regions.photo == Some(photo.id))
                 .or(self.loupe.full.map(|(w, h)| [w, h]));
             if let Some(size) = size
-                && let Some(aim) = crate::app::magnifier::Aim::new(pos, fitted, size, level, ppp)
+                && let Some(aim) =
+                    crate::app::view::magnifier::Aim::new(pos, fitted, size, level, ppp)
             {
                 let [x, y, w, h] = aim.region(size);
                 let centre = [
@@ -620,7 +652,7 @@ impl Library {
                     .filter(|_| regions.photo == Some(photo.id))
                     .map(|(t, [rx, ry, rw, rh])| (t.id(), [rx * fw, ry * fh, rw * fw, rh * fh]));
                 let preview = texture.as_ref().map(|t| t.id());
-                crate::app::magnifier::paint_lens(ui, pos, &aim, level, sharp, preview, size);
+                crate::app::view::magnifier::paint_lens(ui, pos, &aim, level, sharp, preview, size);
             }
         }
         if zoom.on && zoomable {
@@ -646,8 +678,8 @@ impl Library {
             ),
             _ if zoom.on && (self.loupe.regions.pending || full.is_none()) => "Loading…".into(),
             (State::Loading, ..) => "Loading…".into(),
-            (State::Ready, ..) => String::new(),
-            (State::Failed(e), ..) => format!("Preview unavailable: {e}"),
+            // A failure is said in the top bar.
+            (State::Ready | State::Failed(_), ..) => String::new(),
         };
         if !note.is_empty() {
             ui.painter().text(

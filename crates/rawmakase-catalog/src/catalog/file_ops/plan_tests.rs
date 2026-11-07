@@ -5,10 +5,11 @@ use super::tests::{FakeTrash, Faulty, NoTrash, bytes, fixture, results};
 use super::*;
 use crate::catalog::{Catalog, HistoryUpdate};
 use crate::export_settings::ExportOptions;
+use crate::fsops;
 use crate::model::recipe::Recipe;
 use crate::storage::Identity;
-use crate::storage::fsops;
 use anyhow::Result;
+use rawmakase_cancel::Cancel;
 
 fn moved(to: FolderId) -> ItemResult {
     ItemResult::Moved { to }
@@ -138,6 +139,7 @@ fn a_move_keeps_the_file_object_its_time_identity_edit_and_checksum() -> Result<
     fx.cat.save_edit(
         a,
         &source,
+        &crate::storage::Identity::read(&source)?,
         &Recipe::default(),
         &ExportOptions::default(),
         HistoryUpdate::Keep,
@@ -275,7 +277,7 @@ fn background_reads_between_plan_and_execute_strand_nothing() -> Result<()> {
         &mut fx.cat,
         plan.confirm(),
         &NoTrash,
-        &Default::default(),
+        Cancel::NEVER,
         &Faulty::default(),
     )?;
     assert_eq!(results(&outcome), [moved(to)]);
@@ -303,7 +305,7 @@ fn a_family_changed_by_another_connection_after_planning_is_left_alone() -> Resu
             &mut fx.cat,
             plan.confirm(),
             &NoTrash,
-            &Default::default(),
+            Cancel::NEVER,
             &Faulty::default(),
         )?;
         let done = match remove {
@@ -356,7 +358,7 @@ fn a_photo_removed_and_added_again_with_new_edits_is_refused() -> Result<()> {
         &mut fx.cat,
         plan.confirm(),
         &NoTrash,
-        &Default::default(),
+        Cancel::NEVER,
         &Faulty::default(),
     )?;
     assert!(matches!(
@@ -382,7 +384,7 @@ fn a_destination_created_between_plan_and_execute_is_left_alone() -> Result<()> 
         &mut fx.cat,
         plan.confirm(),
         &NoTrash,
-        &Default::default(),
+        Cancel::NEVER,
         &Faulty::default(),
     )?;
     assert!(matches!(
@@ -739,7 +741,7 @@ fn cancelling_stops_between_items() -> Result<()> {
         &mut fx.cat,
         plan.confirm(),
         &NoTrash,
-        &cancel,
+        Cancel::new(&cancel),
         &Faulty::default(),
     )?;
     assert!(outcome.items.is_empty());
@@ -758,7 +760,7 @@ fn a_plan_runs_only_in_its_own_catalog() -> Result<()> {
         &mut other.cat,
         plan.confirm(),
         &NoTrash,
-        &Default::default(),
+        Cancel::NEVER,
         &Faulty::default(),
     );
     assert!(matches!(run, Err(FileOpError::WrongCatalog)));
@@ -779,7 +781,7 @@ fn the_outcome_reads_the_same_from_the_journal_afterwards() -> Result<()> {
         &mut fx.cat,
         plan.confirm(),
         &NoTrash,
-        &Default::default(),
+        Cancel::NEVER,
         &Faulty::default(),
     )?;
     fx.reopen();
@@ -823,7 +825,7 @@ fn a_sidecar_reader_appearing_after_planning_leaves_the_photo_alone() -> Result<
             &mut fx.cat,
             plan.confirm(),
             &NoTrash,
-            &Default::default(),
+            Cancel::NEVER,
             &Faulty::default(),
         )?;
         assert!(
@@ -853,7 +855,7 @@ fn a_destination_replaced_by_a_link_after_planning_is_not_followed() -> Result<(
         &mut fx.cat,
         plan.confirm(),
         &NoTrash,
-        &Default::default(),
+        Cancel::NEVER,
         &Faulty::default(),
     )?;
     assert!(matches!(

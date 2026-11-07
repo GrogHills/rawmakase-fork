@@ -13,6 +13,7 @@ use crate::catalog::HistoryUpdate;
 use crate::export_settings::ExportOptions;
 use crate::model::recipe::Recipe;
 use anyhow::Result;
+use rawmakase_cancel::Cancel;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +59,7 @@ fn trip() -> Trip {
         .save_edit(
             copy,
             &fx.root.join("day/a.NEF"),
+            &crate::storage::Identity::read(&fx.root.join("day/a.NEF")).unwrap(),
             &Recipe::default(),
             &ExportOptions::default(),
             HistoryUpdate::Keep,
@@ -117,14 +119,7 @@ fn refusal(fx: &Fx, folder: &str, trash: &dyn Trash, disk: &dyn disk::Disk) -> S
 
 /// Executes `plan` with `trash` on `disk`.
 fn execute(fx: &mut Fx, plan: Plan, trash: &dyn Trash, disk: &dyn disk::Disk) -> Outcome {
-    execute::execute_with(
-        &mut fx.cat,
-        plan.confirm(),
-        trash,
-        &AtomicBool::new(false),
-        disk,
-    )
-    .unwrap()
+    execute::execute_with(&mut fx.cat, plan.confirm(), trash, Cancel::NEVER, disk).unwrap()
 }
 
 /// Plans and executes putting `folder` in `trash` on `disk`.
@@ -763,6 +758,7 @@ fn a_catalog_change_since_the_question_stops_it() {
             .save_edit(
                 t.a,
                 &t.fx.root.join("day/a.NEF"),
+                &crate::storage::Identity::read(&t.fx.root.join("day/a.NEF")).unwrap(),
                 &Recipe::default(),
                 &ExportOptions::default(),
                 HistoryUpdate::Keep,
@@ -775,6 +771,7 @@ fn a_catalog_change_since_the_question_stops_it() {
             .save_edit(
                 t.stray,
                 &t.fx.root.join("other/c.NEF"),
+                &crate::storage::Identity::read(&t.fx.root.join("other/c.NEF")).unwrap(),
                 &Recipe::default(),
                 &ExportOptions::default(),
                 HistoryUpdate::Keep,
@@ -802,7 +799,7 @@ fn stop_before_or_during_the_last_walk_moves_nothing() -> Result<()> {
         &mut t.fx.cat,
         plan.confirm(),
         &trash,
-        &AtomicBool::new(true),
+        Cancel::new(&AtomicBool::new(true)),
         &Faulty::default(),
     )?;
     assert!(outcome.items.is_empty());
@@ -827,7 +824,13 @@ fn stop_before_or_during_the_last_walk_moves_nothing() -> Result<()> {
     };
     let plan = plan_on(&t.fx, "day", &trash, &disk)?;
     let batch = plan.batch().clone();
-    let outcome = execute::execute_with(&mut t.fx.cat, plan.confirm(), &trash, &cancel, &disk)?;
+    let outcome = execute::execute_with(
+        &mut t.fx.cat,
+        plan.confirm(),
+        &trash,
+        Cancel::new(&cancel),
+        &disk,
+    )?;
     assert_eq!(
         results(&outcome),
         [ItemResult::Unchanged(Some("Stopped.".into()))]
@@ -1424,7 +1427,7 @@ fn a_drive_offline_at_recovery_is_decided_once_it_is_back() -> Result<()> {
     let (mut t, trash, batch) = crashed_with_receipt(false);
     let offline = Faulty::default();
     offline.unlistable.borrow_mut().push(t.fx.root.clone());
-    offline.unlistable.borrow_mut().push(trash.dir.clone());
+    offline.unlistable.borrow_mut().push(trash.dir);
     let recovery = t.fx.recover(&offline);
     assert_eq!(recovery.unfinished.len(), 1, "{recovery:?}");
     assert!(rows_intact(&t));

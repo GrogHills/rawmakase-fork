@@ -6,8 +6,8 @@ use super::journal;
 use super::recover_tests;
 use super::tests::*;
 use super::*;
-use crate::storage::fsops;
-use std::sync::atomic::AtomicBool;
+use crate::fsops;
+use rawmakase_cancel::Cancel;
 
 /// Photos `IMG_0000.NEF`… in one folder, every third with an XMP sidecar.
 fn many(n: usize) -> Vec<String> {
@@ -29,8 +29,8 @@ fn a_name_an_earlier_item_takes_in_the_catalog_leaves_the_later_one_untouched() 
     // when items went one at a time.
     let mut fx = fixture(&["x/a.NEF", "y/A.NEF", "sub/"]);
     let sub = fx.root.join("sub");
-    let names = crate::storage::fsops::list(&sub).unwrap();
-    if crate::storage::fsops::probe(&sub, &names).case != crate::storage::fsops::Folding::Exact {
+    let names = crate::fsops::list(&sub).unwrap();
+    if crate::fsops::probe(&sub, &names).case != crate::fsops::Folding::Exact {
         return;
     }
     let photos = vec![fx.photo("x/a.NEF"), fx.photo("y/A.NEF")];
@@ -247,7 +247,7 @@ fn a_fault_in_either_batch_of_a_rename_ends_proven() {
                     &mut fx.cat,
                     plan.confirm(),
                     &NoTrash,
-                    &AtomicBool::new(false),
+                    Cancel::NEVER,
                     &disk,
                 ));
             });
@@ -282,7 +282,7 @@ fn a_failed_completion_in_a_batch_leaves_only_its_item_and_a_restart_finishes_it
         &mut fx.cat,
         plan.confirm(),
         &NoTrash,
-        &AtomicBool::new(false),
+        Cancel::NEVER,
         &Faulty::default(),
     )
     .unwrap();
@@ -322,7 +322,7 @@ fn a_failed_journal_commit_in_the_second_batch_puts_only_that_batch_back() {
         &mut fx.cat,
         plan.confirm(),
         &NoTrash,
-        &AtomicBool::new(false),
+        Cancel::NEVER,
         &Faulty::default(),
     )
     .unwrap();
@@ -398,7 +398,7 @@ fn every_member_journalled_moved_was_renamed_and_its_folders_synced_first() {
         }
     };
     let watched = check.clone();
-    let recorded = calls.clone();
+    let recorded = calls;
     let disk = Faulty {
         watch: Some(Box::new(move |call: &Call| {
             watched();

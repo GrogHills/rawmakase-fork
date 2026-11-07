@@ -1,7 +1,7 @@
 use super::folder_selection::{Click, FolderSelection};
-use crate::app::design::{Tone, radius, text};
-use crate::app::icons::{self, Icon};
-use crate::app::theme;
+use crate::app::ui::design::{Tone, radius, text};
+use crate::app::ui::icons::{self, Icon};
+use crate::app::ui::theme;
 use crate::catalog::{Folder, FolderId, PhotoId, RootId};
 use eframe::egui::{self, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -117,6 +117,9 @@ pub(super) enum TreeAction {
     /// Remove from Catalog: the folder's name, it and its subfolders, and
     /// their photos' count.
     Remove(String, HashSet<FolderId>, usize),
+    /// Export Folder as Catalog: the folder's name, it and its subfolders,
+    /// and their photos' count.
+    ExportCatalog(String, HashSet<FolderId>, usize),
     /// Synchronize Folder: what to synchronize, and its name.
     Synchronize(crate::catalog::folder_sync::SyncScope, String),
     /// New Folder Inside…: the folder's root, logical path, name and
@@ -370,7 +373,7 @@ pub(super) fn folder_tree_row(
             to: node.logical.clone(),
         });
     }
-    if response.clicked() && !crate::app::widgets::context_clicked(&response) {
+    if response.clicked() && !crate::app::ui::widgets::context_clicked(&response) {
         let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
         if !node.children.is_empty() && pointer.x < x + 6. {
             if open {
@@ -383,8 +386,8 @@ pub(super) fn folder_tree_row(
             action = Some(TreeAction::Select(node.key.clone(), click));
         }
     }
-    crate::app::widgets::context_menu(&response, |ui| {
-        use crate::app::widgets::{menu_item, menu_separator};
+    crate::app::ui::widgets::context_menu(&response, |ui| {
+        use crate::app::ui::widgets::{menu_item, menu_separator};
         ui.set_width(210.);
         ui.spacing_mut().item_spacing.y = 0.;
         if menu_item(
@@ -449,6 +452,14 @@ pub(super) fn folder_tree_row(
         }
         if movable || !node.ids.is_empty() || node.root.is_some() {
             menu_separator(ui);
+        }
+        if !node.ids.is_empty() && menu_item(ui, "Export Folder as Catalog…", "", true, false) {
+            action = Some(TreeAction::ExportCatalog(
+                node.name.clone(),
+                node.ids.clone(),
+                node.count,
+            ));
+            ui.close();
         }
         if !node.ids.is_empty() && menu_item(ui, "Remove from Catalog…", "", true, false) {
             action = Some(TreeAction::Remove(

@@ -82,7 +82,64 @@ pub(in crate::catalog) fn new_batch(w: &mut Write<'_>, kind: ImportKind) -> Resu
         &[&kind.as_str()],
     )
 }
+/// The longest gap between two frames of a burst whose camera didn't number
+/// them (Canon's and Nikon's continuous drive), for Stack Camera Bursts when
+/// adding photos: kept with the batch, the input its stacking takes.
+pub const IMPORT_BURST_SECONDS: f64 = 2.;
+
+/// A batch added with Stack Camera Bursts whose bursts aren't stacked yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingBurstStacks {
+    pub batch: i64,
+    /// The longest gap between frames a camera didn't number.
+    pub seconds: f64,
+    /// The batch's photos still in the catalog.
+    pub photos: Vec<PhotoId>,
+}
+
 impl Catalog {
+    /// The batches added with Stack Camera Bursts whose bursts are still to
+    /// be stacked, oldest first: kept until stacked, across restarts.
+    pub fn pending_burst_stacks(&self) -> Result<Vec<PendingBurstStacks>> {
+        row! {
+            struct Pending {
+                batch: i64,
+                seconds: f64,
+            }
+        }
+        row! {
+            struct Member {
+                batch: i64,
+                photo: PhotoId,
+            }
+        }
+        self.db.snapshot(|s| {
+            let pending: Vec<Pending> = s.read(
+                sql!("SELECT batch, seconds FROM import_burst_stacks ORDER BY batch"),
+                &[],
+            )?;
+            let members: Vec<Member> = s.read(
+                sql!(
+                    "SELECT i.batch, i.photo FROM photo_imports i
+                     JOIN import_burst_stacks b ON b.batch = i.batch
+                     ORDER BY i.photo"
+                ),
+                &[],
+            )?;
+            let mut photos: HashMap<i64, Vec<PhotoId>> = HashMap::new();
+            for m in members {
+                photos.entry(m.batch).or_default().push(m.photo);
+            }
+            Ok(pending
+                .into_iter()
+                .map(|p| PendingBurstStacks {
+                    batch: p.batch,
+                    seconds: p.seconds,
+                    photos: photos.remove(&p.batch).unwrap_or_default(),
+                })
+                .collect())
+        })
+    }
     /// Lightroom's Previous Import: the photos the last Add Photo Folder or
     /// Synchronize added that are still in the catalog.
     pub fn previous_import(&self) -> Result<Vec<PhotoId>> {
@@ -114,6 +171,7 @@ pub(in crate::catalog) enum Place {
 }
 
 impl Catalog {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn add_folder(&mut self, folder: &Path) -> Result<usize> {
         Ok(self.add_folder_with(folder, &Default::default())?.0)
     }
@@ -122,24 +180,7 @@ impl Catalog {
     /// and a root left without folders goes too. Nothing on disk is touched.
     /// Returns the photos removed; their ids may be given to new photos.
     pub fn remove_folders(&mut self, folders: &[FolderId]) -> Result<Vec<PhotoId>> {
-        self.db.write(|w| {
-            let mut roots = BTreeSet::new();
-            for folder in folders {
-                let root: Option<RootId> =
-                    w.read_optional(sql!("SELECT root FROM folders WHERE id=?"), &[folder])?;
-                roots.extend(root);
-            }
-            let photos = remove_folder_rows(w, folders)?;
-            for root in &roots {
-                let left: Option<FolderId> =
-                    w.read_optional(sql!("SELECT id FROM folders WHERE root=?"), &[root])?;
-                if left.is_none() {
-                    w.execute(sql!("DELETE FROM folder_locations WHERE root=?"), &[root])?;
-                    w.execute(sql!("DELETE FROM roots WHERE id=?"), &[root])?;
-                }
-            }
-            Ok(photos)
-        })
+        self.db.write(|w| remove_folders(w, folders))
     }
     /// Removes root `root` from the catalog when it has no folder left (a
     /// folder put in the Trash or moved to another root took its last one);
@@ -266,16 +307,10 @@ impl Catalog {
             Ok(new)
         })?;
         // Everything each photo brings is read before the transaction, so
-        // that it is written with the photo or not at all. The files are read
-        // side by side, as one after another leaves a slow disk or a network
-        // share waiting on each; the checks against the catalog follow in order.
-        let photos: Vec<NewPhoto> =
-            side_by_side(files, |(file, place)| read_new_photo(file, place, defaults))
-                .into_iter()
-                .map(|read| self.new_photo(read))
-                .collect();
-        let edited_at = rawmakase_model::time::now_text();
-        let (added, report, edits) = self.db.write(|w| {
+        // that it is written with the photo or not at all.
+        let photos = self.read_new_photos(files, defaults);
+        let stores = stores(&photos);
+        self.write_new_photos(stores, |w, writer| {
             // The newest batch is Previous Import, empty when nothing new
             // was found.
             let batch = new_batch(w, kind)?;
@@ -283,7 +318,6 @@ impl Catalog {
             let mut folders: HashMap<(RootId, String), FolderId> = HashMap::new();
             let mut added = 0;
             let mut report = super::SidecarReport::default();
-            let mut edits = Vec::new();
             for photo in photos {
                 let (root, logical) = match photo.place {
                     Place::Folder(root, logical) => (*root, logical.clone()),
@@ -298,12 +332,10 @@ impl Catalog {
                         (root, logical.clone())
                     }
                 };
-                let file = photo.file;
                 // Added since the files were read.
-                if known(w, root, &logical, &file)? {
+                if known(w, root, &logical, &photo.file)? {
                     continue;
                 }
-                let filename = file.file_name().unwrap().to_string_lossy();
                 let key = (root, logical);
                 let fid = match folders.get(&key) {
                     Some(id) => *id,
@@ -313,81 +345,124 @@ impl Catalog {
                         id
                     }
                 };
-                let format = file
-                    .extension()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_ascii_uppercase();
-                let id: PhotoId = w.insert_returning_id(
-                    sql!(
-                        "INSERT INTO photos(folder,filename,original_path,format) VALUES(?,?,?,?)
-                         RETURNING id"
-                    ),
-                    &[&fid, &filename, &file.to_string_lossy(), &format],
-                )?;
-                w.execute(
-                    sql!("INSERT INTO photo_imports(photo, batch) VALUES(?, ?)"),
-                    &[&id, &batch],
-                )?;
+                let (_, read) = writer.insert(w, photo, fid, batch)?;
+                report.add(read);
                 added += 1;
-                if let Some(edit) = photo.edit {
-                    // An edit an older release saved that can't be kept stays
-                    // unused on disk.
-                    let written = w.savepoint(|w| {
-                        for (hash, data) in &edit.bitmaps {
-                            super::edits::insert_bitmap(w, hash, data)?;
-                        }
-                        let change = edit.checked.change(id);
-                        super::edit_rows::write_edit(w, &change, &edited_at)?;
-                        Ok(change)
-                    });
-                    edits.extend(refused(written)?.ok());
-                }
-                let mut readable = photo.report.unreadable.is_empty();
-                report.add(photo.report);
-                if let Some(read) = &photo.metadata
-                    && let Err(e) = refused(w.savepoint(|w| {
-                        super::sidecar::apply(w, id, read, super::Merge::FillEmpty)
-                    }))?
-                {
-                    report.unreadable.push((file.clone(), format!("{e:#}")));
-                    readable = false;
-                }
-                // A photo whose metadata couldn't be read may have its own: no
-                // default goes in its place.
-                if readable {
-                    super::defaults::fill(w, id, &photo.defaults)?;
-                }
             }
-            Ok((added, report, edits))
-        })?;
-        edits.iter().for_each(|change| change.committed());
-        Ok((added, report))
+            // Its bursts are stacked once their files are read; asked with
+            // the batch, so it is there with the photos or not at all.
+            if defaults.stack_bursts() && added > 0 {
+                w.execute(
+                    sql!("INSERT INTO import_burst_stacks(batch, seconds) VALUES(?, ?)"),
+                    &[&batch, &IMPORT_BURST_SECONDS],
+                )?;
+            }
+            Ok((added, report))
+        })
+    }
+    /// What each of `files` brings (see [`NewPhoto`]), read from its files,
+    /// with its legacy edit checked for the catalog. The files are read side
+    /// by side, as one after another leaves a slow disk or a network share
+    /// waiting on each; the checks against the catalog follow in order.
+    /// `place` travels with each photo for its caller.
+    pub(in crate::catalog) fn read_new_photos<P: Send>(
+        &self,
+        files: Vec<(PathBuf, P)>,
+        defaults: &super::NewPhotoDefaults,
+    ) -> Vec<NewPhoto<P>> {
+        side_by_side(files, |(file, place)| read_new_photo(file, place, defaults))
+            .into_iter()
+            .map(|read| self.new_photo(read))
+            .collect()
+    }
+    /// Runs `write` in one transaction, with a [`PhotoWriter`] for the
+    /// photos it inserts, then tells the edits it stored that they were
+    /// committed. `stores` (see [`stores`]) raises the catalog to the format
+    /// those edits need in the same transaction.
+    pub(in crate::catalog) fn write_new_photos<R>(
+        &mut self,
+        stores: super::format_upgrade::Stores,
+        write: impl FnOnce(&mut Write<'_>, &mut PhotoWriter) -> Result<R>,
+    ) -> Result<R> {
+        let mut writer = PhotoWriter {
+            edited_at: rawmakase_model::time::now_text(),
+            edits: Vec::new(),
+        };
+        let written = match stores {
+            super::format_upgrade::Stores::Recipes => self.db.write(|w| write(w, &mut writer))?,
+            _ => self.write_recipes(stores, |w| write(w, &mut writer))?,
+        };
+        writer.edits.iter().for_each(|change| change.committed());
+        Ok(written)
     }
     /// Records capture times read from the photos' files, in one transaction.
     /// Only empty dates are filled, never one Lightroom or the user set, and a
     /// photo's virtual copies get its date too.
     pub fn fill_capture_times(&mut self, times: &[(PhotoId, String)]) -> Result<()> {
+        self.db.write(|w| fill_capture_times(w, times))
+    }
+    /// The master photos whose import facts still want the capture time
+    /// their file's EXIF gives, whatever date the photo has (one from XMP or
+    /// the user doesn't count).
+    pub fn photos_to_read_exif_capture(&self) -> Result<Vec<PhotoId>> {
+        self.db.read(
+            sql!(
+                "SELECT f.photo FROM photo_import_facts f JOIN photos p ON p.id = f.photo
+                 WHERE f.exif_read = 0 AND p.master_id IS NULL ORDER BY f.photo"
+            ),
+            &[],
+        )
+    }
+    /// The import facts of `photo`: its original name, EXIF capture time,
+    /// size and whether its EXIF was read; `None` without a row.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn import_facts(&self, photo: PhotoId) -> Result<Option<StoredFacts>> {
+        row! {
+            struct Facts {
+                original_name: String,
+                exif_captured: Option<String>,
+                size: Option<i64>,
+                exif_read: i64,
+            }
+        }
+        let facts: Option<Facts> = self.db.read_optional(
+            sql!(
+                "SELECT original_name, exif_captured, size, exif_read
+                 FROM photo_import_facts WHERE photo=?"
+            ),
+            &[&photo],
+        )?;
+        Ok(facts.map(|f| (f.original_name, f.exif_captured, f.size, f.exif_read != 0)))
+    }
+    /// Records what reading photos' files for their capture times found, in
+    /// one transaction: each date fills the photo's empty date as
+    /// [`Self::fill_capture_times`] does, and every read (`None`: the file
+    /// has no date) completes import facts not read yet. Only the facts
+    /// row's EXIF capture time is written for a photo that has a date.
+    pub fn record_capture_reads(&mut self, reads: &[(PhotoId, Option<String>)]) -> Result<()> {
+        let dated: Vec<(PhotoId, String)> = reads
+            .iter()
+            .filter_map(|(id, time)| Some((*id, time.clone()?)))
+            .collect();
         self.db.write(|w| {
-            // Two statements, each on an index, rather than one OR that scans.
-            for (id, captured) in times {
+            fill_capture_times(w, &dated)?;
+            for (id, time) in reads {
                 w.execute(
-                    sql!("UPDATE photos SET captured=?1 WHERE id=?2 AND captured=''"),
-                    &[captured, id],
-                )?;
-                w.execute(
-                    sql!("UPDATE photos SET captured=?1 WHERE master_id=?2 AND captured=''"),
-                    &[captured, id],
+                    sql!(
+                        "UPDATE photo_import_facts SET exif_captured=?1, exif_read=1
+                         WHERE photo=?2 AND exif_read=0"
+                    ),
+                    &[time, id],
                 )?;
             }
             Ok(())
         })
     }
     /// What a new photo brings, its legacy edit checked for the catalog.
-    fn new_photo<'a>(&self, read: FilesRead<'a>) -> NewPhoto<'a> {
+    fn new_photo<P>(&self, read: FilesRead<P>) -> NewPhoto<P> {
         let edit = read.legacy.and_then(|legacy| {
             legacy
-                .and_then(|legacy| self.check_legacy_edit(&read.file, legacy))
+                .and_then(|legacy| self.check_legacy_edit(legacy))
                 // A sidecar that no longer matches its photo stays unused on disk.
                 .ok()
                 .flatten()
@@ -395,6 +470,7 @@ impl Catalog {
         NewPhoto {
             file: read.file,
             place: read.place,
+            facts: read.facts,
             edit,
             metadata: read.metadata,
             report: read.report,
@@ -403,23 +479,25 @@ impl Catalog {
     }
     /// The edit a photo got outside any catalog, in its photo.rawmakase.json
     /// sidecar, checked for the catalog. The sidecar stays on disk.
-    fn check_legacy_edit(&self, file: &Path, legacy: Option<Legacy>) -> Result<Option<LegacyEdit>> {
+    fn check_legacy_edit(&self, legacy: Option<Legacy>) -> Result<Option<LegacyEdit>> {
         let Some((sidecar, bitmaps)) = legacy else {
             return Ok(None);
         };
-        let checked = self.check_new_edit(file, &sidecar.recipe, &sidecar.export)?;
-        Ok(Some(LegacyEdit { bitmaps, checked }))
+        // The identity the sidecar was checked against as it was read, beside
+        // its photo: a RAW replaced since then doesn't get this edit.
+        let checked = self.check_new_edit(&sidecar.source, &sidecar.recipe, &sidecar.export)?;
+        Ok(Some(LegacyEdit {
+            bitmaps,
+            checked,
+            stores: super::format_upgrade::Stores::of([&sidecar.recipe]),
+        }))
     }
 }
 
 /// What a new photo's files hold: the edit an older release saved beside it
 /// (a RAW's only), its sidecar's and its own XMP metadata, and the defaults
 /// where neither has a value. Nothing of the catalog is read.
-fn read_new_photo<'a>(
-    file: PathBuf,
-    place: &'a Place,
-    defaults: &super::NewPhotoDefaults,
-) -> FilesRead<'a> {
+fn read_new_photo<P>(file: PathBuf, place: P, defaults: &super::NewPhotoDefaults) -> FilesRead<P> {
     // Its masks compressed as they are read, so a folder of them is never
     // held decompressed at once.
     let legacy = crate::storage::is_raw(&file).then(|| {
@@ -434,9 +512,11 @@ fn read_new_photo<'a>(
     });
     let (metadata, report) = super::sidecar::read_file(&file, defaults.raw_xmp());
     let defaults = defaults.for_file(&file, metadata.as_ref());
+    let facts = ImportFacts::of_file(&file);
     FilesRead {
         file,
         place,
+        facts,
         legacy,
         metadata,
         report,
@@ -447,9 +527,10 @@ fn read_new_photo<'a>(
 /// (hash, compressed).
 type Legacy = (super::legacy_sidecar::Sidecar, Vec<(String, Vec<u8>)>);
 /// [`read_new_photo`]'s.
-struct FilesRead<'a> {
+struct FilesRead<P> {
     file: PathBuf,
-    place: &'a Place,
+    place: P,
+    facts: ImportFacts,
     legacy: Option<Result<Option<Legacy>>>,
     metadata: Option<crate::xmp::descriptive::Read>,
     report: super::SidecarReport,
@@ -521,6 +602,22 @@ fn side_by_side<T: Send, R: Send>(items: Vec<T>, read: impl Fn(T) -> R + Sync) -
     });
     done.sort_unstable_by_key(|(index, _)| *index);
     done.into_iter().map(|(_, read)| read).collect()
+}
+
+/// [`Catalog::fill_capture_times`] in `w`'s transaction.
+fn fill_capture_times(w: &mut Write<'_>, times: &[(PhotoId, String)]) -> Result<()> {
+    // Two statements, each on an index, rather than one OR that scans.
+    for (id, captured) in times {
+        w.execute(
+            sql!("UPDATE photos SET captured=?1 WHERE id=?2 AND captured=''"),
+            &[captured, id],
+        )?;
+        w.execute(
+            sql!("UPDATE photos SET captured=?1 WHERE master_id=?2 AND captured=''"),
+            &[captured, id],
+        )?;
+    }
+    Ok(())
 }
 
 /// The catalog folder at `logical` in `root`, made if there is none, in
@@ -607,10 +704,13 @@ fn refused<T>(result: Result<T>) -> Result<Result<T>> {
     }
 }
 
-/// A photo to add and what its files hold, read before it is written.
-struct NewPhoto<'a> {
-    file: PathBuf,
-    place: &'a Place,
+/// A photo to add and what its files hold, read before it is written, with
+/// its caller's `place` for it.
+pub(in crate::catalog) struct NewPhoto<P> {
+    pub(in crate::catalog) file: PathBuf,
+    pub(in crate::catalog) place: P,
+    /// What it is as it enters the catalog (see [`ImportFacts`]).
+    pub(in crate::catalog) facts: ImportFacts,
     edit: Option<LegacyEdit>,
     metadata: Option<crate::xmp::descriptive::Read>,
     /// Its sidecars that could not be read, or were ignored.
@@ -618,11 +718,145 @@ struct NewPhoto<'a> {
     defaults: super::defaults::Fill,
 }
 
+/// A photo's `photo_import_facts` row as stored: its original name, EXIF
+/// capture time, size and whether its EXIF was read.
+#[cfg(any(test, feature = "test-support"))]
+pub(in crate::catalog) type StoredFacts = (String, Option<String>, Option<i64>, bool);
+
+/// What a photo is as it enters the catalog, kept in `photo_import_facts`:
+/// its file's name then, its size, and the capture time its file's EXIF
+/// gives, once read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::catalog) struct ImportFacts {
+    pub(in crate::catalog) original_name: String,
+    /// `None` when the file's size could not be read.
+    pub(in crate::catalog) size: Option<u64>,
+    /// The EXIF capture time once read (`Some(None)`: the file has none);
+    /// `None` leaves it to the background read of capture times.
+    pub(in crate::catalog) exif_captured: Option<Option<String>>,
+}
+impl ImportFacts {
+    /// Those Add Folder and Synchronize know of the file at `file`: its
+    /// name and size; its EXIF is read later, in the background.
+    fn of_file(file: &Path) -> Self {
+        Self {
+            original_name: file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            size: std::fs::metadata(file).ok().map(|m| m.len()),
+            exif_captured: None,
+        }
+    }
+    /// Records them for new photo `photo`, in `w`'s transaction.
+    pub(in crate::catalog) fn insert(&self, w: &mut Write<'_>, photo: PhotoId) -> Result<()> {
+        let size = self.size.map(|s| s as i64);
+        let (read, captured) = match &self.exif_captured {
+            Some(captured) => (1i64, captured.as_deref()),
+            None => (0, None),
+        };
+        w.execute(
+            sql!(
+                "INSERT INTO photo_import_facts(photo, original_name, exif_captured, size, exif_read)
+                 VALUES(?, ?, ?, ?, ?)"
+            ),
+            &[&photo, &self.original_name, &captured, &size, &read],
+        )?;
+        Ok(())
+    }
+}
+
+/// The catalog format a write of `photos` needs for the edits they bring.
+pub(in crate::catalog) fn stores<P>(photos: &[NewPhoto<P>]) -> super::format_upgrade::Stores {
+    // An edit naming a Lensfun lens, or with AI Denoise, raises the catalog
+    // to the format for it.
+    photos
+        .iter()
+        .filter_map(|p| p.edit.as_ref().map(|e| e.stores))
+        .max_by_key(|s| s.version())
+        .unwrap_or(super::format_upgrade::Stores::Recipes)
+}
+
+/// Inserts photos read by [`Catalog::read_new_photos`] in the transaction of
+/// [`Catalog::write_new_photos`], keeping the edits it stores to be told of
+/// the commit.
+pub(in crate::catalog) struct PhotoWriter {
+    edited_at: String,
+    edits: Vec<super::edit_rows::CheckedChange<'static>>,
+}
+impl PhotoWriter {
+    /// Inserts `photo` into catalog folder `folder` as one of import batch
+    /// `batch`, with its legacy edit, its files' metadata and, where those
+    /// were all read, the defaults where they have no value. The caller
+    /// checked that the folder has no photo of that name. Returns the new
+    /// photo and what reading its sidecars found, including metadata that
+    /// could not be stored.
+    pub(in crate::catalog) fn insert<P>(
+        &mut self,
+        w: &mut Write<'_>,
+        photo: NewPhoto<P>,
+        folder: FolderId,
+        batch: i64,
+    ) -> Result<(PhotoId, super::SidecarReport)> {
+        let file = photo.file;
+        let filename = file.file_name().unwrap().to_string_lossy();
+        let format = file
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_uppercase();
+        let id: PhotoId = w.insert_returning_id(
+            sql!(
+                "INSERT INTO photos(folder,filename,original_path,format) VALUES(?,?,?,?)
+                 RETURNING id"
+            ),
+            &[&folder, &filename, &file.to_string_lossy(), &format],
+        )?;
+        w.execute(
+            sql!("INSERT INTO photo_imports(photo, batch) VALUES(?, ?)"),
+            &[&id, &batch],
+        )?;
+        photo.facts.insert(w, id)?;
+        if let Some(edit) = photo.edit {
+            // An edit an older release saved that can't be kept stays
+            // unused on disk.
+            let written = w.savepoint(|w| {
+                for (hash, data) in &edit.bitmaps {
+                    super::edits::insert_bitmap(w, hash, data)?;
+                }
+                let change = edit.checked.change(id);
+                super::edit_rows::write_edit(w, &change, &self.edited_at)?;
+                Ok(change)
+            });
+            self.edits.extend(refused(written)?.ok());
+        }
+        let mut report = photo.report;
+        let mut readable = report.unreadable.is_empty();
+        if let Some(read) = &photo.metadata
+            && let Err(e) = refused(
+                w.savepoint(|w| super::sidecar::apply(w, id, read, super::Merge::FillEmpty)),
+            )?
+        {
+            report.unreadable.push((file.clone(), format!("{e:#}")));
+            readable = false;
+        }
+        // A photo whose metadata couldn't be read may have its own: no
+        // default goes in its place.
+        if readable {
+            super::defaults::fill(w, id, &photo.defaults)?;
+        }
+        Ok((id, report))
+    }
+}
+
 /// An edit saved beside a photo by a release before the catalog, with the
 /// bitmaps (hash, compressed) its spots and masks refer to.
 struct LegacyEdit {
     bitmaps: Vec<(String, Vec<u8>)>,
     checked: super::edit_rows::CheckedNew,
+    /// What its edit stores, for the catalog format it needs (`format_upgrade::Stores`).
+    stores: super::format_upgrade::Stores,
 }
 
 /// This computer's locations, for matching folders found on disk.
@@ -812,6 +1046,28 @@ impl Matcher {
 /// is touched. Returns the photos removed, sorted. Ungated: its callers
 /// decide that the rows may go (Remove Folder from Catalog, or a folder
 /// proven in the Trash).
+/// [`Catalog::remove_folders`] in `w`'s transaction.
+pub(in crate::catalog) fn remove_folders(
+    w: &mut Write<'_>,
+    folders: &[FolderId],
+) -> Result<Vec<PhotoId>> {
+    let mut roots = BTreeSet::new();
+    for folder in folders {
+        let root: Option<RootId> =
+            w.read_optional(sql!("SELECT root FROM folders WHERE id=?"), &[folder])?;
+        roots.extend(root);
+    }
+    let photos = remove_folder_rows(w, folders)?;
+    for root in &roots {
+        let left: Option<FolderId> =
+            w.read_optional(sql!("SELECT id FROM folders WHERE root=?"), &[root])?;
+        if left.is_none() {
+            w.execute(sql!("DELETE FROM folder_locations WHERE root=?"), &[root])?;
+            w.execute(sql!("DELETE FROM roots WHERE id=?"), &[root])?;
+        }
+    }
+    Ok(photos)
+}
 pub(in crate::catalog) fn remove_folder_rows(
     w: &mut Write<'_>,
     folders: &[FolderId],

@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::Module;
-use crate::app::naming::editor as name_editor;
-use crate::app::naming::presets::Preset;
+use crate::app::export::naming::editor as name_editor;
+use crate::app::export::naming::presets::Preset;
 use crate::catalog::PhotoId;
 use crate::export_settings::NameContext;
 use crate::export_settings::{Destination, Format};
@@ -21,13 +21,18 @@ fn editor() -> anyhow::Result<(tempfile::TempDir, Editor, Vec<PhotoId>, egui::Co
     let catalog = dir.path().join("test.rawmakase");
     crate::catalog::Catalog::create(&catalog)?.add_folder(&photos)?;
     let ctx = egui::Context::default();
-    let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
+    let mut e = Editor::with_context(
+        &ctx,
+        None,
+        crate::app::preferences::session::Session::default(),
+        None,
+    );
     e.raw_defaults = Arc::new(crate::raw_defaults::DevelopDefaults::with_presets(
         Default::default(),
         |_| None,
     ));
     let library = crate::app::library::Library::load(&catalog, ctx.clone())?;
-    let ids = library.session.photos.iter().map(|p| p.id).collect();
+    let ids = library.session.photos().iter().map(|p| p.id).collect();
     e.library = Some(Box::new(library));
     e.module = Module::Library;
     Ok((dir, e, ids, ctx))
@@ -104,11 +109,12 @@ fn export_acts_on_the_selection_and_reports_what_it_left_out() -> anyhow::Result
     export(&mut e, scope.clone(), settings(&out))?;
     wait(&mut e, &ctx);
     assert_eq!(listing(&out), ["a.tif", "c.tif"]);
-    assert_eq!(e.status, "Exported 2 of 3 · 1 not exported");
-    // Kept in the top bar until read: the offline RAW, and why.
-    let summary = e.exports.summary.clone().expect("a report");
-    assert_eq!(summary.problems.len(), 1);
-    assert!(summary.problems[0].1.contains("can't be exported"));
+    assert_eq!(e.messages.line(), "Exported 2 of 3 · 1 not exported");
+    // Kept in the top bar until dismissed: the offline RAW, and why.
+    let failed = "Exported 2 of 3 · 1 not exported";
+    let detail = e.messages.entry_detail(failed).expect("the failure");
+    assert!(detail.contains("b.dng: "), "{detail}");
+    assert!(detail.contains("can't be exported"), "{detail}");
 
     // Again into the same folder: Ask asks once for both files.
     export(&mut e, scope, settings(&out))?;
@@ -117,11 +123,8 @@ fn export_acts_on_the_selection_and_reports_what_it_left_out() -> anyhow::Result
     e.plan_export(pending, Some(Existing::Unique));
     wait(&mut e, &ctx);
     assert_eq!(listing(&out), ["a-2.tif", "a.tif", "c-2.tif", "c.tif"]);
-    // That export went well, but the first one's report is unread: it stays, and
-    // the two add up until it is dismissed.
-    let summary = e.exports.summary.clone().expect("the unread report");
-    // The offline RAW was left out of both.
-    assert_eq!(summary.line(), "Exported 4 of 6 · 2 not exported");
+    // A later export never hides an earlier failure: it stays until dismissed.
+    assert!(e.messages.has_entry(failed));
     Ok(())
 }
 
@@ -138,7 +141,7 @@ fn an_open_photo_whose_edit_isnt_final_holds_back_only_its_own_export() -> anyho
         .clone();
     // Open in Develop, its Lightroom edit still to be applied.
     e.document.catalog_photo = Some(ids[0]);
-    e.document.path = Some(path);
+    e.document.opened_at(path);
     e.document.metadata = Some(Default::default());
     e.document
         .set_image(Arc::new(crate::camera_data::CameraImage {
@@ -150,6 +153,7 @@ fn an_open_photo_whose_edit_isnt_final_holds_back_only_its_own_export() -> anyho
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         }));
     e.document.pending_lightroom = Some("s = {}".into());
     e.module = Module::Develop;
@@ -157,9 +161,11 @@ fn an_open_photo_whose_edit_isnt_final_holds_back_only_its_own_export() -> anyho
     library.select(Some(ids[0]));
     assert!(e.export_scope().is_none());
     assert!(
-        e.status.starts_with("Export waits for the open photo"),
+        e.messages
+            .line()
+            .starts_with("Export waits for the open photo"),
         "{}",
-        e.status
+        e.messages.line()
     );
     // A Library selection without it goes ahead.
     e.module = Module::Library;
@@ -179,7 +185,11 @@ fn an_open_photo_whose_edit_isnt_final_holds_back_only_its_own_export() -> anyho
     // decoded again from the file.
     std::fs::remove_file(e.document.path.clone().unwrap())?;
     assert!(e.export_scope().is_none());
-    assert!(e.status.contains("can't be exported"), "{}", e.status);
+    assert!(
+        e.messages.line().contains("can't be exported"),
+        "{}",
+        e.messages.line()
+    );
     Ok(())
 }
 
@@ -194,8 +204,13 @@ fn a_photo_opened_without_a_catalog_is_exported_only_while_its_file_is_there() -
         &path,
     )?;
     let ctx = egui::Context::default();
-    let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
-    e.document.path = Some(path.clone());
+    let mut e = Editor::with_context(
+        &ctx,
+        None,
+        crate::app::preferences::session::Session::default(),
+        None,
+    );
+    e.document.opened_at(path.clone());
     e.document.metadata = Some(Default::default());
     e.document
         .set_image(Arc::new(crate::camera_data::CameraImage {
@@ -207,12 +222,17 @@ fn a_photo_opened_without_a_catalog_is_exported_only_while_its_file_is_there() -
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         }));
     let scope = e.export_scope().expect("the open photo");
     assert!(scope.photos[0].open && scope.photos[0].id.is_none());
     std::fs::remove_file(&path)?;
     assert!(e.export_scope().is_none());
-    assert!(e.status.contains("Offline"), "{}", e.status);
+    assert!(
+        e.messages.line().contains("Offline"),
+        "{}",
+        e.messages.line()
+    );
     Ok(())
 }
 
@@ -253,13 +273,13 @@ fn a_cmyk_jpeg_is_exported_and_fails_with_why() -> anyhow::Result<()> {
     export(&mut e, scope, settings(&out))?;
     wait(&mut e, &ctx);
     assert!(listing(&out).is_empty());
-    let summary = e.exports.summary.clone().expect("a report");
-    assert_eq!(summary.problems.len(), 1);
-    assert_eq!(summary.problems[0].0, "c.jpg");
+    let detail = e
+        .messages
+        .entry_detail("Exported 0 of 1 · 1 not exported")
+        .expect("the failure");
     assert!(
-        summary.problems[0].1.contains("CMYK"),
-        "{:?}",
-        summary.problems
+        detail.contains("c.jpg: ") && detail.contains("CMYK"),
+        "{detail}"
     );
     Ok(())
 }
@@ -298,7 +318,7 @@ fn return_exports_from_the_dialog() -> anyhow::Result<()> {
             ..Default::default()
         };
         e.exports.dialog = true;
-        e.status.clear();
+        e.messages.clear_line();
     };
     open(&mut e);
     e.exports.watermark_editor = Some(super::watermark_editor::WatermarkEditor::new(
@@ -306,13 +326,74 @@ fn return_exports_from_the_dialog() -> anyhow::Result<()> {
         &ctx,
     ));
     return_key(&mut e);
-    assert_eq!(e.status, "");
+    assert_eq!(e.messages.line(), "");
     assert!(e.exports.dialog);
     e.exports.watermark_editor = None;
     open(&mut e);
     return_key(&mut e);
-    assert_eq!(e.status, "Choose a folder to export to");
+    assert_eq!(e.messages.line(), "Choose a folder to export to");
     assert!(e.exports.dialog);
+    // ProPhoto RGB in a JPEG: said, and the dialog stays open with nothing queued.
+    open(&mut e);
+    e.exports.draft.folder = Some(_dir.path().join("out"));
+    e.exports
+        .draft
+        .choose_color_space(crate::color::OutputSpace::ProPhoto);
+    return_key(&mut e);
+    assert!(
+        e.messages.line().contains("ProPhoto RGB"),
+        "{}",
+        e.messages.line()
+    );
+    assert!(e.exports.dialog && e.exports.queued.is_empty());
+    Ok(())
+}
+
+/// Export with Previous exports in the saved colour space, and refuses one its
+/// format can't hold or a later release saved, before anything renders.
+#[test]
+fn export_with_previous_keeps_its_colour_space_or_refuses_it() -> anyhow::Result<()> {
+    use crate::color::OutputSpace;
+    let (dir, mut e, ids, ctx) = editor()?;
+    e.exports.unsaved_settings = true;
+    e.library.as_mut().unwrap().select(Some(ids[0]));
+    let out = dir.path().join("out");
+    let mut jpeg = settings(&out);
+    jpeg.choose_format(Format::Jpeg);
+    jpeg.choose_color_space(OutputSpace::ProPhoto);
+    e.export_previous(Some(jpeg));
+    assert!(e.exports.queued.is_empty());
+    assert!(
+        e.messages.line().contains("ProPhoto RGB"),
+        "{}",
+        e.messages.line()
+    );
+    let file = dir.path().join("export.json");
+    std::fs::write(&file, r#"{"color_space":"DisplayP3","format":"Tiff"}"#)?;
+    let mut later = ExportSettings::load_file(&file).unwrap();
+    (later.destination, later.folder) = (Destination::Folder, Some(out.clone()));
+    e.messages.clear_line();
+    e.export_previous(Some(later));
+    assert!(e.exports.queued.is_empty());
+    assert!(
+        e.messages.line().contains("later version"),
+        "{}",
+        e.messages.line()
+    );
+    assert!(listing(&out).is_empty());
+    let mut adobe = settings(&out);
+    adobe.choose_color_space(OutputSpace::AdobeRgb);
+    e.export_previous(Some(adobe));
+    // The batch captured its settings: a choice made in the dialog meanwhile
+    // doesn't change it.
+    e.exports.draft.choose_color_space(OutputSpace::Srgb);
+    wait(&mut e, &ctx);
+    let exported = out.join("a.tif");
+    let facts = crate::exif::colour_facts(&exported).unwrap();
+    assert_eq!(
+        (facts.color_space, facts.interop_index.as_deref()),
+        (Some(0xffff), Some("R03"))
+    );
     Ok(())
 }
 
@@ -393,10 +474,11 @@ const MODEL: &str = "{{com.adobe.model}}-{{image_name}}";
 fn names_come_from_the_catalog_as_it_was_when_export_was_chosen() -> anyhow::Result<()> {
     let (dir, mut e, ids, _ctx) = editor()?;
     let library = e.library.as_mut().unwrap();
-    library
-        .session
-        .catalog
-        .set_text(&ids[..1], crate::metadata::TextField::Title, "Harbour")?;
+    library.session.catalog_mut_for_tests().set_text(
+        &ids[..1],
+        crate::metadata::TextField::Title,
+        "Harbour",
+    )?;
     let copy = library.create_virtual_copy(ids[0])?.value;
     library.select(Some(copy));
     // Typed, not saved yet.
@@ -409,7 +491,7 @@ fn names_come_from_the_catalog_as_it_was_when_export_was_chosen() -> anyhow::Res
     );
     assert_eq!(fields.captured, None);
     // The catalog changes after the dialog opened.
-    let catalog = &mut e.library.as_mut().unwrap().session.catalog;
+    let catalog = e.library.as_mut().unwrap().session.catalog_mut_for_tests();
     catalog.set_text(&[copy], crate::metadata::TextField::Title, "Later")?;
     catalog.fill_capture_times(&[(copy, "2026-04-24T18:43:24.000".into())])?;
     let mut s = settings(&dir.path().join("out"));
@@ -537,18 +619,22 @@ fn a_failed_read_is_said_and_exports_without_it() -> anyhow::Result<()> {
         Status::Failed(why) => assert!(why.contains("disk gone"), "{why}"),
         other => panic!("{other:?}"),
     }
-    assert!(e.status.contains("could not be read"), "{}", e.status);
+    assert!(
+        e.messages.line().contains("could not be read"),
+        "{}",
+        e.messages.line()
+    );
     press_return(&mut e, &ctx);
     wait(&mut e, &ctx);
     // As Lightroom: the text around a value it lacks stays.
     assert_eq!(listing(&out), ["-a.tif"]);
-    let summary = e.exports.summary.clone().expect("the notes");
-    assert_eq!(
-        summary.notes,
-        [(
-            "a.dng".to_string(),
-            "the camera's make and model were not read".to_string()
-        )]
+    let detail = e
+        .messages
+        .entry_detail("Exported 1 of 1 · 1 with notes")
+        .expect("the notes");
+    assert!(
+        detail.contains("a.dng: the camera's make and model were not read"),
+        "{detail}"
     );
     Ok(())
 }
@@ -579,7 +665,7 @@ fn export_with_previous_waits_for_what_its_names_need() -> anyhow::Result<()> {
     };
     frame(&mut e, &ctx, vec![escape(true), escape(false)]);
     assert!(e.exports.waiting.is_none() && !e.export_modal());
-    assert_eq!(e.status, "Export cancelled");
+    assert_eq!(e.messages.line(), "Export cancelled");
     open.send(())?;
     // Again, to the end.
     e.export_previous(Some(s));
@@ -1057,7 +1143,7 @@ fn a_file_that_cant_be_read_fails_the_read_and_keeps_the_others() -> anyhow::Res
 /// What the dialog chose keeps its tokens whatever happens to the preset.
 #[test]
 fn templates_are_saved_updated_and_deleted_from_the_editor() -> anyhow::Result<()> {
-    use crate::app::naming::presets::{Action, Library};
+    use crate::app::export::naming::presets::{Action, Library};
     use crate::export_settings::SavedTemplates;
     let (dir, mut e, ids, ctx) = editor()?;
     let file = dir.path().join("filename_templates.json");
@@ -1129,7 +1215,7 @@ fn templates_are_saved_updated_and_deleted_from_the_editor() -> anyhow::Result<(
 /// editor, then the dialog.
 #[test]
 fn escape_closes_the_presets_question_then_the_editor() -> anyhow::Result<()> {
-    use crate::app::naming::presets::{Action, Library};
+    use crate::app::export::naming::presets::{Action, Library};
     use crate::export_settings::SavedTemplates;
     let (dir, mut e, ids, ctx) = editor()?;
     let file = dir.path().join("filename_templates.json");

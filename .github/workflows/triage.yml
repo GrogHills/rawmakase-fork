@@ -39,7 +39,7 @@ jobs:
           private-key: ${{ secrets.TRIAGE_APP_PRIVATE_KEY }}
           permission-contents: read
           permission-issues: write
-      - uses: crmne/copilot-triage@f99b390350c35f44f1cca240c9b25c08eb9ad4db # v0.18.0
+      - uses: crmne/copilot-triage@da40025ec5ef48aecd6080893734b526a24e8850 # v0.20.1
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           engine: rubyllm

@@ -11,7 +11,9 @@ use crate::io::{Pieces, ReadSeek};
 /// digits ("12" for .12 s), each where the file has it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stamp {
+    /// The date and time, `YYYY:MM:DD HH:MM:SS`.
     pub date: Option<String>,
+    /// The digits after the second's point.
     pub subseconds: Option<String>,
 }
 
@@ -20,14 +22,17 @@ pub struct Stamp {
 /// (CIFF's TimeStamp, X3F's TIME) is the original.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureDates {
+    /// When the photo was taken: DateTimeOriginal, or the container's own time.
     pub original: Stamp,
+    /// DateTimeDigitized.
     pub digitized: Stamp,
+    /// DateTime: when the file was last changed, by the camera or software.
     pub modified: Stamp,
 }
 
 /// The capture dates of a CR3, CRW, MRW or X3F; none for another file or
 /// one that can't be read. A CR3's, MRW's and X3F's are its camera's EXIF
-/// ([`crate::exif_tiffs`]), the EXIF directory's before IFD0's; an X3F
+/// ([`crate::exif_tiffs`](fn@crate::exif_tiffs)), the EXIF directory's before IFD0's; an X3F
 /// without them has its TIME.
 pub(crate) fn read(file: &mut dyn ReadSeek) -> CaptureDates {
     let Some(mut f) = Pieces::new(file) else {

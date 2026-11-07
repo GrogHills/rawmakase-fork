@@ -2,7 +2,7 @@
 //! Lightroom's; saved on Return or when focus leaves, and kept when the
 //! selection moves or the save fails.
 use super::rows::{ROW, VALUE_GRAY, caption_at, field_rect, font, panel_edit};
-use crate::app::theme;
+use crate::app::ui::theme;
 use crate::catalog::{Photo, PhotoId};
 use crate::catalog_session::CatalogSession;
 use anyhow::Result;
@@ -41,7 +41,7 @@ impl CopyNames {
         let (id, name) = (*id, text.trim().to_string());
         let mut renamed = false;
         if session
-            .photos
+            .photos()
             .iter()
             .any(|p| p.id == id && p.master.is_some() && p.copy_name != name)
         {

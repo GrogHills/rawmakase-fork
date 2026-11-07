@@ -47,7 +47,7 @@ pub(super) struct Listing {
 }
 
 impl Listing {
-    pub fn new(names: Vec<OsString>) -> Self {
+    pub(super) fn new(names: Vec<OsString>) -> Self {
         let mut listing = Self {
             folded: HashMap::new(),
             caseless: HashMap::new(),
@@ -111,14 +111,14 @@ impl Listing {
     }
 
     /// Adds `name`, last, as a file named so arriving there adds it.
-    pub fn push(&mut self, name: OsString) {
+    pub(super) fn push(&mut self, name: OsString) {
         self.index(self.names.len(), &name);
         self.names.push(name);
     }
 
     /// Takes out every name exactly `name`, as a file named so leaving
     /// there takes it out. The last name takes the place of each.
-    pub fn remove(&mut self, name: &OsStr) {
+    pub(super) fn remove(&mut self, name: &OsStr) {
         let exact = |l: &Self| {
             Self::at(&l.folded, &folded(name))
                 .iter()
@@ -139,14 +139,14 @@ impl Listing {
 
     /// Takes out the names after the first `len`, as [`Self::push`] added
     /// them.
-    pub fn truncate(&mut self, len: usize) {
+    pub(super) fn truncate(&mut self, len: usize) {
         while self.names.len() > len {
             let Some(name) = self.names.pop() else { break };
             self.unindex(self.names.len(), &name);
         }
     }
 
-    pub fn names(&self) -> &[OsString] {
+    pub(super) fn names(&self) -> &[OsString] {
         &self.names
     }
 
@@ -155,14 +155,14 @@ impl Listing {
     }
 
     /// The names there `sidecar::caseless` takes for `name`, in listing order.
-    pub fn alike(&self, name: &OsStr) -> impl Iterator<Item = &OsString> {
+    pub(super) fn alike(&self, name: &OsStr) -> impl Iterator<Item = &OsString> {
         Self::at(&self.caseless, &caseless(name))
             .iter()
             .map(|&i| &self.names[i])
     }
 
     /// The names there that would read the file named `companion` as
-    /// theirs ([`readers`]), but for those `left_out` says are not there.
+    /// theirs (the test helper `readers`), but for those `left_out` says are not there.
     fn readers(&self, companion: &OsStr, left_out: &dyn Fn(usize) -> bool) -> Vec<&OsString> {
         if companion.to_str().is_none() {
             return Vec::new();
@@ -182,8 +182,8 @@ impl Listing {
         found
     }
 
-    /// The companions of the file named `photo` there ([`of`]).
-    pub fn companions(
+    /// The companions of the file named `photo` there (the test helper `of`).
+    pub(super) fn companions(
         &self,
         photo: &OsStr,
         same_file: &dyn Fn(&OsStr, &OsStr) -> bool,
@@ -225,8 +225,9 @@ impl Listing {
 
     /// Why the file named `photo` and its `carried` companions can't arrive
     /// in a folder whose names, once everything arriving there is in, are
-    /// these but for those `left_out` says are gone ([`arrival_conflict`]).
-    pub fn arrival_conflict(
+    /// these but for those `left_out` says are gone (the test helper
+    /// `arrival_conflict`).
+    pub(super) fn arrival_conflict(
         &self,
         photo: &OsStr,
         carried: &[OsString],

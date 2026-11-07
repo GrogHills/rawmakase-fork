@@ -76,6 +76,10 @@ const ALPHABET: &[u8] =
 pub struct Enhanced {
     pub uuid: String,
     pub base_name: String,
+    /// Of a fitted look: the look of the camera JPEG it was fitted to, by the maker's
+    /// name for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_look: Option<String>,
     #[serde(default)]
     pub highlights: f32,
     #[serde(default)]
@@ -110,6 +114,7 @@ impl Enhanced {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn for_test(table: Table) -> Self {
         Self {
+            camera_look: None,
             uuid: "0".repeat(32),
             base_name: "Test".into(),
             highlights: 0.,
@@ -386,7 +391,7 @@ pub(super) struct LookFile {
     look: Enhanced,
 }
 impl LookFile {
-    pub fn read(path: &Path) -> Result<Self> {
+    pub(super) fn read(path: &Path) -> Result<Self> {
         ensure!(
             std::fs::metadata(path)?.len() <= 16_000_000,
             "XMP profile too large"
@@ -394,7 +399,7 @@ impl LookFile {
         Self::parse(&std::fs::read_to_string(path)?)
     }
     /// Whether this look can go over `base`.
-    pub fn fits(&self, base: &CameraProfile) -> bool {
+    pub(super) fn fits(&self, base: &CameraProfile) -> bool {
         base.enhanced.is_none()
             && match &self.base {
                 LookBase::Named(name) => *name == base.name,
@@ -402,7 +407,7 @@ impl LookFile {
             }
     }
     /// The look over `base`, which carries the camera's matrices and tables.
-    pub fn compose(&self, base: &CameraProfile) -> Result<CameraProfile> {
+    pub(super) fn compose(&self, base: &CameraProfile) -> Result<CameraProfile> {
         ensure!(
             self.fits(base),
             "Missing base camera profile {}",
@@ -428,7 +433,7 @@ impl LookFile {
     }
     /// A look file's name and UUID, without reading its tables: what an import
     /// checks the names it gives against.
-    pub fn identity(text: &str) -> Result<(String, String)> {
+    pub(super) fn identity(text: &str) -> Result<(String, String)> {
         let doc = roxmltree::Document::parse(text)?;
         let d = look_description(&doc)?;
         Ok((
@@ -436,7 +441,7 @@ impl LookFile {
             d.attribute((CRS, "UUID")).unwrap_or("").into(),
         ))
     }
-    pub fn parse(text: &str) -> Result<Self> {
+    pub(super) fn parse(text: &str) -> Result<Self> {
         let doc = roxmltree::Document::parse(text)?;
         let d = look_description(&doc)?;
         let attr = |name| d.attribute((CRS, name)).unwrap_or("");
@@ -598,6 +603,7 @@ impl LookFile {
         }
         let lut = CurveLut::new(&curve);
         let look = Enhanced {
+            camera_look: None,
             uuid: attr("UUID").into(),
             base_name: String::new(),
             highlights: adjustment("Highlights2012")?,
@@ -657,7 +663,7 @@ fn label<'a>(d: roxmltree::Node<'a, '_>, element: &str) -> Option<&'a str> {
 }
 #[cfg(any(test, feature = "test-support"))]
 #[cfg_attr(not(test), allow(dead_code))]
-pub mod tests {
+pub(super) mod tests {
     use super::*;
     /// A table's bytes in Adobe's encoding.
     pub(crate) fn encode(bytes: &[u8]) -> String {

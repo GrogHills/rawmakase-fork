@@ -2,10 +2,11 @@
 //! pyramid and tone stage. A square-root luminance pyramid separates grain from
 //! multi-pixel blotches. Each band's smooth blocks estimate its noise; soft
 //! thresholding retains detail above that noise. This is not Adobe's algorithm.
+use super::laplacian::{Plane, mirror};
 use crate::camera_data::CameraImage;
 use anyhow::{Result, ensure};
+use rawmakase_cancel::Cancel;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 const LEVELS: usize = 5;
 
@@ -24,7 +25,7 @@ impl LuminanceDenoise {
         })
     }
 
-    pub(crate) fn apply(&self, im: &CameraImage, cancel: &AtomicBool) -> Result<CameraImage> {
+    pub(crate) fn apply(&self, im: &CameraImage, cancel: Cancel<'_>) -> Result<CameraImage> {
         check(cancel)?;
         let plane = Plane {
             w: im.width as usize,
@@ -41,7 +42,7 @@ impl LuminanceDenoise {
             .par_chunks_mut(1024)
             .enumerate()
             .for_each(|(chunk, pixels)| {
-                if cancel.load(Ordering::Relaxed) {
+                if cancel.is_cancelled() {
                     return;
                 }
                 for (j, p) in pixels.iter_mut().enumerate() {
@@ -64,7 +65,7 @@ impl LuminanceDenoise {
         level: usize,
         finer_noise: f32,
         white: f32,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Plane> {
         check(cancel)?;
         if level == LEVELS || plane.w < 4 || plane.h < 4 {
@@ -74,8 +75,8 @@ impl LuminanceDenoise {
                 data: plane.data.clone(),
             });
         }
-        let coarse = plane.down(cancel)?;
-        let mut band = coarse.up(plane.w, plane.h, cancel)?;
+        let coarse = down(plane, cancel)?;
+        let mut band = up(&coarse, plane.w, plane.h, cancel)?;
         band.data
             .par_iter_mut()
             .zip(&plane.data)
@@ -84,7 +85,7 @@ impl LuminanceDenoise {
             if level == 0 { n } else { n.min(finer_noise) }
         });
         let coarse = self.filter(&coarse, level + 1, noise, white, cancel)?;
-        let mut out = coarse.up(plane.w, plane.h, cancel)?;
+        let mut out = up(&coarse, plane.w, plane.h, cancel)?;
         // Amount grows the threshold instead of just blending a fixed blur. Detail
         // protects fine structures; Contrast protects coarser structure separately.
         let detail = 2f32.powf((0.5 - self.detail) * if level == 0 { 1.5 } else { 0.5 });
@@ -94,7 +95,7 @@ impl LuminanceDenoise {
             .par_chunks_mut(1024)
             .enumerate()
             .for_each(|(chunk, pixels)| {
-                if cancel.load(Ordering::Relaxed) {
+                if cancel.is_cancelled() {
                     return;
                 }
                 for (j, p) in pixels.iter_mut().enumerate() {
@@ -130,21 +131,35 @@ fn luma(p: [f32; 3]) -> f32 {
     let [r, g, b] = p.map(|v| v.max(0.).sqrt());
     (r + 2. * g + b) * 0.25
 }
-fn check(cancel: &AtomicBool) -> Result<()> {
-    ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
+fn check(cancel: Cancel<'_>) -> Result<()> {
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     Ok(())
+}
+/// `plane` blurred and halved; an error once `cancel` is set.
+fn down(plane: &Plane, cancel: Cancel<'_>) -> Result<Plane> {
+    check(cancel)?;
+    let out = plane.down(cancel);
+    check(cancel)?;
+    Ok(out)
+}
+/// `plane` doubled to `w` × `h` and blurred; an error once `cancel` is set.
+fn up(plane: &Plane, w: usize, h: usize, cancel: Cancel<'_>) -> Result<Plane> {
+    check(cancel)?;
+    let out = plane.up(w, h, cancel);
+    check(cancel)?;
+    Ok(out)
 }
 
 /// The tenth percentile of 8×8 block RMS energies rejects most scene structure.
 /// Fewer than sixteen measurable blocks fall back to the finer level's estimate.
 /// A scene without smooth regions can still overestimate noise; Detail protects
 /// structure but this estimator is not a substitute for a calibrated noise profile.
-fn band_noise(plane: &Plane, band: &Plane, white: f32, cancel: &AtomicBool) -> Result<Option<f32>> {
+fn band_noise(plane: &Plane, band: &Plane, white: f32, cancel: Cancel<'_>) -> Result<Option<f32>> {
     let (bw, bh) = (plane.w / 8, plane.h / 8);
     let mut energies: Vec<f32> = (0..bw * bh)
         .into_par_iter()
         .filter_map(|i| {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.is_cancelled() {
                 return None;
             }
             let (x, y) = (i % bw * 8, i / bw * 8);
@@ -173,97 +188,10 @@ fn band_noise(plane: &Plane, band: &Plane, white: f32, cancel: &AtomicBool) -> R
     Ok(Some(e.sqrt()))
 }
 
-struct Plane {
-    w: usize,
-    h: usize,
-    data: Vec<f32>,
-}
-/// The 5-tap binomial filter, and its expanding weights for even and odd samples.
-const TAPS: [f32; 5] = [1. / 16., 4. / 16., 6. / 16., 4. / 16., 1. / 16.];
-const EVEN: [f32; 3] = [TAPS[0] * 2., TAPS[2] * 2., TAPS[4] * 2.];
-const ODD: f32 = TAPS[1] * 2.;
-fn mirror(v: isize, n: usize) -> usize {
-    let n = n as isize;
-    let v = v.abs();
-    (if v >= n { 2 * n - 2 - v } else { v }).clamp(0, n - 1) as usize
-}
-impl Plane {
-    /// Blurred and halved.
-    fn down(&self, cancel: &AtomicBool) -> Result<Self> {
-        check(cancel)?;
-        let (w, h) = (self.w.div_ceil(2), self.h.div_ceil(2));
-        let mut wide = vec![0.; w * self.h];
-        wide.par_chunks_mut(w)
-            .zip(self.data.par_chunks(self.w))
-            .for_each(|(out, row)| {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                for (x, o) in out.iter_mut().enumerate() {
-                    *o = (0..5)
-                        .map(|k| row[mirror(2 * x as isize + k - 2, self.w)] * TAPS[k as usize])
-                        .sum();
-                }
-            });
-        let mut data = vec![0.; w * h];
-        data.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
-            if cancel.load(Ordering::Relaxed) {
-                return;
-            }
-            let rows: [&[f32]; 5] = std::array::from_fn(|k| {
-                let r = mirror(2 * y as isize + k as isize - 2, self.h);
-                &wide[r * w..(r + 1) * w]
-            });
-            for (x, o) in out.iter_mut().enumerate() {
-                *o = (0..5).map(|k| rows[k][x] * TAPS[k]).sum();
-            }
-        });
-        check(cancel)?;
-        Ok(Plane { w, h, data })
-    }
-    /// Doubled to `w` × `h` and blurred, as a Laplacian pyramid expands a level.
-    fn up(&self, w: usize, h: usize, cancel: &AtomicBool) -> Result<Self> {
-        check(cancel)?;
-        let expand = |i: usize, at: &dyn Fn(isize) -> f32| -> f32 {
-            let c = (i / 2) as isize;
-            if i.is_multiple_of(2) {
-                at(c - 1) * EVEN[0] + at(c) * EVEN[1] + at(c + 1) * EVEN[2]
-            } else {
-                (at(c) + at(c + 1)) * ODD
-            }
-        };
-        let mut wide = vec![0.; w * self.h];
-        wide.par_chunks_mut(w)
-            .zip(self.data.par_chunks(self.w))
-            .for_each(|(out, row)| {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                for (x, o) in out.iter_mut().enumerate() {
-                    *o = expand(x, &|c| row[mirror(c, self.w)]);
-                }
-            });
-        let mut data = vec![0.; w * h];
-        data.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
-            if cancel.load(Ordering::Relaxed) {
-                return;
-            }
-            let row = |c: isize| {
-                let r = mirror(c, self.h);
-                &wide[r * w..(r + 1) * w]
-            };
-            for (x, o) in out.iter_mut().enumerate() {
-                *o = expand(y, &|c| row(c)[x]);
-            }
-        });
-        check(cancel)?;
-        Ok(Plane { w, h, data })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn image(w: u32, h: u32, f: impl Fn(u32, u32) -> [f32; 3]) -> CameraImage {
         CameraImage {
@@ -278,6 +206,7 @@ mod tests {
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         }
     }
     fn hash(x: u32, y: u32) -> f32 {
@@ -303,7 +232,7 @@ mod tests {
                 let im = image(w, h, |_, _| color);
                 let out = LuminanceDenoise::new(1., 0.5, 0.)
                     .unwrap()
-                    .apply(&im, &cancel)
+                    .apply(&im, Cancel::new(&cancel))
                     .unwrap();
                 for p in out.pixels {
                     for (v, expected) in p.into_iter().zip(color) {
@@ -327,7 +256,7 @@ mod tests {
                 let run = |amount, detail| {
                     let out = LuminanceDenoise::new(amount, detail, 0.)
                         .unwrap()
-                        .apply(&im, &cancel)
+                        .apply(&im, Cancel::new(&cancel))
                         .unwrap();
                     energy(&out, base)
                 };
@@ -349,7 +278,7 @@ mod tests {
         });
         let out = LuminanceDenoise::new(0.5, 0.5, 0.)
             .unwrap()
-            .apply(&im, &AtomicBool::new(false))
+            .apply(&im, Cancel::NEVER)
             .unwrap();
         for row in 16..112 {
             let a = luma(out.pixels[row * 256 + 127]);
@@ -372,7 +301,7 @@ mod tests {
         });
         let out = LuminanceDenoise::new(0.5, 0.5, 0.)
             .unwrap()
-            .apply(&im, &AtomicBool::new(false))
+            .apply(&im, Cancel::NEVER)
             .unwrap();
         let values: Vec<f32> = out.pixels.iter().map(|p| luma(*p)).collect();
         let mean = values.iter().sum::<f32>() / values.len() as f32;
@@ -390,8 +319,8 @@ mod tests {
         let im = image(65, 67, |x, y| [0.1 + 0.01 * hash(x, y); 3]);
         let cancel = AtomicBool::new(true);
         let d = LuminanceDenoise::new(0.5, 0.5, 0.).unwrap();
-        assert!(d.apply(&im, &cancel).is_err());
+        assert!(d.apply(&im, Cancel::new(&cancel)).is_err());
         cancel.store(false, Ordering::Relaxed);
-        assert!(d.apply(&im, &cancel).is_ok());
+        assert!(d.apply(&im, Cancel::new(&cancel)).is_ok());
     }
 }

@@ -5,11 +5,11 @@
 use super::Library;
 use super::filter::{Kind, Label, RatingOp, toggle};
 use super::grid::filter_caption;
-use crate::app::design::{Tone, inset, radius, size, space, text};
-use crate::app::photo_metadata::{LABELS, flag_icon, label_color};
-use crate::app::shortcuts::keys_text;
-use crate::app::theme;
-use crate::app::widgets::{COMPACT_SEGMENT_HEIGHT, segmented};
+use crate::app::library::photo_metadata::{LABELS, flag_icon, label_color};
+use crate::app::shell::shortcuts::keys_text;
+use crate::app::ui::design::{Tone, inset, radius, size, space, text};
+use crate::app::ui::theme;
+use crate::app::ui::widgets::{COMPACT_SEGMENT_HEIGHT, segmented};
 use eframe::egui::{self, Rect, Vec2};
 
 /// The height of the bar's toggles and stars.
@@ -239,11 +239,11 @@ impl Library {
         changed
     }
     fn has_copies(&self) -> bool {
-        self.session.photos.iter().any(|p| p.master.is_some())
+        self.session.photos().iter().any(|p| p.master.is_some())
     }
     fn has_other_labels(&self) -> bool {
         self.session
-            .photos
+            .photos()
             .iter()
             .any(|p| !p.label.is_empty() && !LABELS.contains(&p.label.as_str()))
     }

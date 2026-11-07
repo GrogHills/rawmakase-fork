@@ -17,7 +17,7 @@ use crate::io::{Bytes, Order};
 use crate::sensor::Sensor;
 use crate::variant::{Plan, Variant};
 use crate::vendor::olympus;
-use std::sync::atomic::AtomicBool;
+use rawmakase_cancel::Cancel;
 
 /// How an ORF's sensor data is coded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +135,7 @@ pub(crate) fn open(t: TiffFile) -> Result<RawInfo> {
     info.previews = t.previews();
     info.uncompressed_preview = t.has_uncompressed_thumbnail();
     let notes = olympus::read(&t).unwrap_or_default();
+    info.preview_space = notes.color_space;
     info.cam_mul = notes.cam_mul;
     info.presets = notes.presets;
     if info.lens.is_empty()
@@ -198,6 +199,7 @@ pub(crate) fn open(t: TiffFile) -> Result<RawInfo> {
     {
         let daylight = [r / g * red, 1., b / g * blue];
         info.file_matrix = crate::color::cam_xyz_of(m, daylight);
+        info.file_matrix_source = crate::info::MatrixSource::MakerNote;
     }
     info.plan = Plan::Orf(OrfPlan {
         offset: t.base + u64::from(offset),
@@ -272,7 +274,7 @@ pub(crate) fn decode(
     info: &RawInfo,
     plan: &OrfPlan,
     bytes: &[u8],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Sensor> {
     let (width, height) = (plan.width as usize, plan.height as usize);
     let mut data = crate::io::zeroed(crate::io::samples(plan.width, plan.height, 1)?)?;
@@ -315,6 +317,7 @@ pub(crate) fn decode(
 mod tests {
     use super::*;
     use crate::container::test_tiff::{E, ascii, dir, long, offsets, short, shorts, tiff};
+    use std::sync::atomic::AtomicBool;
 
     const LE: Order = Order::Little;
 
@@ -366,7 +369,7 @@ mod tests {
 
     fn decode(file: &[u8]) -> Result<(RawInfo, Sensor)> {
         let info = crate::open(file)?;
-        let sensor = crate::decode(&info, file, &AtomicBool::new(false))?;
+        let sensor = crate::decode(&info, file, Cancel::NEVER)?;
         Ok((info, sensor))
     }
 
@@ -602,7 +605,7 @@ mod tests {
             let info = crate::open(&file).unwrap();
             let cancelled = AtomicBool::new(true);
             assert_eq!(
-                crate::decode(&info, &file, &cancelled).unwrap_err(),
+                crate::decode(&info, &file, Cancel::new(&cancelled)).unwrap_err(),
                 Error::Cancelled,
                 "{:?}",
                 info.variant

@@ -109,7 +109,7 @@ impl<'a> HistoryUpdate<'a> {
 }
 
 /// `history` as stored.
-pub fn encode(history: &SavedHistory) -> Result<Vec<u8>> {
+pub(super) fn encode(history: &SavedHistory) -> Result<Vec<u8>> {
     ensure!(
         history.applied <= history.steps.len(),
         "Invalid History position"
@@ -143,13 +143,20 @@ fn compress(stored: &impl Serialize) -> Result<Vec<u8>> {
     Ok(z.finish()?)
 }
 
-/// The stored History in `data` as JSON; `None` for a format from a newer release.
-fn stored_json(data: &[u8]) -> Result<Option<(Vec<u8>, Value)>> {
+/// The stored History in `data` as the JSON text it was written as, whatever
+/// release wrote it.
+pub(super) fn text(data: &[u8]) -> Result<Vec<u8>> {
     let mut text = Vec::new();
     ZlibDecoder::new(data)
         .take(MAX_BYTES + 1)
         .read_to_end(&mut text)?;
     ensure!(text.len() as u64 <= MAX_BYTES, "Develop History too large");
+    Ok(text)
+}
+
+/// The stored History in `data` as JSON; `None` for a format from a newer release.
+fn stored_json(data: &[u8]) -> Result<Option<(Vec<u8>, Value)>> {
+    let text = text(data)?;
     let value: Value = serde_json::from_slice(&text)?;
     let version = value
         .get("version")
@@ -255,7 +262,7 @@ fn has_duplicate_keys(text: &[u8]) -> bool {
 }
 
 /// The History in `data`; `None` for a format from a newer release.
-pub fn decode(data: &[u8]) -> Result<Option<SavedHistory>> {
+pub(super) fn decode(data: &[u8]) -> Result<Option<SavedHistory>> {
     let Some(stored) = stored(data)? else {
         return Ok(None);
     };

@@ -3,9 +3,11 @@
 //! the colour mixer, the parametric curve, split toning and a post-crop vignette.
 //! They render with the user's settings without moving the user's sliders (see
 //! `Recipe::with_profile_adjustments`).
+use crate::model::camera_raw as crs;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 const BANDS: [&str; 8] = [
     "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
 ];
@@ -61,39 +63,33 @@ impl Default for LookSettings {
 impl LookSettings {
     /// Whether `key` is one of the settings this reads.
     pub(super) fn reads(key: &str) -> bool {
-        const KEYS: &[&str] = &[
-            "Exposure2012",
-            "Saturation",
-            "ParametricShadows",
-            "ParametricDarks",
-            "ParametricLights",
-            "ParametricHighlights",
-            "ParametricShadowSplit",
-            "ParametricMidtoneSplit",
-            "ParametricHighlightSplit",
-            "SplitToningShadowHue",
-            "SplitToningShadowSaturation",
-            "SplitToningHighlightHue",
-            "SplitToningHighlightSaturation",
-            "SplitToningBalance",
-            "PostCropVignetteAmount",
-            "PostCropVignetteMidpoint",
-            "PostCropVignetteFeather",
-            "PostCropVignetteRoundness",
-            "PostCropVignetteStyle",
-            "PostCropVignetteHighlightContrast",
+        // A look's own subset of Camera Raw's settings; others in a look are refused.
+        let named = [
+            crs::EXPOSURE,
+            crs::SATURATION,
+            crs::SPLIT_TONING_BALANCE,
+            crs::POST_CROP_VIGNETTE_AMOUNT,
+            crs::POST_CROP_VIGNETTE_MIDPOINT,
+            crs::POST_CROP_VIGNETTE_FEATHER,
+            crs::POST_CROP_VIGNETTE_ROUNDNESS,
+            crs::POST_CROP_VIGNETTE_HIGHLIGHT_CONTRAST,
         ];
-        KEYS.contains(&key)
-            || ["Hue", "Saturation", "Luminance"].iter().any(|control| {
-                key.strip_prefix(control)
-                    .and_then(|k| k.strip_prefix("Adjustment"))
-                    .is_some_and(|band| BANDS.contains(&band))
-            })
+        key == "PostCropVignetteStyle"
+            || named
+                .into_iter()
+                .chain(crs::PARAMETRIC)
+                .chain(crs::PARAMETRIC_SPLITS)
+                .chain(crs::SPLIT_TONING_HUE)
+                .chain(crs::SPLIT_TONING_SATURATION)
+                .chain(crs::HSL.into_iter().flatten())
+                .any(|s| s.key == key)
     }
     /// The settings among a look's attributes (`attr` gives "" when absent).
     pub(super) fn parse<'a>(attr: impl Fn(&str) -> &'a str) -> Result<Self> {
-        // Lightroom's units per recipe unit: 100 for sliders, 360 for hues.
-        let number = |key: &str, units: f32, range: [f32; 2]| -> Result<Option<f32>> {
+        // In recipe units: Lightroom's divided by the slider's units, and checked
+        // against the look's own range.
+        let number = |slider: crs::Slider, range: [f32; 2]| -> Result<Option<f32>> {
+            let key = slider.key;
             let text = attr(key);
             if text.is_empty() {
                 return Ok(None);
@@ -102,52 +98,48 @@ impl LookSettings {
                 .trim_start_matches('+')
                 .parse::<f32>()
                 .with_context(|| format!("Invalid profile setting {key}"))?
-                / units;
+                / slider.units;
             ensure!(
                 v.is_finite() && (range[0]..=range[1]).contains(&v),
                 "Profile setting {key} is out of range"
             );
             Ok(Some(v))
         };
-        let slider = |key: &str| number(key, 100., [-1., 1.]).map(Option::unwrap_or_default);
+        let slider = |s: crs::Slider| number(s, [-1., 1.]).map(Option::unwrap_or_default);
         let mut s = Self {
-            exposure: number("Exposure2012", 1., [-5., 5.])?.unwrap_or_default(),
-            saturation: slider("Saturation")?,
+            exposure: number(crs::EXPOSURE, [-5., 5.])?.unwrap_or_default(),
+            saturation: slider(crs::SATURATION)?,
             ..Self::default()
         };
-        for (i, band) in BANDS.iter().enumerate() {
-            for (j, control) in ["Hue", "Saturation", "Luminance"].iter().enumerate() {
-                s.hsl[i][j] = slider(&format!("{control}Adjustment{band}"))?;
+        for (i, band) in crs::HSL.into_iter().enumerate() {
+            for (j, control) in band.into_iter().enumerate() {
+                s.hsl[i][j] = slider(control)?;
             }
         }
-        for (i, name) in ["Shadows", "Darks", "Lights", "Highlights"]
-            .iter()
-            .enumerate()
-        {
-            s.parametric[i] = slider(&format!("Parametric{name}"))?;
+        for (i, region) in crs::PARAMETRIC.into_iter().enumerate() {
+            s.parametric[i] = slider(region)?;
         }
-        for (i, name) in ["Shadow", "Midtone", "Highlight"].iter().enumerate() {
-            if let Some(v) = number(&format!("Parametric{name}Split"), 100., [0., 1.])? {
+        for (i, split) in crs::PARAMETRIC_SPLITS.into_iter().enumerate() {
+            if let Some(v) = number(split, [0., 1.])? {
                 s.splits[i] = v;
             }
         }
-        let hue = |key: &str| number(key, 360., [0., 1.]);
-        let saturation = |key: &str| number(key, 100., [0., 1.]);
+        let part = |s: crs::Slider| number(s, [0., 1.]).map(Option::unwrap_or_default);
         let toning = Toning {
             shadows: [
-                hue("SplitToningShadowHue")?.unwrap_or_default(),
-                saturation("SplitToningShadowSaturation")?.unwrap_or_default(),
+                part(crs::SPLIT_TONING_HUE[0])?,
+                part(crs::SPLIT_TONING_SATURATION[0])?,
             ],
             highlights: [
-                hue("SplitToningHighlightHue")?.unwrap_or_default(),
-                saturation("SplitToningHighlightSaturation")?.unwrap_or_default(),
+                part(crs::SPLIT_TONING_HUE[1])?,
+                part(crs::SPLIT_TONING_SATURATION[1])?,
             ],
-            balance: slider("SplitToningBalance")?,
+            balance: slider(crs::SPLIT_TONING_BALANCE)?,
         };
         if toning.shadows[1] != 0. || toning.highlights[1] != 0. {
             s.toning = Some(toning);
         }
-        if let Some(amount) = number("PostCropVignetteAmount", 100., [-1., 1.])?
+        if let Some(amount) = number(crs::POST_CROP_VIGNETTE_AMOUNT, [-1., 1.])?
             && amount != 0.
         {
             let style = match attr("PostCropVignetteStyle") {
@@ -160,11 +152,11 @@ impl LookSettings {
             let or = |v: Option<f32>, default: f32| v.unwrap_or(default);
             s.vignette = Some(Vignette {
                 amount,
-                midpoint: or(number("PostCropVignetteMidpoint", 100., [0., 1.])?, 0.5),
-                feather: or(number("PostCropVignetteFeather", 100., [0., 1.])?, 0.5),
-                roundness: or(number("PostCropVignetteRoundness", 100., [-1., 1.])?, 0.),
+                midpoint: or(number(crs::POST_CROP_VIGNETTE_MIDPOINT, [0., 1.])?, 0.5),
+                feather: or(number(crs::POST_CROP_VIGNETTE_FEATHER, [0., 1.])?, 0.5),
+                roundness: or(number(crs::POST_CROP_VIGNETTE_ROUNDNESS, [-1., 1.])?, 0.),
                 highlights: or(
-                    number("PostCropVignetteHighlightContrast", 100., [0., 1.])?,
+                    number(crs::POST_CROP_VIGNETTE_HIGHLIGHT_CONTRAST, [0., 1.])?,
                     0.,
                 ),
                 style,
@@ -367,5 +359,156 @@ mod tests {
         let mut bad = vintage();
         bad.toning.as_mut().unwrap().balance = 3.;
         assert!(bad.validate().is_err());
+    }
+
+    /// What a look's settings read today, frozen before the Camera Raw key table
+    /// (#808 step 4.12): each key alone at values across and beyond its range, the
+    /// vignette's dependent settings with and without an amount, and which keys a
+    /// look accepts at all. Compared with `look_settings_golden.txt`, written by this
+    /// test with `RAWMAKASE_BLESS=1`; floats in full, so a one-bit change fails.
+    #[test]
+    fn every_look_setting_reads_as_before() {
+        use std::fmt::Write as _;
+        const VALUES: &[&str] = &[
+            "", "0", "-0", "+0.5", "-0.5", "1", "2.4", "4.99", "5", "5.01", "-5", "-5.01", "5.5",
+            "-12.5", "33.3", "50", "99.99", "-100", "100", "100.01", "101", "180", "359", "360",
+            "361", "1e-7", "-1e-7", "inf", "x", "NaN",
+        ];
+        let mut keys: Vec<String> = [
+            "Exposure2012",
+            "Saturation",
+            "ParametricShadows",
+            "ParametricDarks",
+            "ParametricLights",
+            "ParametricHighlights",
+            "ParametricShadowSplit",
+            "ParametricMidtoneSplit",
+            "ParametricHighlightSplit",
+            "SplitToningShadowHue",
+            "SplitToningShadowSaturation",
+            "SplitToningHighlightHue",
+            "SplitToningHighlightSaturation",
+            "SplitToningBalance",
+            "PostCropVignetteAmount",
+            "PostCropVignetteMidpoint",
+            "PostCropVignetteFeather",
+            "PostCropVignetteRoundness",
+            "PostCropVignetteStyle",
+            "PostCropVignetteHighlightContrast",
+            "Dehaze",
+            "Contrast2012",
+            "Exposure",
+            "HueAdjustment",
+            "HueAdjustmentTeal",
+        ]
+        .map(String::from)
+        .to_vec();
+        for band in BANDS {
+            for control in ["Hue", "Saturation", "Luminance"] {
+                keys.push(format!("{control}Adjustment{band}"));
+            }
+        }
+        // The settings' fields that differ from a look without any, floats in full.
+        fn changed(result: &Result<LookSettings>) -> String {
+            fn walk(prefix: &str, v: &serde_json::Value, d: &serde_json::Value, out: &mut String) {
+                match (v, d) {
+                    (serde_json::Value::Object(m), serde_json::Value::Object(dm)) => {
+                        for (k, v) in m {
+                            walk(&format!("{prefix}.{k}"), v, &dm[k], out);
+                        }
+                    }
+                    (serde_json::Value::Array(a), serde_json::Value::Array(da)) => {
+                        for (i, v) in a.iter().enumerate() {
+                            let d = da.get(i).unwrap_or(&serde_json::Value::Null);
+                            walk(&format!("{prefix}[{i}]"), v, d, out);
+                        }
+                    }
+                    _ => {
+                        // Compared as written: JSON numbers hold -0 equal to 0.
+                        let text = |v: &serde_json::Value| match v.as_f64() {
+                            Some(f) if v.is_f64() => format!("{:?}", f as f32),
+                            _ => v.to_string(),
+                        };
+                        if text(v) != text(d) {
+                            let _ = write!(out, " {prefix}={}", text(v));
+                        }
+                    }
+                }
+            }
+            match result {
+                Ok(s) => {
+                    let mut out = String::from("ok");
+                    let base = serde_json::to_value(LookSettings::default()).unwrap();
+                    walk("", &serde_json::to_value(s).unwrap(), &base, &mut out);
+                    out
+                }
+                Err(e) => format!("error {e:#}"),
+            }
+        }
+        let mut out = String::new();
+        for key in &keys {
+            let _ = writeln!(out, "# {key} read {}", LookSettings::reads(key));
+            // Alone, and with the setting that makes it count: a vignette's amount, the
+            // toning's saturations.
+            let context: &[(&str, &str)] = match key.as_str() {
+                k if k.starts_with("PostCropVignette") && k != "PostCropVignetteAmount" => {
+                    &[("PostCropVignetteAmount", "-20")]
+                }
+                k if k.starts_with("SplitToning") && !k.ends_with("Saturation") => &[
+                    ("SplitToningShadowSaturation", "20"),
+                    ("SplitToningHighlightSaturation", "30"),
+                ],
+                _ => &[],
+            };
+            for (name, with) in [("alone", &[][..]), ("with", context)] {
+                if name == "with" && with.is_empty() {
+                    continue;
+                }
+                for value in VALUES {
+                    let result = LookSettings::parse(|k| {
+                        if k == key {
+                            value
+                        } else {
+                            with.iter().find(|(c, _)| *c == k).map_or("", |(_, v)| *v)
+                        }
+                    });
+                    let _ = writeln!(out, "{key}={value:?} {name} {}", changed(&result));
+                }
+            }
+        }
+        // The vignette's other settings, with an amount and without one.
+        for amount in ["", "0", "-20"] {
+            for (key, value) in [
+                ("PostCropVignetteStyle", "x"),
+                ("PostCropVignetteStyle", "3"),
+                ("PostCropVignetteMidpoint", "150"),
+                ("PostCropVignetteFeather", "-1"),
+            ] {
+                let result = LookSettings::parse(|k| match k {
+                    "PostCropVignetteAmount" => amount,
+                    k if k == key => value,
+                    _ => "",
+                });
+                let _ = writeln!(
+                    out,
+                    "amount {amount:?} {key}={value:?} {}",
+                    changed(&result)
+                );
+            }
+        }
+        if std::env::var_os("RAWMAKASE_BLESS").is_some() {
+            std::fs::write(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/camera_profiles/look_settings_golden.txt"),
+                &out,
+            )
+            .unwrap();
+            return;
+        }
+        let golden = include_str!("look_settings_golden.txt");
+        for (i, (want, got)) in golden.lines().zip(out.lines()).enumerate() {
+            assert_eq!(got, want, "line {}", i + 1);
+        }
+        assert_eq!(out.lines().count(), golden.lines().count(), "line count");
     }
 }

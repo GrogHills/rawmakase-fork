@@ -15,7 +15,7 @@ either selection with Add/Subtract brushes and intersect it with existing ranges
 or gradients. Saved results work offline without a model or inference runtime.
 
 Ship this complete workflow first. Implementing all the work in
-[the preliminary research](retouching-and-ai.md) would not simplify it: removal,
+the preliminary research (never committed) would not simplify it: removal,
 depth, denoise and tagging each need different models, saved representations and
 rendering contracts. Share the raster and inference foundations, then extend them
 in the order described at the end of this plan.
@@ -47,7 +47,7 @@ split and catalog-only editing:
 | `crates/rawmakase-catalog/src/catalog/edits.rs` | Bitmap insertion; retrieval is test-only | Production batch retrieval and asset-aware saves |
 | `crates/rawmakase-catalog/src/catalog/edit_rows.rs` | Authoritative edit/history writes | Save raster dependencies with references in one transaction |
 | `src/edit_session/mod.rs` | Edits, history and dirty state coordinated by session operations | Atomic installation of generated masks and their in-memory assets |
-| `src/app/mask_tool.rs` | Creation, composition, corrections, sliders, overlay | Generation controls and result application |
+| `src/app/develop/tools/mask_tool.rs` | Creation, composition, corrections, sliders, overlay | Generation controls and result application |
 | `src/app/task.rs`, `src/app/worker/latest.rs` | Cancellation, generations and bounded worker patterns | Dedicated inference lifecycle using these patterns |
 | `crates/rawmakase-export/src/export/job.rs` | Captured image and recipe for export | Capture referenced asset IDs and unsaved leases; resolve before rendering |
 
@@ -142,12 +142,12 @@ asset-aware job source is necessary for Library workers:
 | Path | Required behavior |
 | --- | --- |
 | Develop After/Before, fit/regions, overlay and Reference View | Resolve the particular displayed recipe, including historical Before states |
-| Library thumbnails and edited previews (`src/app/library/previews.rs`) | Carry catalog identity and captured IDs; never substitute Defaults on an asset error |
+| Library thumbnails and edited previews (`src/app/library/previews/`) | Carry catalog identity and captured IDs; never substitute Defaults on an asset error |
 | Library Loupe (`src/app/library/stage.rs`, `src/app/library/screen.rs`) | Preserve typed asset errors through source selection and rendering |
-| Build Standard/1:1 Previews (`src/app/preview_build.rs`) | Resolve captured saved assets and report per-photo failure without publishing an incomplete preview |
+| Build Standard/1:1 Previews (`src/app/library/preview_build.rs`) | Resolve captured saved assets and report per-photo failure without publishing an incomplete preview |
 | Snapshot/history restore | Install recipe/IDs and history synchronously; resolve render assets asynchronously under the new revision |
 | Foreground/queued export, command outputs and headless CLI | Capture recipe/IDs together, lease unsaved assets and fail before output publication on missing assets |
-| Masking color sampler (`src/app/mask_tool.rs::developed_lab`) | Continue clearing masks deliberately; pass an empty asset set and test absence of local-mask feedback |
+| Masking color sampler (`src/app/develop/tools/mask_tool.rs::developed_lab`) | Continue clearing masks deliberately; pass an empty asset set and test absence of local-mask feedback |
 
 An asset-free render entry point must reject a recipe with unresolved bitmap
 references. Share decoded bytes using budgeted `Arc` leases, not per-worker copies.
@@ -817,7 +817,17 @@ Deliberate differences from the plan above:
   rest matched the current result, and none was judged a meaningful difference for
   100–200 MB more to download and a second more per photo (ViTMatte's weights are
   also trained on Adobe's restricted Composition-1k). Not added.
-- The subject and sky choice is measured on a handful of photographs, not on the plan's
+- Sky was first the DETR sky label refined with SAM 2's outlines, and left blocky gaps
+  beside poles and heads, and took the sea for sky. It is now UperNet ConvNeXt base
+  (see [masking](masking.md) and [dependencies](dependencies.md)), its own pack and its own
+  session, loaded when first asked for. It was looked at on 256 of the owner's photographs, chosen
+  by what could break it (blown skies, water, foliage, night, no sky) and at random, with
+  no ground truth: its worse cases are in masking's limits. It runs at 1024 px, as tried
+  first: 768 px takes half the time and 1.7 GB, gets some hazy windows right and leaves
+  holes in others' bright clouds. The horizon cut the old
+  outlines needed is gone: on the new model it only removed real sky behind what stands
+  in front of it.
+- The subject choice is measured on a handful of photographs, not on the plan's
   evaluation corpus; there is no faint-result threshold and no grow/shrink/feather.
   Selections run on the CPU by default; the plan's acceleration option arrived as the
   optional [remote worker](remote-inference.md), which may register CUDA or CoreML

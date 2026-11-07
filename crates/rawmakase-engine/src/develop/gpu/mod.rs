@@ -4,16 +4,88 @@
 //! On the desktop it shares the UI's wgpu device, so a preview is finished straight
 //! into a texture the viewport draws (`present.rs`). Headless callers (tests, the
 //! benchmark) create their own device. Buffers are bounded and reused for equal
-//! dimensions; callers retain CPU pixels for fallback.
+//! dimensions; callers retain CPU pixels for fallback. The CPU stages are the
+//! reference, and exports always use them (docs/architecture.md).
+//!
+//! # Backends and devices
+//!
+//! Portable WGSL compute through wgpu: Metal on macOS, Vulkan on supported Linux
+//! drivers, including NVIDIA and AMD, and DirectX 12 on Windows. Windows leaves
+//! Vulkan out while a DirectX 12 device can be created, because an Intel Vulkan
+//! driver crashed the app at launch where DirectX 12 worked (#623). If that device
+//! fails, it tries Vulkan and then OpenGL before opening the window (#768);
+//! `WGPU_BACKEND` overrides all of this. The UI and a standalone processor share that
+//! choice ([`backends`]). The desktop creates the UI's device with the storage limits
+//! previews need ([`required_limits`]) and a high-performance adapter. On Linux the
+//! window's adapter is the first GPU the system lists instead: the display's GPU, or
+//! the discrete one under `prime-run` or `DRI_PRIME=1`, because a render-offload GPU
+//! can claim it presents to the window and then fail to configure it. OpenGL and
+//! software adapters are not used for compute. Every GPU call runs inside its own
+//! validation, internal and out-of-memory error scopes, so a failure disables the
+//! preview GPU without reaching the UI. Only ordinary 32-bit storage buffers,
+//! Rgba8Unorm storage textures and compute workgroups are used, without vendor
+//! extensions. Hardware validated so far: Apple M1 Pro.
+//!
+//! # What runs here
+//!
+//! The per-pixel colour and tone stage (`develop.wgsl`, fed by
+//! `pipeline/pixel_params.rs`) runs on the stage cache's samples for every recipe
+//! resolved with a camera profile; unresolved recipes use the CPU stage. Each pass is
+//! compiled for the features its parameters use (`develop::Variant`); the
+//! Shadows/Highlights map's grids stay on the device per map base, and each sample
+//! set's camera colour per the recipe fields it reads (`develop::Kept`), written once
+//! a second render with the same settings asks for it and read after its pass is
+//! submitted.
+//!
+//! When the GPU renders a preview, the developed pixels stay on the device and
+//! `present.wgsl` finishes them into a texture that egui draws directly (registered
+//! as a native texture by the render worker): sharpening, vignettes and grain, the
+//! clipping overlay, the monitor profile (a 52³ lattice sampled from
+//! `color_management` once per profile, interpolated trilinearly) and 8-bit encoding,
+//! in the CPU reference's order. The histogram is counted in the same pass and the
+//! minimap's copy is reduced on the GPU; only the histogram (3 KB) and, for catalog
+//! photos, a 640-pixel Library thumbnail are read back. Nothing is converted or
+//! uploaded on the UI thread. Recipes the port does not cover, and machines without a
+//! usable adapter, render on the CPU, and the worker then prepares the display bytes,
+//! histogram and reduced copies before the UI uploads the texture. Full-resolution
+//! regions keep the sharpening halo before cropping. Lanczos3 resizing of full
+//! renders stays on the GPU for readback callers. The status line says `GPU` for
+//! presented frames, `GPU finish` when only finishing used the GPU, and `CPU`
+//! otherwise.
+//!
+//! For the same recipes, the stages before the per-pixel stage also run on the
+//! device when the photo fits its buffer limits (`resident.rs`): the photo or pyramid
+//! level is kept there, and regions are sampled there through geometry and lens
+//! correction. Colour and luminance noise reduction run on the CPU on the full camera
+//! image, before retouching and before the preview pyramid is built
+//! (`develop::recipe::Denoise` captures their settings and execution together; the
+//! retouch cache keys that value and the source image identity), so the GPU samples
+//! the already denoised image. Exports run the same stage without the cache. The Shadows/Highlights map (with Clarity's gain) is
+//! built on the CPU from the photo's measurement copy, and the scene tone stage reads
+//! it in `develop.wgsl`. Texture's image is made on the CPU, and a mask's Clarity or
+//! Texture renders the whole preview on the CPU. A failure in these stages turns off
+//! only this path for the session.
+//!
+//! # Textures, buffers and failure
+//!
+//! Presented textures are kept per view (the whole photo, or a 100% region) and
+//! size, two of each, so a slider moving alternates between the reduced preview's and
+//! the full render's textures without allocating. Each texture carries a generation
+//! that changes whenever it is written; the worker reuses a finished frame when
+//! switching views only while its texture still holds it.
+//!
+//! Buffers are reused by dimensions, limited by the adapter and a 1 GiB aggregate
+//! buffer budget. No compatible adapter, oversized buffers, allocation or validation
+//! errors and readback failures fall back to the CPU. After a GPU failure the preview
+//! renderer releases the backend and does not retry it for every edit; restarting
+//! creates a new backend. GPU work already submitted cannot be interrupted: obsolete
+//! results are discarded before they are published.
 use crate::model::recipe::Recipe;
 use crate::rendered::Rendered;
 use anyhow::{Context, Result, ensure};
+use rawmakase_cancel::Cancel;
 use std::{
-    sync::{
-        PoisonError, RwLock, RwLockWriteGuard,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{PoisonError, RwLock, RwLockWriteGuard, mpsc},
     time::Duration,
 };
 use wgpu::util::DeviceExt;
@@ -100,19 +172,73 @@ struct Buffers {
     staging: wgpu::Buffer,
 }
 /// The wgpu backends the UI and previews may use, unless `WGPU_BACKEND` names
-/// others. Windows uses DirectX 12, with OpenGL as the fallback, and leaves Vulkan
-/// out. wgpu prefers Vulkan when both are available, and Intel's Vulkan driver for
-/// HD Graphics 530 (igvk64.dll 31.0.101.2125) crashes the process at most launches,
-/// while DirectX 12 and OpenGL start reliably on the same machine (#623).
+/// others. Windows uses DirectX 12 with OpenGL as the fallback and leaves Vulkan out
+/// while DirectX 12 works: wgpu prefers Vulkan when both are available, and Intel's
+/// Vulkan driver for HD Graphics 530 (igvk64.dll 31.0.101.2125) crashes the process
+/// at most launches, while DirectX 12 and OpenGL start reliably there (#623).
 pub fn backends() -> wgpu::Backends {
-    wgpu::Backends::from_env().unwrap_or(default_backends(cfg!(windows)))
+    static DEFAULT: std::sync::OnceLock<wgpu::Backends> = std::sync::OnceLock::new();
+    wgpu::Backends::from_env()
+        .unwrap_or_else(|| *DEFAULT.get_or_init(|| default_backends(cfg!(windows), device_starts)))
 }
-fn default_backends(windows: bool) -> wgpu::Backends {
-    if windows {
-        wgpu::Backends::DX12 | wgpu::Backends::GL
+/// wgpu commits to one adapter and gives up if its device fails, so on Windows each
+/// backend is tried here first (#768). Vulkan comes before OpenGL because previews
+/// don't use OpenGL for compute. With nothing working, the usual choice reports why.
+fn default_backends(
+    windows: bool,
+    mut starts: impl FnMut(wgpu::Backends) -> bool,
+) -> wgpu::Backends {
+    use wgpu::Backends;
+    if !windows {
+        Backends::PRIMARY | Backends::GL
+    } else if starts(Backends::DX12) {
+        Backends::DX12 | Backends::GL
+    } else if starts(Backends::VULKAN) {
+        Backends::VULKAN | Backends::GL
+    } else if starts(Backends::GL) {
+        Backends::GL
     } else {
-        wgpu::Backends::PRIMARY | wgpu::Backends::GL
+        Backends::DX12 | Backends::GL
     }
+}
+/// Whether `backends` has an adapter whose device can be created, chosen and limited
+/// as the window's will be (egui's defaults and [`required_limits`]). DirectX 12 and
+/// Vulkan need real hardware: their software adapters must not hide a usable OpenGL
+/// driver.
+fn device_starts(backends: wgpu::Backends) -> bool {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference:
+            wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        ..Default::default()
+    })) else {
+        return false;
+    };
+    let gl = backends == wgpu::Backends::GL;
+    if !gl && adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+        return false;
+    }
+    let required_limits = if gl {
+        wgpu::Limits {
+            max_texture_dimension_2d: 8192,
+            ..wgpu::Limits::downlevel_webgl2_defaults()
+        }
+    } else {
+        required_limits(&adapter)
+    };
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("RAWmakase backend check"),
+        required_limits,
+        ..Default::default()
+    }))
+    .is_ok()
 }
 /// Device limits previews need: storage buffers for a whole photo kept on the device
 /// (735 MB for 61 megapixels), up to 2 GB where the adapter allows.
@@ -246,9 +372,9 @@ impl Processor {
         image: &Rendered,
         recipe: &Recipe,
         max_edge: u32,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Rendered> {
-        ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
+        ensure!(!cancel.is_cancelled(), "Render superseded");
         recipe.validate()?;
         ensure!(
             image.width > 0
@@ -309,7 +435,7 @@ impl Processor {
         recipe: &Recipe,
         dimensions: [u32; 4],
         sizes: [u64; 3],
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Rendered> {
         let [w, h, ow, oh] = dimensions;
         let resize = w != ow || h != oh;
@@ -407,7 +533,7 @@ impl Processor {
         });
         self.queue
             .write_buffer(&b.source, 0, bytemuck::cast_slice(&image.pixels));
-        ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
+        ensure!(!cancel.is_cancelled(), "Render superseded");
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut dispatch = |pipeline: usize, width: u32, height: u32| {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -447,7 +573,7 @@ impl Processor {
         }
         rx.recv_timeout(Duration::from_secs(1))
             .context("GPU readback timed out")??;
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             b.staging.unmap();
             anyhow::bail!("Render superseded");
         }

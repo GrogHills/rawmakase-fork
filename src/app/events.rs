@@ -1,15 +1,15 @@
 //! Accept worker results at a single generation-checked boundary.
-use super::{
+use crate::app::Module;
+use crate::app::shell::messages::Topic;
+use crate::app::{
     Editor,
     worker::{self, Event, LoadedHeader, Pane, RenderStage, TaskKind},
 };
-use crate::app::Module;
 use crate::export_settings::ExportOptions;
 use eframe::egui;
 
 impl Editor {
-    pub(super) fn events(&mut self, ctx: &egui::Context) {
-        self.import_progress();
+    pub(in crate::app) fn events(&mut self, ctx: &egui::Context) {
         // A Point Color sample stops as soon as its tab is no longer where the photo is
         // edited (the Library, Before, another tab), whichever way that happened.
         if self.document.point_color_pick.is_running() && !self.point_color_tab_shown() {
@@ -17,8 +17,8 @@ impl Editor {
         }
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                Event::ProfileDownloaded { id, result } => self.profile_downloaded(id, result),
                 Event::CatalogWorking(message) => {
-                    self.status = message.clone();
                     self.catalog_work = Some(message);
                 }
                 Event::FoldersAdded { result, source } => {
@@ -67,8 +67,9 @@ impl Editor {
                 Event::FileOpResolved(catalog, operation, resolved) => {
                     self.file_op_resolved(catalog, operation, *resolved)
                 }
+                Event::CatalogExported(result) => self.catalog_exported(*result),
                 Event::FolderQuestion(question) => {
-                    self.modal = Some(super::Modal::FolderQuestion(*question))
+                    self.modal = Some(crate::app::Modal::FolderQuestion(*question))
                 }
 
                 Event::SystemProbed { generation, system } => {
@@ -76,7 +77,7 @@ impl Editor {
                 }
                 Event::Monitor(p) => {
                     self.activity.finish_dialog();
-                    self.view.monitor = super::monitor::MonitorProfile::Custom(p);
+                    self.view.monitor = crate::app::preferences::monitor::MonitorProfile::Custom(p);
                     let _ = self.save_session();
                     self.schedule();
                 }
@@ -104,10 +105,10 @@ impl Editor {
                             self.ensure_analysis();
                             self.commit_edit(old.clone(), None);
                         }
-                        Err(e) => self.status = e.to_string(),
+                        Err(e) => self.messages.fail(e.to_string()),
                     }
                 }
-                Event::Auto { id, kind, result } if id == self.load.id() => {
+                Event::Auto { id, kind, result } if id == self.document.load_id() => {
                     self.auto_ready(kind, result)
                 }
                 Event::PointColorSample {
@@ -115,7 +116,7 @@ impl Editor {
                     generation,
                     sampled,
                     result,
-                } if id == self.load.id()
+                } if id == self.document.load_id()
                     && self.document.point_color_pick.is_running()
                     && self.document.point_color_pick.id() == generation =>
                 {
@@ -126,7 +127,7 @@ impl Editor {
                     generation,
                     sampled,
                     result,
-                } if id == self.load.id()
+                } if id == self.document.load_id()
                     && self.document.targeted_pick.is_running()
                     && self.document.targeted_pick.id() == generation =>
                 {
@@ -137,30 +138,58 @@ impl Editor {
                     generation,
                     analysed,
                     result,
-                } if id == self.load.id() => self.upright_ready(generation, &analysed, result),
+                } if id == self.document.load_id() => {
+                    self.upright_ready(generation, &analysed, result)
+                }
+                Event::CameraLook {
+                    id,
+                    generation,
+                    profile,
+                    result,
+                } if id == self.document.load_id() => {
+                    self.camera_look_ready(generation, profile, result)
+                }
+                Event::CameraThumbnail {
+                    id,
+                    generation,
+                    result,
+                } if id == self.document.load_id() => {
+                    self.camera_thumbnail_ready(ctx, generation, result)
+                }
                 Event::Straighten {
                     id,
                     generation,
                     analysed,
                     result,
-                } if id == self.load.id() => {
+                } if id == self.document.load_id() => {
                     self.auto_straighten_ready(generation, &analysed, result)
                 }
                 Event::Selection(done) => self.selection_done(*done),
-                Event::ModelInstalled(result) => {
-                    self.selection.models.finished(&result);
-                    if result.as_ref().err().is_some_and(|e| e == "Cancelled") {
-                        self.status = "Model download cancelled".into();
+                Event::AiDenoise(update) => self.ai_denoise_update(*update),
+                Event::AiDenoiseStored(path) => self.ai_result_stored(&path),
+                Event::ModelInstalled(pack, result) => {
+                    self.selection.models.of_mut(pack).finished(&result);
+                    if matches!(result, Err(crate::model_install::InstallError::Cancelled)) {
+                        self.messages.note("Model download cancelled");
                     } else {
-                        self.model_installed(result);
+                        self.model_installed(pack, result);
                     }
                 }
-                Event::ModelRemoved(result) => {
-                    self.selection.models.removed(result.is_ok());
-                    self.status = match result {
-                        Ok(()) => "Selection model removed".into(),
-                        Err(e) => format!("Model not removed: {e}"),
-                    };
+                Event::Lensfun {
+                    generation,
+                    job,
+                    result,
+                } => {
+                    if let Some((level, said)) = self.lensfun.finished(generation, job, result) {
+                        self.messages.say(level, said);
+                    }
+                }
+                Event::ModelRemoved(pack, result) => {
+                    self.selection.models.of_mut(pack).removed();
+                    match result {
+                        Ok(()) => self.messages.done("Selection model removed"),
+                        Err(e) => self.messages.fail(format!("Model not removed: {e}")),
+                    }
                 }
                 Event::CatalogUpgraded { generation, result } => {
                     self.catalog_upgraded(generation, result)
@@ -172,7 +201,9 @@ impl Editor {
                     profiles,
                     errors,
                     groups,
-                } if id == self.load.id() => {
+                    imported,
+                } if id == self.document.load_id() => {
+                    let before = self.document.edit.recipe().clone();
                     self.document.profiles = profiles;
                     self.document.profile_errors = errors;
                     self.document.profile_groups = groups;
@@ -183,7 +214,13 @@ impl Editor {
                         // The Lightroom edit is the starting point, not an unsaved change.
                         self.document.edit.save_state_mut().saved();
                     }
+                    if imported {
+                        let current = self.unchanged_current_photo(&before);
+                        self.refresh_library_defaults_preserving(current);
+                    }
                 }
+                // Profiles imported for a photo no longer open: none keeps its preview.
+                Event::Profiles { imported: true, .. } => self.refresh_library_defaults(),
                 Event::Import(kind, paths) => {
                     self.activity.finish_dialog();
                     self.import(kind, paths, ctx);
@@ -197,13 +234,15 @@ impl Editor {
                     self.activity.finish_dialog();
                     let m = self.document.metadata.clone().unwrap_or_default();
                     match crate::presets::save_preset(&p, self.document.edit.recipe(), &m) {
-                        Ok(()) => self.status = "Preset saved".into(),
-                        Err(e) => self.status = e.to_string(),
+                        Ok(()) => self.messages.done("Preset saved"),
+                        Err(e) => self.messages.fail(e.to_string()),
                     }
                 }
-                Event::Header(header) if header.id == self.load.id() => self.header_ready(*header),
+                Event::Header(header) if header.id == self.document.load_id() => {
+                    self.header_ready(*header)
+                }
                 Event::StandIn(stand_in) => self.stand_in_ready(ctx, *stand_in),
-                Event::Embedded { id, image: im } if id == self.load.id() => {
+                Event::Embedded { id, image: im } if id == self.document.load_id() => {
                     // The stored preview, which shows the edit, stays until the
                     // first render.
                     if self.preview.stand_in.is_some() {
@@ -234,22 +273,29 @@ impl Editor {
                         Some(navigator),
                     );
                     self.preview.embedded = true;
-                    self.preview.mode = super::state::TextureMode::Whole;
+                    self.preview.mode = crate::app::develop::state::TextureMode::Whole;
                     // Uncropped, so it is placed by the photo's crop once that is known.
                     self.preview.crop = Some([0., 0., 1., 1.]);
                     self.preview.status = "Camera preview • developing RAW…".into();
                 }
-                Event::Ready { id, full, status } if id == self.load.id() => {
+                Event::Ready {
+                    id,
+                    full,
+                    file,
+                    status,
+                } if id == self.document.load_id() => {
                     self.document.set_image(full);
-                    self.load.finish(id);
+                    self.document.image_file = file;
+                    self.document.finish_load(id);
                     // An Upright mode chosen before the photo decoded still needs analysing.
                     self.ensure_analysis();
                     if !self.document.edit.save_state().is_protected() {
                         // A raw default that could not be used stays explained.
-                        self.status = match self.defaults_note() {
+                        let text: String = match self.defaults_note() {
                             Some(note) => format!("{status} · {note}"),
                             None => status,
                         };
+                        self.messages.note(text);
                     }
                     self.schedule();
                 }
@@ -286,7 +332,10 @@ impl Editor {
                         continue;
                     };
                     self.preview.showing(id);
-                    let region = matches!(request.mode, super::state::TextureMode::Region(_));
+                    let region = matches!(
+                        request.mode,
+                        crate::app::develop::state::TextureMode::Region(_)
+                    );
                     // A region's own histogram would describe only what is
                     // visible; the whole photo's follows as `Histogram`.
                     if !region {
@@ -325,10 +374,11 @@ impl Editor {
                         if let Some(small) = thumbnail
                             && id == self.preview.task.id()
                         {
-                            self.refresh_library_thumbnail(ctx, small);
+                            self.refresh_library_thumbnail(ctx, small, request.ai);
                         }
                     }
                     self.preview.status = status;
+                    self.messages.settle(Topic::Render);
                 }
                 Event::Histogram { id, histogram } if self.preview.request(id).is_some() => {
                     self.preview.histogram = *histogram;
@@ -337,10 +387,10 @@ impl Editor {
                     id,
                     task: TaskKind::Load,
                     error,
-                } if id == self.load.id() => {
+                } if id == self.document.load_id() => {
                     self.document.failed = Some(error.clone());
-                    self.status = error;
-                    self.load.finish(id);
+                    self.messages.fail_on(Topic::Load, error);
+                    self.document.finish_load(id);
                     // No render is coming to take over from the stored preview.
                     self.preview.stand_in = None;
                 }
@@ -349,7 +399,7 @@ impl Editor {
                     task: TaskKind::Render(Pane::After),
                     error,
                 } if id == self.preview.task.id() => {
-                    self.status = error;
+                    self.messages.fail_on(Topic::Render, error);
                     self.preview.task.finish(id);
                     self.preview.stand_in = None;
                     // A failed render on the GPU retires Before's textures too: render
@@ -365,7 +415,7 @@ impl Editor {
                     task: TaskKind::Render(Pane::Before),
                     error,
                 } if id == self.preview.before.task.id() => {
-                    self.status = format!("Before: {error}");
+                    self.messages.warn(format!("Before: {error}"));
                     self.preview.before.task.finish(id);
                     // A failed render on the GPU retires the edit's textures too: render
                     // the edit again. Before keeps its failed job, so it is not retried.
@@ -378,7 +428,7 @@ impl Editor {
                     task: TaskKind::Render(Pane::Magnifier),
                     error,
                 } if id == self.preview.magnifier.task.id() => {
-                    self.status = format!("Magnifier: {error}");
+                    self.messages.warn(format!("Magnifier: {error}"));
                     self.preview.magnifier.task.finish(id);
                     // A failed render on the GPU retires the edit's textures too: render
                     // the edit again. The magnifier keeps its failed job, so it is not
@@ -399,75 +449,80 @@ impl Editor {
             }
         }
     }
-    /// Whether the catalog `l`, opened again after a synchronization, still
-    /// has the photo open in Develop: where its file was found moved, there.
-    fn keeps_open_photo(&self, l: &super::library::Library) -> bool {
-        let Some((id, path)) = &self.relink_open else {
-            return false;
-        };
-        self.document.catalog_photo == Some(*id)
-            && self
-                .library
-                .as_ref()
-                .is_some_and(|old| old.session.catalog.location() == l.session.catalog.location())
-            && l.photo(*id)
-                .is_some_and(|p| path.as_ref().is_none_or(|path| &p.path == path))
+    /// A catalog arrived (opened, or read again after adding or relinking a folder), or
+    /// failed to.
+    pub(in crate::app) fn catalog_ready(
+        &mut self,
+        result: Result<Box<crate::app::library::Library>, String>,
+    ) {
+        self.catalog_arrived(result, None);
     }
-    pub(super) fn catalog_ready(&mut self, result: Result<Box<super::library::Library>, String>) {
+    /// The catalog read again after a synchronization, `follow` naming the photo open in
+    /// Develop and where its file was found moved: it stays open where the catalog still
+    /// lists it there (see [`crate::app::catalog::keeps_open_photo`]).
+    pub(in crate::app) fn catalog_arrived(
+        &mut self,
+        result: Result<Box<crate::app::library::Library>, String>,
+        follow: Option<crate::app::catalog::Follow>,
+    ) {
         self.activity.finish_dialog();
         // Folder locations may have changed with it.
         self.save_computer_name();
         self.preferences.locations = None;
         match result {
-            Ok(mut l) if self.keeps_open_photo(&l) => {
+            Ok(mut l)
+                if crate::app::catalog::keeps_open_photo(
+                    follow.as_ref(),
+                    self.document.catalog_photo,
+                    self.library.as_ref().is_some_and(|old| {
+                        old.session.catalog().location() == l.session.catalog().location()
+                    }),
+                    |id| l.photo(id).map(|p| p.path.clone()),
+                ) =>
+            {
                 // After a synchronization the open photo stays open, its
                 // edit, History and pending save kept; where its file was
                 // found moved, the document follows it.
-                let (_, path) = self.relink_open.take().expect("kept");
+                let (_, path) = follow.expect("kept");
                 if let Some(path) = path {
                     self.document.relink(path);
                 }
                 self.onboarding.catalog_error = None;
-                if !l.message.is_empty() {
-                    self.status = l.message.clone();
-                }
+                self.messages.absorb(&mut l.messages);
                 l.set_defaults(self.raw_defaults.clone());
+                l.set_ai_cache(self.ai_denoise_cache());
                 let selected = self.document.catalog_photo;
                 self.library = Some(l);
                 if let (Some(library), Some(id)) = (&mut self.library, selected) {
-                    library.apply_layout(&self.saved_layout);
+                    library.apply_layout(self.session.layout());
                     library.select(Some(id));
                 }
                 let _ = self.save_session();
             }
             Ok(mut l) => {
-                self.relink_open = None;
                 self.onboarding.catalog_error = None;
-                self.load.invalidate();
                 // The photo being left is Previous, as when moving between photos.
                 if let Some(settings) = self.current_settings() {
                     self.previous_settings = Some(settings);
                 }
-                self.document.reset(None);
-                self.preview.clear_document();
-                self.presets.clear_document();
-                self.view.clear_document();
+                self.close_document();
                 self.selection.clear_catalog();
-                self.status = if !l.message.is_empty() {
-                    l.message.clone()
-                } else if l.session.photos.is_empty() {
-                    "Catalog ready. Add a folder of photos to begin.".into()
+                if !l.messages.line().is_empty() {
+                    self.messages.absorb(&mut l.messages);
+                } else if l.session.photos().is_empty() {
+                    self.messages
+                        .note("Catalog ready. Add a folder of photos to begin.");
                 } else {
-                    "Catalog ready. Offline photos remain in the library; locate their folders to develop them.".into()
-                };
+                    self.messages.note("Catalog ready. Offline photos remain in the library; locate their folders to develop them.");
+                }
                 // Commands never cross catalogs; reloading this one (after
                 // adding or relinking a folder) keeps them.
                 let reloaded = self.library.as_ref().is_some_and(|old| {
-                    old.session.catalog.location() == l.session.catalog.location()
+                    old.session.catalog().location() == l.session.catalog().location()
                 });
                 if !reloaded {
                     // A folder chosen for removal belongs to the catalog left.
-                    if matches!(self.modal, Some(super::Modal::RemoveFolder(_))) {
+                    if matches!(self.modal, Some(crate::app::Modal::RemoveFolder(_))) {
                         self.modal = None;
                     }
                     self.undo_log.clear();
@@ -475,15 +530,16 @@ impl Editor {
                     self.clear_reference();
                 }
                 l.set_defaults(self.raw_defaults.clone());
+                l.set_ai_cache(self.ai_denoise_cache());
                 // A catalog opened (not read again) may have file
                 // operations a crash left unfinished.
                 if !reloaded {
-                    self.recover_files_later(l.session.catalog.location().clone());
+                    self.recover_files_later(l.session.catalog().location().clone());
                 }
                 self.library = Some(l);
                 self.module = Module::Library;
                 // On launch, return to the folder, photo and module of last time.
-                let restore = self.restore.take();
+                let restore = self.waiting.take_restore();
                 if let Some(library) = &mut self.library {
                     if let Some(place) = &restore {
                         library.restore_source(&place.source, place.photo);
@@ -492,27 +548,23 @@ impl Editor {
                     // catalog is loaded again (a folder added or relinked);
                     // another catalog starts with every photo shown.
                     if restore.is_some() || reloaded {
-                        library.apply_layout(&self.saved_layout);
+                        library.apply_layout(self.session.layout());
                     }
                 }
                 // Develop reopens on its photo, even one the filters now hide.
                 if let Some(place) = restore
-                    && place.module == super::library::Module::Develop
+                    && place.module == crate::app::library::Module::Develop
                     && let Some(id) = place.photo.or_else(|| self.library.as_ref()?.selected())
                 {
                     self.develop_catalog_photo(id);
-                    // On launch, a photo gone offline leaves the Library shown
-                    // without a dialog; the status bar says why.
-                    self.not_editable = None;
                 }
                 self.open_pending_photo();
                 let _ = self.save_session();
             }
             Err(e) => {
-                self.relink_open = None;
-                self.pending_photo = None;
+                self.waiting.failed();
                 self.onboarding.catalog_error = Some(e.clone());
-                self.status = format!("Catalog operation failed: {e}");
+                self.messages.fail(format!("Catalog operation failed: {e}"));
             }
         }
     }
@@ -520,43 +572,62 @@ impl Editor {
     fn header_ready(&mut self, header: LoadedHeader) {
         let LoadedHeader {
             path: p,
+            file,
             metadata: m,
             recipe: r,
             export: ex,
             status,
             ..
         } = header;
-        self.document.file = crate::storage::Identity::read(&p).ok();
+        self.document.file = file;
         self.document.metadata = Some(m);
         self.document.edit.replace(r);
         self.document.export = ex;
         self.document.edit.save_state_mut().saved();
-        self.status = status;
+        self.messages.settle(Topic::Save);
+        self.messages.note(status);
         if let (Some(l), Some(photo)) = (&self.library, self.document.catalog_photo) {
             self.document.lightroom_history = l
                 .session
-                .catalog
+                .catalog()
                 .lightroom_history(photo)
                 .unwrap_or_default();
-            self.document.snapshots.list = l.session.catalog.snapshots(photo).unwrap_or_default();
+            self.document.snapshots.list = l.session.catalog().snapshots(photo).unwrap_or_default();
             // The edit as the catalog stores it, read once: the Lightroom settings
             // applied below are the ones read with it.
-            let record = l.session.catalog.edit_record(photo);
-            let saved = record
-                .as_ref()
+            let start = l
+                .session
+                .catalog()
+                .edit_record(photo)
                 .map_err(|e| anyhow::anyhow!("{e:#}"))
-                .and_then(|r| r.saved(&p));
-            match saved {
-                Ok(Some(saved)) => {
-                    self.document.origin = super::state::EditOrigin::Saved;
+                .and_then(|r| crate::edits::Start::capture(&r, &p, self.raw_defaults.clone()));
+            match start {
+                Ok(crate::edits::Start::Saved(saved)) => {
+                    self.document.origin = crate::app::develop::state::EditOrigin::Saved;
                     self.document.edit.replace(saved.recipe);
                     self.document.export = saved.export;
-                    // A History that cannot be read leaves the edit as it is.
-                    if let Ok(Some(history)) = l.session.catalog.load_history(photo) {
-                        self.document.edit.restore_history(history);
-                    }
+                    // A stored History that cannot be read (a newer release's, or one
+                    // holding HDR states this release refuses) leaves the edit as it
+                    // is, but protected: saving would replace that History for good.
+                    let catalog = l.session.catalog();
+                    let unreadable = match catalog.load_history(photo) {
+                        Ok(Some(history)) => {
+                            self.document.edit.restore_history(history);
+                            None
+                        }
+                        Ok(None) => catalog
+                            .has_history(photo)
+                            .unwrap_or(true)
+                            .then(|| "Its History is from a newer RAWmakase".to_string()),
+                        Err(e) => Some(format!("{e:#}")),
+                    };
                     self.document.edit.save_state_mut().saved();
                     self.document.lightroom_notice.clear();
+                    if let Some(why) = unreadable {
+                        let why = format!("{why}; edit protected");
+                        self.document.edit.save_state_mut().protect(why.clone());
+                        self.document.lightroom_notice = why;
+                    }
                     // Masks made from a selection are read from the catalog now. One
                     // that cannot be leaves the edit and its History as they are, but
                     // protected: saving it would lose the mask for good.
@@ -571,21 +642,24 @@ impl Editor {
                         self.document.lightroom_notice = e.to_string();
                     }
                 }
-                Ok(None) => {
+                Ok(start) => {
                     self.document.export = ExportOptions::default();
                     self.document.edit.save_state_mut().saved();
                     self.document.lightroom_notice.clear();
                     // No RAWmakase edit yet: start from the Lightroom edit, as
-                    // Lightroom shows it, once camera profiles are known.
-                    self.document.pending_lightroom =
-                        record.ok().and_then(|r| r.lightroom().map(str::to_owned));
+                    // Lightroom shows it, once camera profiles are known. Without
+                    // one, the raw defaults the photo opened with stay.
+                    self.document.pending_lightroom = match start {
+                        crate::edits::Start::Lightroom(text) => Some(text),
+                        _ => None,
+                    };
                     if self.document.pending_lightroom.is_some() {
-                        self.document.origin = super::state::EditOrigin::Lightroom;
+                        self.document.origin = crate::app::develop::state::EditOrigin::Lightroom;
                     }
                 }
                 Err(e) => {
                     // Unreadable is not unedited: it must not follow the defaults.
-                    self.document.origin = super::state::EditOrigin::Saved;
+                    self.document.origin = crate::app::develop::state::EditOrigin::Saved;
                     self.document.edit.save_state_mut().protect(e.to_string());
                     self.document.lightroom_notice = e.to_string();
                 }
@@ -599,25 +673,53 @@ impl Editor {
     /// After a finished whole-photo render of the current edit, show it as
     /// the photo's Library and filmstrip thumbnail.
     /// Whether the viewport shows the catalog photo's edit as the library would.
-    pub(super) fn shows_library_edit(&self) -> bool {
+    pub(in crate::app) fn shows_library_edit(&self) -> bool {
         self.library.is_some()
             && self.document.catalog_photo.is_some()
             && self.document.path.is_some()
             && !self.view.zoom.on
             && !self.view.compare.shows_before()
-            && !self.view.is(super::state::Tool::Crop)
+            && !self.view.is(crate::app::develop::state::Tool::Crop)
             && self.presets.preview.is_none()
     }
-    fn refresh_library_thumbnail(&mut self, ctx: &egui::Context, small: image::RgbImage) {
-        if self.preview.mode != super::state::TextureMode::Whole || !self.shows_library_edit() {
+    /// A render made with a partial AI Denoise result is not the photo's thumbnail:
+    /// the final result's render will be.
+    fn refresh_library_thumbnail(
+        &mut self,
+        ctx: &egui::Context,
+        small: image::RgbImage,
+        ai: crate::app::develop::state::RenderedAi,
+    ) {
+        use crate::app::develop::state::RenderedAi;
+        use crate::app::library::PreviewAi;
+        if self.preview.mode != crate::app::develop::state::TextureMode::Whole
+            || !self.shows_library_edit()
+        {
             return;
         }
+        let shows = match ai {
+            _ if !self.document.edit.recipe().ai_denoise.renders() => PreviewAi::Off,
+            RenderedAi::None => PreviewAi::Plain,
+            RenderedAi::Complete => PreviewAi::Finished,
+            RenderedAi::Partial => return,
+        };
         let Ok(json) = serde_json::to_string(self.document.edit.recipe()) else {
             return;
         };
         let (Some(library), Some(id)) = (&mut self.library, self.document.catalog_photo) else {
             return;
         };
-        library.update_edited(ctx, id, small, json);
+        library.update_edited(
+            ctx,
+            id,
+            self.document.image_file.as_ref(),
+            shows,
+            small,
+            json,
+        );
     }
 }
+
+#[cfg(test)]
+#[path = "events_editor_tests.rs"]
+mod editor_tests;

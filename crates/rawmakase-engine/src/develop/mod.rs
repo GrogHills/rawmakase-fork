@@ -1,4 +1,5 @@
 //! Headless RAW development: recipes, geometry, color and detail rendering.
+pub mod ai_denoise;
 mod auto;
 mod basic_tone;
 mod basic_tone_data;
@@ -14,10 +15,12 @@ mod crop_constraint;
 // Develop code names the curve primitives as `develop::curve`, where they began.
 use crate::color::curve;
 pub mod effects;
+mod export_image;
 mod geometry;
 pub mod gpu;
 pub mod guided;
 mod image_space;
+mod laplacian;
 mod local_tone;
 mod local_tone_data;
 mod local_tone_rule;
@@ -33,9 +36,13 @@ mod pyramid;
 mod shadow_context;
 mod shadow_context_data;
 pub mod sharpening;
+mod slots;
 pub mod targeted;
 pub mod texture;
+mod tone_lut;
 pub mod upright;
+pub use ai_denoise::AiSource;
+pub use export_image::ExportImage;
 pub use preview_renderer::{PreviewRenderer, render_fitted};
 pub mod quality;
 mod recipe;
@@ -46,13 +53,13 @@ mod scene_tone;
 mod stage_cache;
 
 pub use crate::color::{mul, srgb_encode};
-pub use auto::{
-    AutoTone, Measures, auto_tone, auto_tone_basis, auto_tone_cancellable, auto_white_balance,
-    auto_white_balance_cancellable,
-};
+pub use auto::{AutoTone, Measures, auto_tone, auto_tone_basis, auto_white_balance};
 pub use black_white::{AutoMix, ColorSpread};
 pub use geometry::{Geometry, rendered_crop};
 pub use image_space::ViewMapping;
 pub use orientation::{Mirror, QuarterTurn, mirror, turn};
 pub(crate) use pipeline::{Camera, camera_stage, render_base};
-pub use pipeline::{neutral_pick, pick_fringe, preview, render, render_cancellable, render_region};
+pub use pipeline::{
+    neutral_pick, pick_fringe, preview, render, render_export, render_region, render_with_ai,
+};
+pub use quality::render_hdr;

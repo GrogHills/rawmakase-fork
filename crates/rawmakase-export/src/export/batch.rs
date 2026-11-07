@@ -14,14 +14,12 @@ use crate::{
     raw_defaults::DevelopDefaults,
 };
 use anyhow::{Context, Result, bail, ensure};
+use rawmakase_cancel::Cancel;
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 /// One photo of a batch, as it was when Export was pressed.
@@ -127,12 +125,16 @@ pub enum Unplanned {
     NoFolder,
     /// Ask what to do: these files exist. Plan again with the answer.
     Conflicts(Vec<PathBuf>),
+    /// The settings can't be exported as they are (the reason): a colour space the
+    /// format can't hold, or one only a later release knows.
+    Settings(String),
 }
 impl std::fmt::Display for Unplanned {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Unplanned::NoFolder => f.write_str("Choose a folder to export to"),
             Unplanned::Conflicts(files) => write!(f, "{} files already exist", files.len()),
+            Unplanned::Settings(reason) => f.write_str(reason),
         }
     }
 }
@@ -235,6 +237,10 @@ pub fn plan(
     settings: &ExportSettings,
     answer: Option<Existing>,
 ) -> Result<Plan, Unplanned> {
+    // Nothing is planned, asked or rendered for settings no photo could export with.
+    settings
+        .check_output()
+        .map_err(|e| Unplanned::Settings(format!("{e:#}")))?;
     // Numbered in the order the photos were chosen, so a photo that fails or is
     // skipped keeps its number and the others theirs.
     let total = photos.len();
@@ -355,6 +361,8 @@ pub struct Batch {
     pub demosaic: crate::camera_data::Demosaic,
     /// Where each full-size decode is looked up first.
     pub cache: crate::decode_cache::DecodeCache,
+    /// Where AI Denoise sources come from.
+    pub ai: crate::ai_denoise::AiService,
 }
 
 /// How far a batch is: `done` photos of `total`, and how far the current one is.
@@ -369,7 +377,7 @@ pub struct Progress {
 /// photo's outcome. Cancel stops between stages: a cancel observed before a file
 /// is committed discards it; a commit already under way may finish, and that photo
 /// counts as exported.
-pub fn run(batch: &Batch, cancel: &AtomicBool, progress: impl Fn(Progress)) -> Vec<Outcome> {
+pub fn run(batch: &Batch, cancel: Cancel<'_>, progress: impl Fn(Progress)) -> Vec<Outcome> {
     let total = batch.photos.len();
     // A preset's image or font, read once: every photo gets the same watermark,
     // however long the batch runs. The Simple Copyright Watermark takes each
@@ -383,7 +391,7 @@ pub fn run(batch: &Batch, cancel: &AtomicBool, progress: impl Fn(Progress)) -> V
     let mut reserved = batch.plan.reserved.clone();
     let mut outcomes = Vec::with_capacity(total);
     for (done, (photo, planned)) in batch.photos.iter().zip(&batch.plan.entries).enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             outcomes.push(Outcome::NotStarted);
             continue;
         }
@@ -443,7 +451,7 @@ fn export(
     planned: &Planned,
     preset: Option<&crate::watermark::Ready>,
     reserved: &mut Reservations,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
     progress: &impl Fn(f32),
 ) -> Outcome {
     let result = (|| -> Result<(PathBuf, Vec<String>), Stop> {
@@ -452,7 +460,7 @@ fn export(
         if let Some(parent) = planned.target.parent() {
             std::fs::create_dir_all(parent).map_err(anyhow::Error::from)?;
         }
-        let staged = super::stage(
+        let staged = super::stage_pixels(
             &planned.target,
             &prepared.rendered,
             &prepared.metadata,
@@ -476,7 +484,7 @@ fn export(
         Ok((path, notes)) => Outcome::Exported { path, notes },
         Err(Stop::Skipped(reason)) => Outcome::Skipped(reason),
         // Whatever stopped it, a cancel seen is a cancel, not a failure.
-        Err(_) if cancel.load(Ordering::Relaxed) => Outcome::Cancelled,
+        Err(_) if cancel.is_cancelled() => Outcome::Cancelled,
         Err(Stop::Cancelled) => Outcome::Cancelled,
         Err(Stop::Failed(e)) => Outcome::Failed(format!("{e:#}")),
     }
@@ -487,14 +495,22 @@ fn render(
     batch: &Batch,
     photo: &BatchPhoto,
     preset: Option<&crate::watermark::Ready>,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
     progress: &impl Fn(f32),
 ) -> Result<(job::Prepared, Vec<String>)> {
+    // The file as it is before it is decoded: AI Denoise's result must be of the same.
+    let file = crate::storage::Identity::read(&photo.source).ok();
     let opened = crate::photo::open_source(&photo.source, cancel)
         .with_context(|| format!("{} can't be read", photo.source.display()))?;
     let (mut recipe, mut notes) = match &photo.edit {
         Edit::Catalog(record) => {
             let (profiles, _) = crate::camera_profiles::installed(opened.metadata());
+            let profiles = rawmakase_decode::camera_look::with_default(
+                &photo.source,
+                opened.metadata(),
+                profiles,
+                cancel,
+            );
             let resolved = edits::resolve(
                 record,
                 &photo.source,
@@ -519,7 +535,7 @@ fn render(
         } => {
             if let Some(file) = file {
                 ensure!(
-                    crate::storage::Identity::read(&photo.source)? == *file,
+                    crate::storage::Identity::read(&photo.source)?.same_photo(file),
                     "the photo's file changed since it was shown; open it again to export it"
                 );
             }
@@ -532,7 +548,7 @@ fn render(
             )
         }
     };
-    ensure!(!cancel.load(Ordering::Relaxed), "Cancelled");
+    ensure!(!cancel.is_cancelled(), "Cancelled");
     let image = Arc::new(match opened {
         Opened::Raw(raw) => {
             job::decode_full(raw, &photo.source, batch.demosaic, &batch.cache, cancel)?
@@ -546,6 +562,9 @@ fn render(
     {
         notes.push(issue.message().into());
     }
+    if preset.is_some() && batch.settings.hdr.is_some() {
+        anyhow::bail!("Watermarks are not supported in HDR exports yet");
+    }
     let mut prepared = job::prepare(
         &job::Photo {
             image,
@@ -555,15 +574,20 @@ fn render(
             watermark: batch.watermark.clone().filter(|_| preset.is_none()),
             demosaic: batch.demosaic,
             cache: batch.cache.clone(),
+            ai: batch.ai.clone(),
+            file,
         },
         &batch.settings,
         cancel,
         &|p| progress(p * 0.9),
     )?;
-    if let Some(preset) = preset
-        && !preset.apply(&mut prepared.rendered)
-    {
-        notes.push("the watermark's text has no characters its font can draw".into());
+    if let Some(preset) = preset {
+        let super::Pixels::Sdr(rendered) = &mut prepared.rendered else {
+            anyhow::bail!("Watermarks are not supported in HDR exports yet");
+        };
+        if !preset.apply(rendered) {
+            notes.push("the watermark's text has no characters its font can draw".into());
+        }
     }
     notes.extend(prepared.notice.clone());
     Ok((prepared, notes))
@@ -577,10 +601,10 @@ fn commit(
     planned: &Planned,
     late: Existing,
     reserved: &mut Reservations,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<(PathBuf, Option<String>), Stop> {
     // The last moment to stop: dropping the staged file leaves nothing behind.
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return Err(Stop::Cancelled);
     }
     let mut target = planned.target.clone();

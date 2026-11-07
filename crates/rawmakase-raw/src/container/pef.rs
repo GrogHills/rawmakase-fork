@@ -14,12 +14,15 @@ use crate::io::{Bytes, Order};
 use crate::sensor::Sensor;
 use crate::variant::{Plan, Variant};
 use crate::vendor::pentax;
-use std::sync::atomic::AtomicBool;
+use rawmakase_cancel::Cancel;
 
 /// Where a PEF's sensor data is and how it is coded, and its levels.
 #[derive(Clone, Debug)]
 pub(crate) struct PefPlan {
     pub offset: u64,
+    /// The bytes IFD0's strips hold (`StripByteCounts`); 0 when the file
+    /// doesn't say.
+    pub length: u64,
     pub width: u32,
     pub height: u32,
     pub bits: u32,
@@ -117,6 +120,12 @@ pub(crate) fn open(t: TiffFile) -> Result<RawInfo> {
         info.frame = crate::geometry::even(crop);
     }
     let size = [width, height];
+    // A body whose note's crop is not where its JPEGs are.
+    if let Some(frame) =
+        crate::facts::camera(&info.make, &info.model, false, size).find_map(|c| c.frame)
+    {
+        info.frame = frame;
+    }
     // Rows for files of this bit depth, or any.
     let rows = || {
         crate::facts::camera(&info.make, &info.model, false, size)
@@ -139,6 +148,7 @@ pub(crate) fn open(t: TiffFile) -> Result<RawInfo> {
         .unwrap_or(full);
     info.plan = Plan::Pef(PefPlan {
         offset: t.base + u64::from(offset),
+        length: bytes,
         width,
         height,
         bits,
@@ -170,7 +180,7 @@ pub(crate) fn decode(
     info: &RawInfo,
     plan: &PefPlan,
     bytes: &[u8],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Sensor> {
     let (width, height) = (plan.width as usize, plan.height as usize);
     let mut data = crate::io::zeroed(crate::io::samples(plan.width, plan.height, 1)?)?;
@@ -185,7 +195,11 @@ pub(crate) fn decode(
                 .as_ref()
                 .ok_or_else(|| corrupt("PEF without its Huffman table"))?;
             let codes = crate::codec::pentax::Codes::from_note(table, *order)?;
-            crate::codec::pentax::decode(src, &codes, width, height, &mut data, cancel)?;
+            // Pixel-shift files keep three more frames after the first, and
+            // every PEF its full-size JPEG: the strip's length bounds the
+            // stream's parallel decoding (#725).
+            let strip = usize::try_from(plan.length).ok().filter(|&n| n > 0);
+            crate::codec::pentax::decode(src, strip, &codes, width, height, &mut data, cancel)?;
         }
         Variant::PefPacked => {
             let p = Packing::msb(plan.bits);
@@ -214,9 +228,10 @@ pub(crate) fn decode(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::container::test_tiff::{E, ascii, dir, long, offsets, point, short, shorts, tiff};
+    use std::sync::atomic::AtomicBool;
 
     const LE: Order = Order::Little;
 
@@ -231,7 +246,7 @@ mod tests {
     }
 
     /// A new-style note (`PENTAX \0II`, offsets from its start) of `entries`.
-    fn note(entries: Vec<E>) -> Vec<u8> {
+    pub(crate) fn note(entries: Vec<E>) -> Vec<u8> {
         let mut out = b"PENTAX \0II".to_vec();
         out.extend(dir(&entries, 10, LE));
         out
@@ -239,7 +254,7 @@ mod tests {
 
     /// A little-endian PEF by `make` and `model` of `width × height` coded `bps` bits with
     /// `compression`, its data `strip`, IFD0 entries `more` and a note.
-    fn pef(
+    pub(crate) fn pef(
         [make, model]: [&str; 2],
         [width, height, bps, compression]: [u32; 4],
         strip: &[u8],
@@ -271,7 +286,7 @@ mod tests {
 
     fn decode(file: &[u8]) -> Result<(RawInfo, Sensor)> {
         let info = crate::open(file)?;
-        let sensor = crate::decode(&info, file, &AtomicBool::new(false))?;
+        let sensor = crate::decode(&info, file, Cancel::NEVER)?;
         Ok((info, sensor))
     }
 
@@ -453,7 +468,7 @@ mod tests {
             let info = crate::open(&file).unwrap();
             let cancelled = AtomicBool::new(true);
             assert_eq!(
-                crate::decode(&info, &file, &cancelled).unwrap_err(),
+                crate::decode(&info, &file, Cancel::new(&cancelled)).unwrap_err(),
                 Error::Cancelled
             );
             for end in (0..file.len()).step_by(3) {

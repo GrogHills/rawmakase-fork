@@ -48,13 +48,13 @@ use super::tree_copy::{Entry, walk};
 use super::{
     BatchId, FileOpError, Plan, Summary, Trash, TrashError, TrashReceipt, TrashSupport, TreeCounts,
 };
-use crate::storage::fsops::{EntryKind, FileId, VolumeKind};
+use crate::fsops::{EntryKind, FileId, VolumeKind};
 use anyhow::{Context, Result};
+use rawmakase_cancel::Cancel;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What a folder Trash item journals (as its `preconditions`). Every field
 /// added later must default when absent, so this release's journal reads
@@ -351,7 +351,7 @@ impl TrashTreeState {
     /// resolves elsewhere, a folder in it has a location of its own,
     /// something else of the catalog is inside it, or a family in it
     /// changed. `None` when everything holds.
-    pub fn check(&self, db: &impl Reads, computer: &str) -> Result<Option<String>> {
+    pub(super) fn check(&self, db: &impl Reads, computer: &str) -> Result<Option<String>> {
         if super::tree::subtree(db, self.root, &self.from)? != self.folders {
             return Ok(Some(CHANGED.into()));
         }
@@ -496,9 +496,9 @@ pub(super) fn run(
     catalog: &mut Catalog,
     planned: &TrashTree,
     involved: bool,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<()> {
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return Ok(());
     }
     let state = &planned.state;
@@ -545,14 +545,14 @@ pub(super) fn run(
     };
     let item = journal::item(&catalog.db, id)?.context("the journalled item is gone")?;
     // b. Exactly as planned, right before the Trash.
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return set(catalog, ItemState::NoChange, "Stopped.");
     }
     if let Some(why) = changed(cx.disk, planned, &item) {
         return set(catalog, ItemState::NoChange, &why);
     }
     // The walk takes no Stop: asked again once it is done.
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return set(catalog, ItemState::NoChange, "Stopped.");
     }
     // c. One Trash call, by its name as used, or the other spelling of the
@@ -786,7 +786,7 @@ enum Found {
 }
 
 impl ReceiptSeen {
-    pub fn of(disk: &dyn Disk, item: &Item) -> Self {
+    pub(super) fn of(disk: &dyn Disk, item: &Item) -> Self {
         let Some(at) = item.members.first().and_then(|m| m.receipt.clone()) else {
             return Self {
                 at: None,

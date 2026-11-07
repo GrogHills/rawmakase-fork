@@ -147,6 +147,7 @@ mod scenarios {
     use crate::storage::{ChecksumRead, FileChecksum};
     use crate::{export_settings::ExportOptions, model::recipe::Recipe};
     use anyhow::Result;
+    use rawmakase_cancel::Cancel;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
@@ -233,7 +234,7 @@ mod scenarios {
         }
         fn plan_with(&self, scope: SyncScope, online: &dyn Fn(&Path) -> bool) -> Result<SyncPlan> {
             let inputs = self.cat.sync_inputs(scope)?;
-            scan(&inputs, online, &AtomicBool::new(false), &|_| {})
+            scan(&inputs, online, Cancel::NEVER, &|_| {})
         }
         fn apply(&mut self, plan: &SyncPlan, accepted: &Accepted) -> Result<Applied> {
             self.cat
@@ -248,6 +249,7 @@ mod scenarios {
             self.cat.save_edit(
                 id,
                 &path,
+                &crate::storage::Identity::read(&path)?,
                 &recipe,
                 &ExportOptions::default(),
                 crate::catalog::HistoryUpdate::Keep,
@@ -265,6 +267,30 @@ mod scenarios {
             .open(to)?
             .set_modified(later)?;
         std::fs::remove_file(from)?;
+        Ok(())
+    }
+
+    #[test]
+    fn synchronized_photos_keep_the_name_and_size_they_were_added_with() -> Result<()> {
+        let mut f = fixture()?;
+        let new = f.root.join("Lisbon/IMG_2000.dng");
+        std::fs::write(&new, b"synthetic raw, synchronized")?;
+        let plan = f.plan(SyncScope::All)?;
+        let applied = f.apply(&plan, &plan.default_accepted())?;
+        assert_eq!(applied.added, 1);
+        let id = f.id("IMG_2000.dng");
+        assert_eq!(
+            f.cat.import_facts(id)?,
+            Some(("IMG_2000.dng".into(), None, Some(27), false))
+        );
+        // Renamed outside RAWmakase and found again: still the name it had.
+        let old = f.id("IMG_1001.dng");
+        let to = f.root.join("Lisbon/keep-01.dng");
+        copy_then_delete(&f.root.join("Lisbon/IMG_1001.dng"), &to)?;
+        let plan = f.plan(SyncScope::All)?;
+        f.apply(&plan, &plan.default_accepted())?;
+        assert_eq!(f.path_of(old), to);
+        assert_eq!(f.cat.import_facts(old)?.unwrap().0, "IMG_1001.dng");
         Ok(())
     }
 
@@ -415,8 +441,9 @@ mod scenarios {
         };
         f.apply(&plan, &accepted)?;
         assert_eq!(f.path_of(id), to);
-        // Not verified: the edit stays bound to the file it was saved for.
-        assert!(f.cat.load_edit(id, &to).is_err());
+        // Not verified, but the same photo (`Identity::same_photo`): its edit
+        // still applies, whatever the copy's modification time.
+        assert!(f.cat.load_edit(id, &to)?.is_some());
         Ok(())
     }
 
@@ -425,14 +452,12 @@ mod scenarios {
         let mut f = fixture()?;
         let id = f.id("IMG_1001.dng");
         f.edit(id)?;
-        // The file changed after the edit was saved; the checksum is of the
-        // new version.
+        // The file's bytes changed after the edit was saved; the checksum is
+        // of the new version.
         let from = f.root.join("Lisbon/IMG_1001.dng");
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
-        std::fs::File::options()
-            .write(true)
-            .open(&from)?
-            .set_modified(later)?;
+        let mut bytes = std::fs::read(&from)?;
+        bytes[16] ^= 0xff;
+        std::fs::write(&from, bytes)?;
         f.checksum_all()?;
         let to = f.root.join("Lisbon/moved.dng");
         copy_then_delete(&from, &to)?;
@@ -801,7 +826,7 @@ mod scenarios {
         std::fs::write(f.root.join("Lisbon/new.dng"), bytes(81))?;
         let inputs = f.cat.sync_inputs(SyncScope::All)?;
         let cancel = AtomicBool::new(false);
-        let stopped = scan(&inputs, &|_| true, &cancel, &|_| {
+        let stopped = scan(&inputs, &|_| true, Cancel::new(&cancel), &|_| {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed)
         });
         assert!(stopped.is_err());

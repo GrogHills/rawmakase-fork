@@ -53,33 +53,77 @@ pub fn cache_dir() -> PathBuf {
         .unwrap_or_else(|| home.join(".cache/rawmakase"))
 }
 
+/// The running executable's size and modification time: what a cache entry made
+/// by this build is keyed by, so another build never reads it.
+pub fn build_identity() -> String {
+    std::env::current_exe()
+        .and_then(fs::metadata)
+        .map(|m| {
+            let modified = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            format!("{}-{modified}", m.len())
+        })
+        .unwrap_or_default()
+}
+
+/// The key of a result this build made from file version `id`: the file's identity
+/// ([`Identity::key`](crate::storage::Identity::key)), then `own`, what the cache's
+/// result depends on beyond the file (a decode's demosaic, AI Denoise's model,
+/// assembly and provider, a Camera Look fit's version), then [`build_identity`].
+/// Each cache keeps its own part and reads the file's identity once, when its job
+/// is captured; Library previews keep their cheap stamps instead.
+pub fn source_key(id: &crate::storage::Identity, own: impl std::fmt::Display) -> String {
+    format!("{}-{own}-{}", id.key(), build_identity())
+}
+
 #[derive(Clone, Debug)]
 pub struct DecodeCache {
     dir: Arc<RwLock<Dir>>,
     limit: Arc<AtomicU64>,
 }
+/// Where one kind of cache entry lives: its subfolder of the default directory and of a
+/// chosen folder, and its file extension. Decoded images and AI Denoise results each
+/// have their own, so relocating, purging or trimming one never touches the other's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Namespace {
+    pub default: &'static str,
+    pub chosen: &'static str,
+    pub extension: &'static str,
+}
+/// Decoded images.
+pub(crate) const DECODED: Namespace = Namespace {
+    default: "decoded",
+    chosen: CHOSEN_SUBFOLDER,
+    extension: "decoded",
+};
 #[derive(Clone, Debug, PartialEq)]
-struct Dir {
-    path: PathBuf,
+pub(crate) struct Dir {
+    pub path: PathBuf,
     /// The folder the user chose, if any. Its subfolder is created only while
     /// it exists, so an unplugged drive's mount point is never recreated on
     /// the system disk; the default directory is created with its parents.
-    chosen: Option<PathBuf>,
+    pub chosen: Option<PathBuf>,
 }
 impl Dir {
     fn of(folder: Option<&Path>) -> Self {
+        Self::of_in(DECODED, folder)
+    }
+    pub(crate) fn of_in(namespace: Namespace, folder: Option<&Path>) -> Self {
         match folder {
             None => Self {
-                path: cache_dir().join("decoded"),
+                path: cache_dir().join(namespace.default),
                 chosen: None,
             },
             Some(folder) => Self {
-                path: folder.join(CHOSEN_SUBFOLDER),
+                path: folder.join(namespace.chosen),
                 chosen: Some(folder.to_path_buf()),
             },
         }
     }
-    fn create(&self) -> std::io::Result<()> {
+    pub(crate) fn create(&self) -> std::io::Result<()> {
         if self.chosen.is_none() {
             return fs::create_dir_all(&self.path);
         }
@@ -146,12 +190,12 @@ impl DecodeCache {
         if previous == self.dir() {
             return Ok(0);
         }
-        Ok(purge(&previous))
+        Ok(purge(&previous, DECODED.extension))
     }
     /// Removes every entry, and nothing else in the directory. Returns how
     /// many were removed.
     pub fn purge(&self) -> usize {
-        purge(&self.dir())
+        purge(&self.dir(), DECODED.extension)
     }
     /// The size cap in bytes, shared with clones used by existing workers.
     pub fn limit(&self) -> u64 {
@@ -164,22 +208,14 @@ impl DecodeCache {
     }
     /// The key of `path` as the current build develops it at full size with `demosaic`.
     pub fn key(path: &Path, demosaic: Demosaic) -> Result<String> {
-        let id = crate::storage::Identity::read(path)?;
-        let exe = std::env::current_exe()
-            .and_then(fs::metadata)
-            .map(|m| {
-                let modified = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_nanos());
-                format!("{}-{modified}", m.len())
-            })
-            .unwrap_or_default();
-        Ok(format!(
-            "{}-{}-{}-{:?}-{exe}",
-            id.prefix_hash, id.size, id.modified_ns, demosaic
+        Ok(Self::key_of(
+            &crate::storage::Identity::read(path)?,
+            demosaic,
         ))
+    }
+    /// The key of the file version `id`, as [`key`](Self::key) names it.
+    pub fn key_of(id: &crate::storage::Identity, demosaic: Demosaic) -> String {
+        source_key(id, format_args!("{demosaic:?}"))
     }
     fn file(&self, key: &str) -> PathBuf {
         file_in(&self.dir(), key)
@@ -233,15 +269,22 @@ impl DecodeCache {
             start + n * 12,
             bytemuck::cast_slice_mut(&mut changes),
         )?;
+        // Like a decode of the file, the loaded image measures its own Auto CA
+        // rather than sharing one measured on the image `metadata` came from.
+        let metadata = Metadata {
+            lateral_ca: Default::default(),
+            ..metadata.clone()
+        };
         let image = CameraImage {
             recovered: Default::default(),
             width: header.width,
             height: header.height,
             pixels,
-            metadata: metadata.clone(),
+            metadata,
             fast: header.fast,
             scale_factor: header.scale_factor,
             scale_clipped: header.scale_clipped,
+            hdr: Default::default(),
         };
         let mut recovered = CameraImage {
             recovered: Default::default(),
@@ -252,6 +295,7 @@ impl DecodeCache {
             fast: image.fast,
             scale_factor: image.scale_factor,
             scale_clipped: image.scale_clipped,
+            hdr: Default::default(),
         };
         recovered
             .pixels
@@ -272,6 +316,12 @@ impl DecodeCache {
     /// trims the directory to the size cap. Written to a temporary file and renamed,
     /// so a concurrent reader never sees a partial entry.
     pub fn store(&self, key: &str, image: &CameraImage) -> Result<()> {
+        // RAWs only: a rendered file opens fast enough, and an HDR file's light isn't
+        // in the cache's format (docs/records/hdr-stage4-design.md).
+        ensure!(
+            !image.metadata.is_rendered(),
+            "The decode cache keeps RAWs only"
+        );
         let recovered = image.recovered.get().context("Image not recovered")?;
         ensure!(
             recovered.pixels.len() == image.pixels.len(),
@@ -321,45 +371,53 @@ impl DecodeCache {
     }
     /// Removes the least recently used entries until `dir` fits the cap.
     fn trim(&self, dir: &Path) -> Result<()> {
-        let mut entries: Vec<(SystemTime, u64, PathBuf)> = fs::read_dir(dir)?
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let path = e.path();
-                (path.extension()? == "decoded").then_some(())?;
-                let m = e.metadata().ok()?;
-                Some((m.modified().ok()?, m.len(), path))
-            })
-            .collect();
-        let mut total: u64 = entries.iter().map(|e| e.1).sum();
-        entries.sort();
-        let limit = self.limit();
-        for (_, size, path) in entries {
-            if total <= limit {
-                break;
-            }
-            if fs::remove_file(&path).is_ok() {
-                total -= size;
-            }
-        }
-        Ok(())
+        trim(dir, DECODED.extension, self.limit())
     }
 }
-fn file_in(dir: &Path, key: &str) -> PathBuf {
-    let hash = crate::storage::fnv1a(crate::storage::FNV_OFFSET, key.as_bytes());
-    dir.join(format!("{hash:016x}.decoded"))
+/// Removes the least recently used `extension` entries of `dir` until they fit `limit`.
+pub(crate) fn trim(dir: &Path, extension: &str, limit: u64) -> Result<()> {
+    let mut entries: Vec<(SystemTime, u64, PathBuf)> = fs::read_dir(dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let path = e.path();
+            (path.extension()? == extension).then_some(())?;
+            let m = e.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), path))
+        })
+        .collect();
+    let mut total: u64 = entries.iter().map(|e| e.1).sum();
+    entries.sort();
+    for (_, size, path) in entries {
+        if total <= limit {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total -= size;
+        }
+    }
+    Ok(())
 }
-fn purge(dir: &Path) -> usize {
+fn file_in(dir: &Path, key: &str) -> PathBuf {
+    entry_in(dir, key, DECODED.extension)
+}
+/// The file of `key` in `dir`.
+pub(crate) fn entry_in(dir: &Path, key: &str, extension: &str) -> PathBuf {
+    let hash = crate::storage::fnv1a(crate::storage::FNV_OFFSET, key.as_bytes());
+    dir.join(format!("{hash:016x}.{extension}"))
+}
+/// Removes every `extension` entry of `dir`, and nothing else. Returns how many.
+pub(crate) fn purge(dir: &Path, extension: &str) -> usize {
     fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "decoded"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == extension))
         .filter(|e| fs::remove_file(e.path()).is_ok())
         .count()
 }
 /// Fills `buf` from `offset`, in parallel chunks: one reader leaves most of an SSD's
 /// bandwidth unused on a 700 MB image.
-fn read_at(file: &fs::File, offset: u64, buf: &mut [u8]) -> Result<()> {
+pub(crate) fn read_at(file: &fs::File, offset: u64, buf: &mut [u8]) -> Result<()> {
     const CHUNK: usize = 16 << 20;
     buf.par_chunks_mut(CHUNK)
         .enumerate()
@@ -401,9 +459,31 @@ unsafe impl bytemuck::Pod for Change {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A decode is filed under the file's identity, the demosaic and the build, in
+    /// the form the entries already on disk have.
+    #[test]
+    fn a_decode_key_keeps_its_form() {
+        let id = crate::storage::Identity {
+            size: 12,
+            modified_ns: 34,
+            prefix_hash: "ab".into(),
+        };
+        assert_eq!(
+            DecodeCache::key_of(&id, Demosaic::Rawmakase),
+            format!("ab-12-34-Rawmakase-{}", build_identity())
+        );
+    }
     #[test]
     fn changed_limit_reaches_existing_workers_and_controls_eviction() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        let mut rendered = image(4, 3, 0.2);
+        rendered.metadata.source = rawmakase_model::camera_data::Source::Rendered;
+        assert!(
+            DecodeCache::new(dir.path().join("rendered"), u64::MAX)
+                .store("r", &rendered)
+                .is_err(),
+            "the decode cache keeps RAWs only"
+        );
         let cache = DecodeCache::new(dir.path().to_path_buf(), 1);
         let worker = cache.clone();
         cache.set_limit(1 << 20);
@@ -483,6 +563,7 @@ mod tests {
             fast: false,
             scale_factor: 1.5,
             scale_clipped: 7,
+            hdr: Default::default(),
         };
         let mut recovered = im.clone();
         recovered.pixels[3] = [2., 3., 4.];

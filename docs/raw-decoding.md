@@ -13,7 +13,7 @@ add a camera or a variant.
 
 - `crates/rawmakase-tiff` reads TIFF directories (bounded, no RAW knowledge);
   the model's DNG reader and `rawmakase-raw` use it.
-- `crates/rawmakase-raw` depends only on `rawmakase-tiff` and pure-Rust
+- `crates/rawmakase-raw` depends only on `rawmakase-tiff`, `rawmakase-cancel` and pure-Rust
   crates (Deflate, JPEG XL through jxl-oxide, rayon, the TOML tables' parser). It has no unsafe code (`#![forbid(unsafe_code)]`), no build script,
   and never panics on malformed input; every allocation is checked against
   header limits (`io::samples`). Metadata records are read in place or up to
@@ -77,6 +77,20 @@ property list, which the SD9 and SD10 write instead. It is none when a section
 holding them can't be read, so what a file still being copied hides is read
 again later, and only the properties asked for are decoded.
 
+`preview_from_file(file, edge)` reads a RAW's preview for a thumbnail `edge`
+pixels on its long side without the rest of the file, for Library thumbnails
+on network volumes. Unlike the reads above, it gives the existing readers a
+buffer the file's size, filled only where read: the file's start and end, each
+preview candidate's start up to its JPEG frame header, at which the file is
+opened again (NEF's reader sizes its previews from their frames), then the
+preview chosen. A reader can't tell zeros not read from the file's own, so
+it is used only for the variants whose previews read this way matched the
+whole-file ones (`partial::checked`), and a preview smaller than `edge` is
+none. In either case, and whenever a part needed isn't found, the caller
+reads the whole file.
+The ignored test `real_files_give_the_same_preview_read_in_pieces` compares
+the two reads on a folder of RAWs; it is how a variant is added.
+
 Modules, each with a small `pub(crate)` surface:
 
 | Module | Owns |
@@ -84,6 +98,7 @@ Modules, each with a small `pub(crate)` surface:
 | `io` | Bounded byte reads, in memory or in pieces of the file, and the allocation limits |
 | `exif_tiffs` | Where a CR3, MRW or X3F keeps its camera's EXIF, read from the file's pieces (`exif_tiffs`) |
 | `captured` | Capture dates read from a file's pieces, by container (`capture_dates`) |
+| `partial` | A thumbnail's embedded preview read in pieces, for the variants checked against whole-file reads (`preview_from_file`) |
 | `codec/` | Decoders from bytes to samples, knowing no container or camera: bit pumps, JPEG Huffman codes, the parallel decoding of one stream of prefix codes (`speculative`), lossless JPEG, DNG's JPEG XL tiles, Nikon's Huffman-coded data and small RAWs, Nikon High Efficiency (JPEG XS), Panasonic's blocks and strips, Sony's codings, Fujifilm's compressed stripes, Canon's CRX, Olympus's coding, packed samples, Pentax's Huffman-coded differences, Samsung's codings, Canon's CRW blocks, Phase One's IIQ rows, Hasselblad's pairs |
 | `container/` | Probing and structure per container family: where the sensor data, previews and maker notes are (`tiff`, `dng`, `nef`, `rw2`, `arw`, `raf`, `cr3`, `orf`, `pef`, `srw`, `erf`, `cr2`, `headerless`, `ciff`, `iiq`, `fff`, `mos`, `sti`, `brcm`, `mrw`, `dcs`, `kdc`; `x3f` for its EXIF, capture dates and property list alone) |
 | `vendor/` | Per-maker rules: what a maker's own tags and maker notes mean (white balance, presets, lens, crops, levels) and their decryption (`nikon`, `panasonic`, `sony`, `fujifilm`, `canon_cr3`, `olympus`, `pentax`, `samsung`, `epson`, `canon`, `phase_one`, `hasselblad`, `leaf`) |
@@ -260,7 +275,8 @@ rounded inward to even rows and columns.
 DNG lens IDs come from the maker note DNGPrivateData keeps: Pentax's and
 Samsung's Pentax bodies' own ("PENTAX \0", `vendor::pentax`: LensType's
 series × 256 + number, as Adobe's aux:LensID "4 28" is 1052), or Nikon's in
-Adobe's "MakN" record (`vendor::nikon`, read as a NEF's note).
+Adobe's "MakN" record (`vendor::nikon`, read as a NEF's note), with its Lens
+tag (0x0084: focal range and maximum apertures, `RawInfo::lens_info`).
 
 A DNG whose white balance is AsShotWhiteXY (no AsShotNeutral) has the
 white's camera neutral: AnalogBalance × CameraCalibration × ColorMatrix,
@@ -309,6 +325,12 @@ whose files RAWmakase has always read with other areas have
 
 Sony (from our own measurements unless said otherwise):
 
+- The default crop is SonyCropTopLeft and SonyCropSize. Along a side the crop
+  does not cut (its length is DefaultCropSize's), DefaultCropOrigin places it:
+  the a7R III's and a7R IV's own tag starts at column 0, 8 and 32 columns left of
+  their JPEGs and Camera Raw's frame. A crop running past the table's visible
+  area (crop modes of the a7 III and a7 IV) grows the area to as much past the
+  crop as before it.
 - An ARW2 code `c` is the point `2c` on Sony's 12-bit tone curve, whose slope
   starts at 1 and doubles at each SonyToneCurve threshold (in quarters).
 - The SR2SubIFD (white balance as shot and its presets, levels) is encrypted.
@@ -806,7 +828,10 @@ on even rows and columns, in sensor coordinates) come from the maker note
 decoder source consulted, and verified by an exact match with LibRaw's output
 on every PEF of our dataset);
 Pentax DNGs' lens ID and ISO from the same note in DNGPrivateData. Samsung's
-GX PEFs read the note too, but not its crop. White is the camera table's
+GX PEFs read the note too, but not its crop. The K-3 Mark III's, K-70's and
+KF's note crop is not where their JPEGs are: their frames are `measured` rows,
+aligned with those JPEGs (Camera Raw frames the K-3 Mark III and KF the same
+way). White is the camera table's
 where Adobe DNG Converter's WhiteLevel is not the file's (a fixed 16315 on
 most 14-bit bodies, where WhiteLevel 0x007E reads a few codes higher), else
 WhiteLevel, else the data's full range: the 645D, 645Z, K-5 II, K-5 II s,
@@ -904,6 +929,15 @@ LibRaw gives it: the camera's colours pass through unconverted.
 Known: a DNG without a D65 matrix is read with its ColorMatrix1, which for
 GoPro's GPRs (illuminants Standard A and D50) and Leica's Q and SL DNGs is
 the tungsten one, not the D50 one Camera Raw would use at D65.
+
+Where the matrix came from is kept as a fact of the file, never saved
+(`RawInfo::matrix_source`, `Metadata::matrix_source`): a table row
+(`adobe-dng` or `compat-observed`), the DNG's own ColorMatrix (or one of a
+tungsten calibration alone), the Olympus maker note, a monochrome DNG's
+neutral, or none. `photo::open` adds whether a DNG's embedded profile is
+absent, unreadable, colour matrices alone, for another camera or usable
+(`Metadata::embedded_profile_status`), before it drops the parse error.
+Camera Look (fitted) decides from them which photos have no colour data.
 
 ## Checking decodes
 

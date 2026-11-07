@@ -1,8 +1,8 @@
 //! The grid, with the filter bar above it and its toolbar below.
 use super::cell::{self, photo_cell};
 use super::{Action, Library};
-use crate::app::design::{self, Tone, inset, space, text};
-use crate::app::theme;
+use crate::app::ui::design::{self, Tone, inset, space, text};
+use crate::app::ui::theme;
 use crate::catalog::{Photo, PhotoId};
 use eframe::egui::{self, Vec2};
 
@@ -21,13 +21,13 @@ impl Library {
                     ui.add_space(space::L);
                     self.cell_style_menu(ui);
                     ui.add_space(space::L);
-                    ui.small(if self.visible.len() == self.session.photos.len() {
-                        format!("{} photos", self.session.photos.len())
+                    ui.small(if self.visible.len() == self.session.photos().len() {
+                        format!("{} photos", self.session.photos().len())
                     } else {
                         format!(
                             "{} of {} photos",
                             self.visible.len(),
-                            self.session.photos.len()
+                            self.session.photos().len()
                         )
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -72,9 +72,9 @@ impl Library {
     pub(in crate::app) fn grid(
         &mut self,
         ui: &mut egui::Ui,
-        zoom: &mut crate::app::navigator::Zoom,
+        zoom: &mut crate::app::view::navigator::Zoom,
         chrome: bool,
-        magnifier: Option<&mut crate::app::magnifier::Magnifier>,
+        magnifier: Option<&mut crate::app::view::magnifier::Magnifier>,
     ) -> Action {
         self.auto_stack_window(ui.ctx());
         if self.compare.open {
@@ -96,7 +96,7 @@ impl Library {
                 .show(ui, |ui| self.grid_toolbar(ui));
         }
         // Inset on the photo's backdrop, as the Loupe's photo is.
-        let margin = crate::app::workspace::PHOTO_MARGIN;
+        let margin = crate::app::shell::workspace::PHOTO_MARGIN;
         let inner = ui.available_width() - 2. * margin;
         let columns = ((inner / self.thumb_size).floor() as usize).max(1);
         let width = (inner / columns as f32).floor().max(80.);
@@ -120,7 +120,7 @@ impl Library {
             && let Some(after) = self
                 .visible
                 .iter()
-                .position(|i| self.session.photos[*i].id == id)
+                .position(|i| self.session.photos()[*i].id == id)
         {
             let rows = (after / columns) as f32 - (before / columns) as f32;
             self.grid_kinetic.stop();
@@ -135,7 +135,7 @@ impl Library {
                     && let Some(at) = self.selection.active.and_then(|id| {
                         self.visible
                             .iter()
-                            .position(|i| self.session.photos[*i].id == id)
+                            .position(|i| self.session.photos()[*i].id == id)
                     })
                 {
                     self.grid_kinetic.stop();
@@ -160,7 +160,7 @@ impl Library {
                                     let Some(&index) = self.visible.get(row * columns + col) else {
                                         break;
                                     };
-                                    let p = self.session.photos[index].clone();
+                                    let p = self.session.photos()[index].clone();
                                     let exists = self.is_available(&p.path);
                                     self.request_previews(&p, ui.ctx());
                                     let shown = cell::Shown {
@@ -207,6 +207,12 @@ impl Library {
                 );
                 self.grid_kinetic.end(ui, glide);
                 self.grid_offset = output.state.offset.y;
+                // Page Up and Page Down move by the rows wholly in view, with
+                // half a point's grace for rounding.
+                let top = ((output.state.offset.y - 0.5) / height).ceil();
+                let bottom =
+                    ((output.state.offset.y + output.inner_rect.height() + 0.5) / height).floor();
+                self.grid_page_rows = (bottom - top).max(1.) as usize;
             });
         ui.spacing_mut().item_spacing = spacing;
         if let Some((photo, menu)) = metadata_edit
@@ -233,13 +239,15 @@ impl Library {
             PhotoAction::SetReference => {}
             PhotoAction::Reveal => {
                 if let Err(e) = crate::platform::reveal::reveal(&photo.path) {
-                    self.message = format!("Could not show {}: {e}", photo.filename);
+                    self.messages
+                        .fail(format!("Could not show {}: {e}", photo.filename));
                 }
             }
-            PhotoAction::FindOnDisk => self.find_request = Some(photo.id),
+            PhotoAction::FindOnDisk => self.ask(super::outbox::Request::Find(photo.id)),
             PhotoAction::CopyPath => {
                 ctx.copy_text(photo.path.display().to_string());
-                self.message = format!("Copied {}", photo.path.display());
+                self.messages
+                    .note(format!("Copied {}", photo.path.display()));
             }
             PhotoAction::Edit(edit) => {
                 let ids = if whole_selection && self.selection.selected.contains(&photo.id) {
@@ -248,10 +256,11 @@ impl Library {
                     vec![photo.id]
                 };
                 if let Err(e) = self.edit_photos(&ids, edit, false) {
-                    self.message = format!("Metadata could not be saved: {e}");
+                    self.messages
+                        .fail(format!("Metadata could not be saved: {e}"));
                 }
             }
-            PhotoAction::Copy(copy) => self.copy_request = Some(copy),
+            PhotoAction::Copy(copy) => self.ask(super::outbox::Request::Copy(copy)),
             PhotoAction::Stack(stack) => {
                 let ids = if whole_selection && self.selection.selected.contains(&photo.id) {
                     self.selected_ids()
@@ -266,15 +275,13 @@ impl Library {
             // The selection when the photo is in it, in the grid and the
             // filmstrip alike, as Export.
             PhotoAction::BuildPreviews(kind) => {
-                self.previews_request = Some(super::PreviewsRequest::Build(
-                    self.menu_scope(photo.id),
-                    kind,
+                self.ask(super::outbox::Request::Previews(
+                    super::PreviewsRequest::Build(self.menu_scope(photo.id), kind),
                 ));
             }
             PhotoAction::DiscardPreviews(kinds) => {
-                self.previews_request = Some(super::PreviewsRequest::Discard(
-                    self.menu_scope(photo.id),
-                    kinds,
+                self.ask(super::outbox::Request::Previews(
+                    super::PreviewsRequest::Discard(self.menu_scope(photo.id), kinds),
                 ));
             }
             PhotoAction::Remove => {
@@ -307,7 +314,7 @@ impl Library {
                 } else {
                     vec![photo.id]
                 };
-                self.read_request = Some(ids);
+                self.ask(super::outbox::Request::Read(ids));
             }
             PhotoAction::MoveToFolder => {
                 let ids = if whole_selection && self.selection.selected.contains(&photo.id) {
@@ -315,7 +322,29 @@ impl Library {
                 } else {
                     vec![photo.id]
                 };
-                self.file_request = Some(super::FileRequest::ChooseFolder(ids));
+                self.ask(super::outbox::Request::File(
+                    super::FileRequest::ChooseFolder(ids),
+                ));
+            }
+            PhotoAction::ExportCatalog => {
+                let ids = if whole_selection && self.selection.selected.contains(&photo.id) {
+                    self.selected_ids()
+                } else {
+                    vec![photo.id]
+                };
+                let name = match ids.len() {
+                    1 => std::path::Path::new(&photo.filename)
+                        .file_stem()
+                        .map_or_else(String::new, |s| s.to_string_lossy().into_owned()),
+                    _ => "Selected Photos".into(),
+                };
+                self.ask(super::outbox::Request::Export(
+                    super::CatalogExportRequest {
+                        name,
+                        scope: crate::catalog::ExportScope::Photos(ids),
+                        removal: None,
+                    },
+                ));
             }
         }
         None
@@ -414,7 +443,7 @@ impl Library {
     }
     /// The grid cell style, from a menu as well as J.
     fn cell_style_menu(&mut self, ui: &mut egui::Ui) {
-        let keys = crate::app::shortcuts::keys_text("J");
+        let keys = crate::app::shell::shortcuts::keys_text("J");
         ui.menu_button(
             egui::RichText::new(self.cell_style.name())
                 .size(text::SMALL)

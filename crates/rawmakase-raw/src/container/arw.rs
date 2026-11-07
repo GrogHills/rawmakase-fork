@@ -15,7 +15,7 @@ use crate::io::{Bytes, Order};
 use crate::sensor::Sensor;
 use crate::variant::{Plan, Variant};
 use crate::vendor::sony;
-use std::sync::atomic::{AtomicBool, Ordering};
+use rawmakase_cancel::Cancel;
 
 /// Where an ARW's sensor data is and how it is coded.
 #[derive(Clone, Debug, Default)]
@@ -281,7 +281,7 @@ pub(crate) fn decode(
     info: &RawInfo,
     plan: &ArwPlan,
     bytes: &[u8],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Sensor> {
     let (width, height) = (plan.width as usize, plan.height as usize);
     let file = Bytes::new(
@@ -320,7 +320,7 @@ pub(crate) fn decode(
                 .zip(data.chunks_exact_mut(width))
                 .enumerate()
             {
-                if y % 256 == 0 && cancel.load(Ordering::Relaxed) {
+                if y % 256 == 0 && cancel.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
                 for (d, c) in dst.iter_mut().zip(row.as_chunks::<2>().0) {
@@ -339,7 +339,7 @@ pub(crate) fn decode(
                 .zip(data.chunks_exact_mut(width))
                 .enumerate()
             {
-                if y % 256 == 0 && cancel.load(Ordering::Relaxed) {
+                if y % 256 == 0 && cancel.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
                 crate::codec::sony::packed12(row, dst);
@@ -391,7 +391,7 @@ fn ycbcr_tiles<'a>(
     plan: &ArwPlan,
     strip: &impl Fn(usize) -> Result<&'a [u8]>,
     rgb: &mut [u16],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<()> {
     let (width, height) = (plan.width as usize, plan.height as usize);
     let [tw, th] = plan.tile.map(|v| v as usize);
@@ -402,7 +402,7 @@ fn ycbcr_tiles<'a>(
     }
     let mut samples = Vec::new();
     for i in 0..tiles {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let tile = strip(i)?;
@@ -446,7 +446,7 @@ fn ljpeg_tiles<'a>(
     plan: &ArwPlan,
     strip: &impl Fn(usize) -> Result<&'a [u8]>,
     data: &mut [u16],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<()> {
     let (width, height) = (plan.width as usize, plan.height as usize);
     let [tw, th] = plan.tile.map(|v| v as usize);
@@ -457,7 +457,7 @@ fn ljpeg_tiles<'a>(
     }
     let mut samples = Vec::new();
     for i in 0..tiles {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let tile = strip(i)?;
@@ -632,8 +632,32 @@ pub(crate) mod tests {
 
     fn decode(file: &[u8]) -> Result<(RawInfo, Sensor)> {
         let info = crate::open(file)?;
-        let sensor = crate::decode(&info, file, &AtomicBool::new(false))?;
+        let sensor = crate::decode(&info, file, Cancel::NEVER)?;
         Ok((info, sensor))
+    }
+
+    /// The a7R IV's own tag says column 0, its default crop column 32, as its JPEG
+    /// and Camera Raw frame it. A crop along the other side keeps its own place.
+    #[test]
+    fn a_sony_crop_takes_its_place_from_the_default_crop_along_a_side_it_does_not_cut() {
+        let frame = |at: [u16; 2], size: [u16; 2]| {
+            let file = arw(
+                "ILCE-7RM4",
+                [40, 24],
+                [14, 1],
+                vec![
+                    (0x74c7, Value::Short(at.to_vec())),
+                    (0x74c8, Value::Short(size.to_vec())),
+                    (0xc61f, Value::Short(vec![4, 2])),
+                    (0xc620, Value::Short(vec![32, 20])),
+                ],
+                vec![0; 40 * 24 * 2],
+            );
+            crate::open(&file).unwrap().frame
+        };
+        assert_eq!(frame([0, 2], [32, 20]), [4, 2, 32, 20]);
+        assert_eq!(frame([0, 6], [32, 12]), [4, 6, 32, 12]);
+        assert_eq!(frame([12, 2], [16, 20]), [12, 2, 16, 20]);
     }
 
     #[test]
@@ -857,7 +881,7 @@ pub(crate) mod tests {
         let luma: Vec<u16> = vec![1000, 1010, 1020, 1030, 1040, 1050, 1060, 1070];
         let (cb, cr) = (vec![16383 + 10, 16383], vec![16383 - 20, 16383]);
         let (tile, _) = crate::codec::ljpeg::tests::encode_sampled(
-            &[luma.clone(), cb, cr],
+            &[luma, cb, cr],
             &[(2, 2), (1, 1), (1, 1)],
             2,
             1,

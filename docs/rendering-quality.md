@@ -6,7 +6,7 @@ See [preview performance](preview-performance.md) for how previews are rendered 
 
 ## Preview and detail
 
-Every change renders the real pipeline at viewport size in physical pixels (including display scale), from a resolution pyramid for Fit and zoomed-out views. When a render takes more than a moment, an edit publishes a reduced render first, labeled **Draft • refining**, and the full render replaces it: at 100% a reduced render of the region (also when panning), and for the whole photo one with at most a megapixel. Fast renders, and views still cached, go straight to full resolution. While an edit continues, the running render finishes and shows before the next one starts; a new photo, view or size cancels it, and an older result never replaces a newer one ([architecture](architecture.md#preview-compute-backend)).
+Every change renders the real pipeline at viewport size in physical pixels (including display scale), from a resolution pyramid for Fit and zoomed-out views. When a render takes more than a moment, an edit publishes a reduced render first, labeled **Draft • refining**, and the full render replaces it: at 100% a reduced render of the region (also when panning), and for the whole photo one with at most a megapixel. Fast renders, and views still cached, go straight to full resolution. While an edit continues, the running render finishes and shows before the next one starts; a new photo, view or size cancels it, and an older result never replaces a newer one ([architecture](architecture.md#previews)).
 
 Sharpening (`develop/sharpening.rs`) is applied before resizing. New edits and Lightroom imports start at Lightroom Classic's raw defaults (Amount 40, Radius 1.0, Detail 25, Masking 0; every raw and DNG import in the catalogue sampled, process versions 2012 to 6) and render with an unsharp mask fitted to Camera Raw 18.7 on a synthetic chart (slanted edges, sine gratings of 0.04 to 0.3 cycles per pixel, texture, noisy flats; 45 renders). It is about 2.4 times the strength of RAWmakase's earlier operator (a luminance-only Gaussian unsharp mask, no longer rendered) on fine detail per Amount, shapes the high-pass as `d / (1 + (|d|/halo)³)` so strong edges get small halos, makes dark halos 0.57 of light ones, scales the strength with Detail (0.3× at 0, 2.1× at 100) and fades out detail below a Masking threshold. The Detail panel's reset gives the Lightroom defaults. Camera Raw's ringing at Detail above 50 and its gentler sharpening of noise in deep shadows are not modelled. Full-resolution region rendering includes the required sharpening halo, and its pixels match the full render. No separate Fit-only sharpening changes the result. Luminance noise reduction is described below.
 
@@ -27,19 +27,94 @@ GPU rendering sample the same denoised image. This is an approximation, not Adob
 algorithm: texture-only scenes can overestimate noise, and high amounts can lose
 faint detail.
 
+## AI Denoise
+
+AI Denoise replaces the demosaic for a photo with RawNIND
+UtNet2 (Bayer), which denoises and demosaics the mosaic in one pass. The photo's
+visible mosaic is packed as RGGB planes (an X-Trans mosaic is demosaiced, its white
+balance taken off and sampled again as RGGB), run in 512-pixel packed tiles with 64
+pixels of mirrored or real context, and brought to the mosaic's scale by one gain
+fitted on 8×8 packed blocks without clipped samples or dark channels. Fed a mosaic
+clipped at black, the model lifts the deep shadows; their channels are scaled back
+to the mosaic's own mean over 16-pixel packed blocks, in full below 0.01 of white and
+not at all above 0.03. The result is white balanced as development balances the
+mosaic; within 8 pixels of a clipped sample, feathered over 8 more, it is the plain
+demosaic, which the model never saw unclipped. Highlights are then recovered on this
+image of its own, never with the plain image's recovery, since recovery depends on
+each pixel's values.
+
+Rendering blends the two recovered images by Amount before colour and luminance noise
+reduction, which then apply as without it: the AI source's change in luminance (the
+channels' mean) and in colour each by a weight, the AI source itself at 100%. The
+weights are Camera Raw 18.7's: its Denoise records the blend it applies (`BlendParams`)
+as 0.4375 and 0.5 at Amount 25, 0.70 and 0.75 at 50 and 1 at 100. That they are
+luminance's and colour's, the channels' mean as luminance, and linear interpolation
+between them (from 0 at 0) are RAWmakase's reading, not established Camera Raw
+behaviour. Switching AI Denoise on sets manual Luminance and Color noise reduction to
+0, and switching it off brings Color's defaults back, as Camera Raw writes them from
+its defaults (how it treats manual noise reduction the user changed is not measured); everything after is unchanged. Half-size drafts and a photo
+without a ready result (computing, model not installed, failed) render the plain
+image, the state shown beside the switch; export never does, and fails the photo
+instead. The recipe names no model: as with every other setting, an edit renders
+with the installed model, and results are cached under a key holding the model's
+SHA-256, the adapter version, the provider and the build, so a changed model or
+adapter recomputes them. Cached and fresh results differ only by half-precision
+rounding. Measured on an M1 Pro, an Amount change updates the Fit preview in
+155 ms at 24 MP and 357 ms at 61 MP, and Develop's resident memory while dragging
+grows by 0.80 GB (24 MP) and 0.90 GB (61 MP).
+
+The Library's edited previews, Compare, Survey and the Loupe show AI Denoise only
+from a finished result in the cache for the photo's file and the installed model, on
+any provider. The previews then decode the photo at full size, as Develop does, and
+assemble the result over it. Without a finished result they render the plain image,
+from the half-size decode, as before. The Loupe never runs the model, and doesn't show
+a partial result. Once any job stores a result, previews of that file shown plain are
+made again. A preview records what it shows in its cache tag: no AI Denoise (`-fit`), the
+plain image of an edit with it (`-fit-noai`), or the finished result of a named model
+(`-fit-ai-<model>`). The plain and AI previews never replace each other, the plain one is
+not used once a result is finished, and a changed model makes the preview again. Develop
+gives its render to the Library only once its result is final; a render with a partial
+result is shown in Develop only. Previews that earlier releases kept for edits with
+AI Denoise, under `-fit` with or without the result, are not shown again. An offline photo
+keeps whichever preview it has. Only RAWmakase's own edits are read this way. An imported
+Lightroom edit with Denoise previews plain in the Library until it is edited in Develop.
+
+The choices above were measured on 2026-11-02 (M1 Pro, ONNX Runtime 1.23.2; the 190
+CC0 photos above ISO 400 in the pixls archive, RawNIND's held-out test pairs). Tiles
+start at rawnind_jddc's grid origin: with the padded image's own grid, 9 of 59
+non-RGGB photos differed from upstream's alignment by up to MAE 0.009 and p99.9 0.17
+after the comparison transform, against at most 2 × 10⁻⁵ and 0.0017 on upstream's grid.
+One gain serves all three channels: on mid-tone blocks they agree within 3.2%; the
+Canon R10's 14% spread at ISO 32,000 came from lifted dark blocks, which the fit now
+leaves out. Overlap 32 left a band at tile borders 5–7 times the difference elsewhere,
+so the overlap is 64. Deep shadows were lifted up to 2.5 EV at ISO 204,800 before the
+correction. Against the scene's low-ISO frame (both in linear Rec.2020, a
+per-channel least-squares gain onto the reference, clipped and sRGB-encoded, then
+MS-SSIM over 5 scales), AI Denoise beat the best of manual Luminance 0, 25, 50 and 75 on
+82 of RawNIND's 85 noisy Bayer frames (mean 0.942 against 0.779) and on 19 of 27 X-Trans
+frames (0.955 against 0.904; its losses at ISO 2500 or below, by at most 0.01), with no
+maze or grid at 100%. No tile was non-finite on the CPU or CoreML, which stays within
+1.2 × 10⁻⁶ (relative) of the CPU, so CoreML's GPU (an ML Program in single precision) is used on
+Apple Silicon: a 24 MP photo takes about 3.5 s there and 20 s on the CPU. Against Camera Raw 18.7's
+Denoise on five of those CC0 photos at Amount 50 and 100 (100% crops, side by side):
+similar at ISO 12,800–20,000 (Camera Raw keeps slightly more fine texture); behind at
+ISO 32,000 and above, where RawNIND leaves colour blotches in dark areas and Camera Raw
+keeps more detail, and on X-Trans, where the RGGB rebuild leaves the result softer and
+mottled beside Camera Raw's own X-Trans model.
+
 ## Tone and highlights
 
 Profile-based recipes also store a camera exposure baseline independently of the Exposure slider. The verified X100F DR100 reference baseline is +0.15 EV; unverified camera/DR combinations use zero. Point curves use a natural cubic spline and the sRGB transfer function in ProPhoto primaries, with a hue-preserving master pass followed by independent RGB curves. Clipped input endpoints and 0–255 point editing are supported. Contrast preserves endpoints. See the comparison report for reference-derived metadata and limits.
 
 Every resolved recipe has a camera profile (without an imported or embedded one, the camera matrix with the DNG default tone curve) and uses the profile tone curve. Before it, the scene tone stage keeps scene values above 1 and rolls them off to a white point measured from the sensor's white and the photo's maximum, as Camera Raw's default render does; Shadows and Highlights are a measured local operator there ([tone controls](tone-controls.md#shadows-and-highlights)).
 
-Highlight reconstruction estimates clipped camera channels from nearby unclipped channel ratios, before color conversion. It retains unclipped channels and blends in recovery near the sensor ceiling. With no usable color evidence, it falls back to neutral; it cannot recreate fully clipped texture. The recovered image is lazily cached per decoded image. Extreme WB changes after demosaicing still have limitations.
+Highlight reconstruction follows Camera Raw 18.7's measured rule in white-balanced camera space, before color conversion ([partially clipped highlights](#partially-clipped-highlights)): every channel is pulled up towards the mean of the other two by a weight that rises with its own sensor level, so a clipped channel becomes that mean and a channel near the sensor's white mostly follows the others. It cannot recreate fully clipped texture. The recovered image is lazily cached per decoded image. Extreme WB changes after demosaicing still have limitations.
 
 Master point curves still have a saturated-color residual. The parametric curve is measured ([tone controls](tone-controls.md#parametric-curve)). Generated-ramp regression data checks neutral master and independent RGB curves separately from RAW/profile differences; see `tests/data/README.md`. Exact Lightroom rendering parity is **not** established.
 
 ## Color mixer and grading
 
-The color mixer, Saturation, Vibrance, color grading and Point Color render Camera Raw 18.7's measured responses: see [color mixer and grading](color-mixer.md). Legacy split-tone XMP imports restore blending 100 and clear modern grading controls. The earlier approximations, and the `reference_color` choice between them, are no longer rendered; the [color validation table](macos-lightroom-validation.md) records how they compared.
+The color mixer, Saturation, Vibrance, color grading and Point Color render Camera Raw 18.7's measured responses: see [color mixer and grading](color-mixer.md). Legacy split-tone XMP imports restore blending 100 and clear modern grading controls. The earlier approximations, and the `reference_color` choice between them, are no longer rendered; the [color validation table](records/macos-lightroom-validation.md) records how they compared.
 
 ## Camera calibration
 
@@ -50,31 +125,32 @@ The primary sliders render Camera Raw 18.7's measured changes (in `calibration.r
 ## Partially clipped highlights
 
 Highlight recovery runs once on the full decoded camera image, before the scene
-tone controls, and feeds Fit, regions and export. The existing 7×7 neighbourhood
-uses unclipped neighbours' channel ratios. A wider partially clipped area used to
-fall back to neutral even when a channel still held useful information, producing
-hard grey patches when Highlights darkened it.
+tone controls, and feeds Fit, regions and export. It is Camera Raw 18.7's rule as
+measured on flat patches rendered through a linear profile (`scripts/corpus/probe_dng.py`
+with an As Shot neutral, so channels clip at different scene levels): in
+white-balanced camera space each channel is pulled up towards the mean of the other
+two, never down, by the weight `((s − 0.25) / 0.75)^1.8`, where `s` is the channel's
+own fraction of the sensor's white. A clipped channel (`s` = 1) becomes the mean of the
+other two outright; a channel at 0.9 of its white follows them by 0.77 of the gap, one
+at half by 0.14, one in the lower quarter not at all. The
+three pulls are solved together (each channel's target is the others' pulled values,
+anchored at what the sensor recorded), so with two channels clipped the lower one lands
+between the unclipped channel and the higher clip, and once the unclipped channel passes
+the higher clip the pixel is neutral at that level, as Camera Raw renders it. Nothing
+reads neighbouring pixels: on flat patches Camera Raw's result is exactly this per-pixel
+rule, and a clipped sky keeps whatever gradient its unclipped channels carry.
 
-When that local search finds nothing, a lazily built map (at most 512 pixels on
-the long edge) supplies a colour reference from the same connected bright area.
-Only smooth, unclipped samples contribute; dark gaps separate areas so an unrelated
-bright object cannot provide the reference. The surviving channels stay unchanged;
-only clipped channels are estimated, with the existing blend near saturation.
-Fully clipped pixels and areas without a usable reference keep the neutral fallback.
-Where one channel is clipped, no estimate lowers it below the value the sensor
-recorded, which is only a lower bound on the light: a neighbour ratio or a neutral
-fallback that comes out lower keeps the recorded value. Darkening it rendered bright
-lights duller and darker than Camera Raw (on the test dataset's own-stress sets, the
-highlight-region error fell from about 3–4 to 1.3–1.8 ΔE00). Where two are clipped
-the estimate is kept: Camera Raw renders such a core whiter than the recorded pair
-(a sunset sun with red and blue clipped is yellow-white), and the floor turned it
-magenta. The floor fades out with the second channel's own recovery blend (0.97 to
-1.0 of its clip), so it adds no step where a second channel reaches the cutoff. The
-estimate itself still switches its reference channels there, as it did before.
-This infers missing colour, not missing detail, and is not Adobe's recovery algorithm.
-Cancellation discards the map and recovered image together. Tests cover a wide
-partially clipped area, dark gaps, untouched surviving channels, fully clipped
-fallback and cancellation.
+Measured on 136 patches (six hue directions at two saturations and six levels of the
+sensor's white, all unclipped; four hues at eight levels through every clip, under two
+As Shot neutrals), the rule reproduces Camera Raw within 0.005 RMS of the level per
+channel, the shoulder both renderers apply above white excluded. It replaces the
+neighbourhood-ratio estimate and the connected-area colour map of earlier releases: those
+reconstructed the patch's true colour (a warm patch with green clipped stayed warm,
+where Camera Raw moves it towards neutral and brighter), which is why clipped skies
+rendered duller and pinker than Camera Raw's. The rule also changes unclipped colours
+whose channels approach the white, as Camera Raw does: a saturated red at 0.9 of its
+white loses a third of its chroma. This infers Camera Raw's colour, not missing detail,
+and is not Adobe's algorithm. Cancellation discards the recovered image.
 
 ## Camera profiles
 
@@ -99,6 +175,6 @@ rawmakase compare source.ARW lightroom.tiff /tmp/sony-comparison --origin 2400 1
 
 The output directory must not already exist. `--recipe preset.json` optionally supplies RAWmakase edits; without it the current engine defaults are used, independently of sidecars. The tool writes unscaled 512-pixel crops, a 4× difference visualization, the exact recipe, and full-image sRGB MAE/RMSE/PSNR. These metrics measure differences, not quality, and do not compensate for exposure or registration. A reference with different dimensions is rejected rather than stretched.
 
-Five X100F Lightroom comparisons across three photographs were checked on macOS, including custom white balance, master/RGB point curves and nonzero tone sliders. The corrected profile tone substantially reduced preview error, but full Lightroom parity is not established. See [macOS and Lightroom validation](macos-lightroom-validation.md) for measurements and limitations. The supplied private archives installed 62 matching camera profiles and 603 Settings presets in the user data directory; none are bundled. See [XMP support](xmp-presets.md).
+Five X100F Lightroom comparisons across three photographs were checked on macOS, including custom white balance, master/RGB point curves and nonzero tone sliders. The corrected profile tone substantially reduced preview error, but full Lightroom parity is not established. See [macOS and Lightroom validation](records/macos-lightroom-validation.md) for measurements and limitations. The supplied private archives installed 62 matching camera profiles and 603 Settings presets in the user data directory; none are bundled. See [XMP support](xmp-presets.md).
 
 CLI profile selection: `rawmakase render source.RAF output.jpg --profile /path/to/profile.dcp`. Profile libraries are read from `$RAWMAKASE_DATA_DIR/camera-profiles` and the platform RAWmakase data directory (`~/Library/Application Support/RAWmakase` on macOS, XDG on Linux); camera matching is mandatory.

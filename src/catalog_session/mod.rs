@@ -4,22 +4,28 @@ mod backfill;
 pub(crate) mod background;
 mod checksums;
 mod descriptive;
+mod import_stacks;
 mod stacks;
 
 use crate::catalog::{
     Catalog, CatalogLocation, Collection, CollectionId, Folder, FolderId, Photo, PhotoId, RootId,
 };
 use anyhow::Result;
+pub(crate) use backfill::{
+    capture_time as file_capture_time, read_info as file_photo_info, read_sequence as file_sequence,
+};
 /// A file's photo info as the catalog reads it for photos added from
 /// folders; export names read a photo's without a catalog the same way.
-pub(crate) use backfill::{capture_time as file_capture_time, read_info as file_photo_info};
+pub(crate) use import_stacks::{BurstRead, BurstsRead};
 
 /// What photos added from folders get where their files have none: the
 /// Preferences' Creator and Copyright, giving way to the camera's own,
 /// which the RAW decoders also find in a CR3, MRW or X3F, and to a CR3's
-/// own XMP, which they find too.
+/// own XMP, which they find too; with the Preferences' other choices for
+/// photos added (Stack Camera Bursts), read once, when adding starts.
 pub(crate) fn new_photo_defaults() -> crate::catalog::NewPhotoDefaults {
     photo_defaults(crate::catalog::MetadataDefaults::load())
+        .with_options(crate::catalog::ImportOptions::load())
 }
 fn photo_defaults(metadata: crate::catalog::MetadataDefaults) -> crate::catalog::NewPhotoDefaults {
     crate::catalog::NewPhotoDefaults::new(
@@ -43,21 +49,30 @@ pub(crate) use descriptive::{Committed, DescriptiveChange, DescriptiveEdit};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Its lists are read only from outside: they change only as the session reads
+/// the catalog again, or through its methods that keep them in step with the
+/// catalog and each other (and start a new generation when photos may have
+/// changed place, name, master or id). Writes through the session's catalog
+/// that leave the lists as they are (edits, History, snapshots, camera
+/// sequences, the computer's name) have methods of their own; nothing outside
+/// gets the catalog to change. Workflows that change the catalog through a
+/// connection of their own (adding folders, relinking, Synchronize, file
+/// operations) open it again or read it again after, as before.
 pub(crate) struct CatalogSession {
-    pub catalog: Catalog,
+    catalog: Catalog,
     /// The catalog's photos, without macOS "._" metadata files.
-    pub photos: Vec<Photo>,
+    photos: Vec<Photo>,
     /// Folders, each counting the photos in `photos` it holds.
-    pub folders: Vec<Folder>,
-    pub collections: Vec<Collection>,
+    folders: Vec<Folder>,
+    collections: Vec<Collection>,
     /// Each collection's photos, limited to the ones in `photos`.
-    pub collection_photos: HashMap<CollectionId, HashSet<PhotoId>>,
-    pub roots: Vec<(RootId, String, Option<String>)>,
+    collection_photos: HashMap<CollectionId, HashSet<PhotoId>>,
+    roots: Vec<(RootId, String, Option<String>)>,
     /// The folders located apart from their roots on this computer, by root.
-    pub overrides: HashMap<RootId, Vec<crate::catalog::Override>>,
+    overrides: HashMap<RootId, Vec<crate::catalog::Override>>,
     /// Previous Import: the photos the last Add Photo Folder or Synchronize
     /// added.
-    pub previous_import: HashSet<PhotoId>,
+    previous_import: HashSet<PhotoId>,
     backfill: backfill::Backfill,
     wake: Wake,
     /// Changes whenever photos may have changed place, name or master (see
@@ -78,6 +93,129 @@ pub(crate) struct Opened {
 }
 
 impl CatalogSession {
+    /// The catalog, to read. No method of [`Catalog`] that takes `&self` writes
+    /// it (`export_catalog` writes another catalog), except the test-support
+    /// ones (`db_for_tests`, `fail_metadata_writes`).
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+    /// The catalog's photos, without macOS "._" metadata files.
+    pub(crate) fn photos(&self) -> &[Photo] {
+        &self.photos
+    }
+    /// Folders, each counting the photos in [`Self::photos`] it holds.
+    pub(crate) fn folders(&self) -> &[Folder] {
+        &self.folders
+    }
+    pub(crate) fn collections(&self) -> &[Collection] {
+        &self.collections
+    }
+    /// Each collection's photos, limited to the ones in [`Self::photos`].
+    pub(crate) fn collection_photos(&self) -> &HashMap<CollectionId, HashSet<PhotoId>> {
+        &self.collection_photos
+    }
+    /// Each root: its id, the path it was added under and where it is found on
+    /// this computer, when elsewhere.
+    pub(crate) fn roots(&self) -> &[(RootId, String, Option<String>)] {
+        &self.roots
+    }
+    /// The folders located apart from their roots on this computer, by root.
+    pub(crate) fn overrides(&self) -> &HashMap<RootId, Vec<crate::catalog::Override>> {
+        &self.overrides
+    }
+    /// Previous Import: the photos the last Add Photo Folder or Synchronize
+    /// added.
+    pub(crate) fn previous_import(&self) -> &HashSet<PhotoId> {
+        &self.previous_import
+    }
+    /// Saves photo `id`'s edit ([`Catalog::save_edit`]). Changes no list.
+    pub(crate) fn save_edit(
+        &mut self,
+        id: PhotoId,
+        path: &Path,
+        source: &crate::storage::Identity,
+        recipe: &crate::model::recipe::Recipe,
+        export: &crate::export_settings::ExportOptions,
+        history: crate::catalog::HistoryUpdate<'_>,
+    ) -> Result<()> {
+        self.catalog
+            .save_edit(id, path, source, recipe, export, history)
+    }
+    /// Saves and clears edits in one transaction ([`Catalog::change_edits`]).
+    /// Changes no list.
+    pub(crate) fn change_edits(
+        &mut self,
+        changes: &[crate::catalog::EditChange<'_, '_>],
+    ) -> Result<()> {
+        self.catalog.change_edits(changes)
+    }
+    /// Adds a snapshot of `photo` ([`Catalog::add_snapshot`]). Changes no list.
+    pub(crate) fn add_snapshot(
+        &mut self,
+        photo: PhotoId,
+        name: &str,
+        recipe: &crate::model::recipe::Recipe,
+    ) -> Result<i64> {
+        self.catalog.add_snapshot(photo, name, recipe)
+    }
+    /// Changes no list.
+    pub(crate) fn update_snapshot(
+        &mut self,
+        id: i64,
+        recipe: &crate::model::recipe::Recipe,
+    ) -> Result<()> {
+        self.catalog.update_snapshot(id, recipe)
+    }
+    /// Changes no list.
+    pub(crate) fn rename_snapshot(&mut self, id: i64, name: &str) -> Result<()> {
+        self.catalog.rename_snapshot(id, name)
+    }
+    /// Changes no list.
+    pub(crate) fn delete_snapshot(&mut self, id: i64) -> Result<()> {
+        self.catalog.delete_snapshot(id)
+    }
+    /// Saves camera sequences read from the files ([`Catalog::save_sequences`]).
+    /// Changes no list.
+    pub(crate) fn save_sequences(
+        &mut self,
+        read: &[(PhotoId, crate::catalog::SavedSequence)],
+    ) -> Result<()> {
+        self.catalog.save_sequences(read)
+    }
+    /// Renames this computer for the folder locations
+    /// ([`Catalog::rename_computer`]). Changes no list.
+    pub(crate) fn rename_computer(&mut self, name: &str) -> Result<()> {
+        self.catalog.rename_computer(name)
+    }
+    /// Orders the photos by capture time, then file name and id, as the
+    /// catalog lists them, after capture times were filled in or read again.
+    pub(crate) fn sort_photos_by_capture_time(&mut self) {
+        self.photos.sort_by(|a, b| {
+            (&a.captured, &a.filename, a.id).cmp(&(&b.captured, &b.filename, b.id))
+        });
+    }
+    /// Forgets the photos, folders, roots, collection members and Previous
+    /// Import when the catalog could not be read again after a change made
+    /// through another connection: a folder removed may have given its id to a
+    /// new one, so none is offered to be changed. The collections and overrides
+    /// stay as listed; the failed read started a new generation already.
+    pub(crate) fn forget_lists(&mut self) {
+        self.photos.clear();
+        self.folders.clear();
+        self.roots.clear();
+        self.collection_photos.clear();
+        self.previous_import.clear();
+    }
+    /// The catalog, for a test to change before reading it again.
+    #[cfg(test)]
+    pub(crate) fn catalog_mut_for_tests(&mut self) -> &mut Catalog {
+        &mut self.catalog
+    }
+    /// The photos as listed, for a test to set up flags or capture times.
+    #[cfg(test)]
+    pub(crate) fn photos_mut_for_tests(&mut self) -> &mut Vec<Photo> {
+        &mut self.photos
+    }
     pub(crate) fn open(location: &CatalogLocation) -> Result<Opened> {
         crate::platform::network::prepare_filesystem_bridge();
         let mut catalog = Catalog::open(location)?;
@@ -208,6 +346,9 @@ impl CatalogSession {
     /// Reads the photos, folders, collections and roots again. All or nothing:
     /// when a read fails, the lists stay as they were, still matching each other.
     pub(crate) fn reload(&mut self) -> Result<()> {
+        // Read again after a change that may move, rename, promote or remove
+        // photos: what was read before no longer applies, even if this read fails.
+        self.generation = GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         // Earlier imports could pick up macOS "._" metadata files; never show them.
         let mut photos = self.catalog.photos()?;
         photos.retain(|p| !crate::storage::is_hidden(Path::new(&p.filename)));
@@ -236,9 +377,6 @@ impl CatalogSession {
         self.collection_photos = collection_photos;
         self.roots = roots;
         self.overrides = overrides;
-        // Read again after a change that may move, rename, promote or
-        // remove photos: what was read before no longer applies.
-        self.generation = GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         self.count_checksums();
         Ok(())
     }
@@ -247,6 +385,96 @@ impl CatalogSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A catalog of two JPEGs, `a` with a virtual copy in a collection, and a session
+    /// whose next read of the catalog fails (its collections are gone).
+    fn session_that_cannot_read_again() -> Result<(tempfile::TempDir, CatalogSession, PhotoId)> {
+        let directory = tempfile::tempdir()?;
+        let folder = directory.path().join("photos");
+        std::fs::create_dir(&folder)?;
+        image::RgbImage::new(8, 8).save(folder.join("a.jpg"))?;
+        image::RgbImage::new(8, 8).save(folder.join("b.jpg"))?;
+        let path = directory.path().join("library.rawmakase");
+        let mut catalog = Catalog::create(&path)?;
+        catalog.add_folder(&folder)?;
+        let a = catalog.photos()?[0].id;
+        let copy = catalog.create_virtual_copy(a)?;
+        let collection = catalog.quick_collection()?;
+        catalog.change_collection(collection, &[copy], &[])?;
+        drop(catalog);
+        let Opened { session, .. } = CatalogSession::open(&CatalogLocation::from(&path))?;
+        session
+            .catalog
+            .db_for_tests()
+            .execute_batch("ALTER TABLE collections RENAME TO collections_gone")?;
+        Ok((directory, session, copy))
+    }
+
+    /// Issue 808 (M3, A2): a removed copy's id may be given to the next new photo, so
+    /// once it is removed the lists drop it and what background readers read before
+    /// is dropped, even when the catalog cannot be read again.
+    #[test]
+    fn a_removed_copy_leaves_the_lists_and_the_generation_when_reading_again_fails() -> Result<()> {
+        let (_directory, mut session, copy) = session_that_cannot_read_again()?;
+        let generation = session.generation();
+        let removed = session.remove_virtual_copy(copy)?;
+        assert!(removed.listed.is_err());
+        assert!(session.photos.iter().all(|p| p.id != copy));
+        assert!(
+            session
+                .collection_photos
+                .values()
+                .all(|m| !m.contains(&copy))
+        );
+        assert_eq!(session.folders[0].count, 2);
+        assert_ne!(session.generation(), generation);
+        Ok(())
+    }
+
+    /// Issue 808 (M3, review): a read of photo info or capture times under way when a
+    /// copy is removed, or a copy made the master, may hold an id given to another
+    /// photo next (or a master's file a copy now names): it stops, and is started
+    /// again by whoever shows the catalog, as when folders are removed.
+    #[test]
+    fn background_reads_stop_when_a_copy_is_removed_or_made_the_master() -> Result<()> {
+        for change in ["remove", "promote"] {
+            let directory = tempfile::tempdir()?;
+            let folder = directory.path().join("photos");
+            std::fs::create_dir(&folder)?;
+            image::RgbImage::new(8, 8).save(folder.join("a.jpg"))?;
+            let path = directory.path().join("library.rawmakase");
+            let mut catalog = Catalog::create(&path)?;
+            catalog.add_folder(&folder)?;
+            let a = catalog.photos()?[0].id;
+            let copy = catalog.create_virtual_copy(a)?;
+            drop(catalog);
+            let Opened { mut session, .. } = CatalogSession::open(&CatalogLocation::from(&path))?;
+            session.start_photo_info(|_| true);
+            session.start_capture_times(|_| true);
+            assert!(session.reading_photo_info(), "{change}");
+            match change {
+                "remove" => session.remove_virtual_copy(copy)?.listed?,
+                _ => session.set_copy_as_master(copy)?.listed?,
+            }
+            assert!(!session.reading_photo_info(), "{change}");
+            assert!(!session.reading_capture_times(), "{change}");
+        }
+        Ok(())
+    }
+
+    /// Removing folders, whose photos' ids may be reused, starts a new generation
+    /// even when the catalog cannot be read again.
+    #[test]
+    fn removed_folders_start_a_new_generation_when_reading_again_fails() -> Result<()> {
+        let (_directory, mut session, _) = session_that_cannot_read_again()?;
+        let generation = session.generation();
+        let folder = session.folders[0].id;
+        let removed = session.remove_folders(&[folder], None)?;
+        assert!(removed.listed.is_err());
+        assert!(session.photos.is_empty());
+        assert_ne!(session.generation(), generation);
+        Ok(())
+    }
 
     #[test]
     fn opening_reads_the_catalog_with_no_window() -> Result<()> {
@@ -335,6 +563,12 @@ mod tests {
         }
         let info = session.catalog.photo_info(b)?.expect("read from the file");
         assert_eq!(info.dimensions, Some((6, 4)));
+        // Its sequence is read in the same pass, so Auto-Stack opens no
+        // file of it: it says nothing. a's info is left for later (no image
+        // to size), and so is its sequence.
+        let sequences = session.catalog.sequences()?;
+        assert_eq!(sequences.keys().collect::<Vec<_>>(), [&b]);
+        assert_eq!(sequences[&b].sequence, None);
         session.reload()?;
         let captured = |id| {
             session
@@ -349,6 +583,112 @@ mod tests {
         // Tried once: not read again until asked to retry.
         session.start_capture_times(|_| true);
         assert!(!session.reading_capture_times());
+        Ok(())
+    }
+
+    #[test]
+    fn import_facts_get_the_exif_date_whatever_date_the_photo_has() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let folder = directory.path().join("photos");
+        std::fs::create_dir(&folder)?;
+        let dated = crate::export::exif::dated_file(true, "2024:03:02 10:00:01", "");
+        let size = dated.len() as i64;
+        std::fs::write(folder.join("a.jpg"), dated)?;
+        image::RgbImage::new(6, 4).save(folder.join("b.png"))?;
+        let path = directory.path().join("library.rawmakase");
+        Catalog::create(&path)?.add_folder(&folder)?;
+        let Opened { mut session, .. } = CatalogSession::open(&CatalogLocation::from(&path))?;
+        let id = |session: &CatalogSession, name: &str| {
+            session
+                .photos
+                .iter()
+                .find(|p| p.filename == name)
+                .unwrap()
+                .id
+        };
+        let (a, b) = (id(&session, "a.jpg"), id(&session, "b.png"));
+        // Added from a folder: its name and size, its EXIF still to read.
+        assert_eq!(
+            session.catalog.import_facts(a)?,
+            Some(("a.jpg".into(), None, Some(size), false))
+        );
+        // A date from elsewhere (XMP, the user) is not the file's EXIF.
+        session
+            .catalog
+            .fill_capture_times(&[(a, "2020-01-01T00:00:00.000".into())])?;
+        session.reload()?;
+        session.start_capture_times(|_| true);
+        let mut saved = Vec::new();
+        let started = std::time::Instant::now();
+        while session.reading_capture_times() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            let capture = session.poll_capture_times();
+            assert!(capture.error.is_none());
+            saved.extend(capture.saved);
+            std::thread::yield_now();
+        }
+        assert!(saved.is_empty(), "{saved:?}");
+        let photo = session.photos.iter().find(|p| p.id == a).unwrap();
+        assert_eq!(photo.captured, "2020-01-01T00:00:00.000");
+        assert_eq!(
+            session.catalog.import_facts(a)?,
+            Some((
+                "a.jpg".into(),
+                Some("2024-03-02T10:00:01.000".into()),
+                Some(size),
+                true
+            ))
+        );
+        // A file with no date is read once: it has none.
+        let (_, captured, _, read) = session.catalog.import_facts(b)?.unwrap();
+        assert_eq!((captured, read), (None, true));
+        assert!(session.catalog.photos_to_read_exif_capture()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_undated_copy_of_a_dated_master_shows_the_date_its_file_gives() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let folder = directory.path().join("photos");
+        std::fs::create_dir(&folder)?;
+        std::fs::write(
+            folder.join("a.jpg"),
+            crate::export::exif::dated_file(true, "2024:03:02 10:00:01", ""),
+        )?;
+        let path = directory.path().join("library.rawmakase");
+        Catalog::create(&path)?.add_folder(&folder)?;
+        let Opened { mut session, .. } = CatalogSession::open(&CatalogLocation::from(&path))?;
+        let a = session.photos[0].id;
+        let copy = session.catalog.create_virtual_copy(a)?;
+        // The master dated since (by its XMP), its copy not.
+        session.catalog_mut_for_tests().db_for_tests().execute(
+            "UPDATE photos SET captured='2020-01-01T00:00:00.000' WHERE id=?",
+            [a.0],
+        )?;
+        session.reload()?;
+        session.start_capture_times(|_| true);
+        let mut saved = Vec::new();
+        let started = std::time::Instant::now();
+        while session.reading_capture_times() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            saved.extend(session.poll_capture_times().saved);
+            std::thread::yield_now();
+        }
+        let captured = |session: &CatalogSession, id| {
+            session
+                .photos
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .captured
+                .clone()
+        };
+        // As the catalog has them, so the Library sorts them again.
+        assert_eq!(captured(&session, a), "2020-01-01T00:00:00.000");
+        assert_eq!(captured(&session, copy), "2024-03-02T10:00:01.000");
+        assert!(!saved.is_empty());
+        session.reload()?;
+        assert_eq!(captured(&session, copy), "2024-03-02T10:00:01.000");
         Ok(())
     }
 

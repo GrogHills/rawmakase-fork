@@ -6,8 +6,8 @@
 use super::descriptive::{DescriptiveEdit, parse_keywords};
 use super::rows::{ROW, VALUE_GRAY, caption_at, field_rect, paint_truncated, panel_edit, value_at};
 use super::{Library, Place};
-use crate::app::design::{space, text};
-use crate::app::theme;
+use crate::app::ui::design::{space, text};
+use crate::app::ui::theme;
 use crate::catalog::PhotoId;
 use crate::metadata::{Descriptive, Keyword, Location, TextField, Value};
 use eframe::egui::{self, Vec2};
@@ -223,18 +223,20 @@ impl Library {
         {
             // The drafts stay with the photos they were typed for, to be
             // saved again or discarded.
-            self.message = format!("Metadata could not be saved: {e}");
+            self.messages
+                .fail(format!("Metadata could not be saved: {e}"));
             return;
         }
-        let read = self.session.catalog.descriptive_of(&targets);
+        let read = self.session.catalog().descriptive_of(&targets);
         let keywords: anyhow::Result<Vec<Vec<Keyword>>> = targets
             .iter()
-            .map(|id| self.session.catalog.keywords(*id))
+            .map(|id| self.session.catalog().keywords(*id))
             .collect();
         let (read, keywords) = match (read, keywords) {
             (Ok(r), Ok(k)) => (r, k),
             (Err(e), _) | (_, Err(e)) => {
-                self.message = format!("Metadata could not be read: {e}");
+                self.messages
+                    .fail(format!("Metadata could not be read: {e}"));
                 return;
             }
         };
@@ -300,7 +302,8 @@ impl Library {
             f.edited.copyright |= copyright.typed;
         });
         if commit && let Err(e) = self.commit_fields() {
-            self.message = format!("Metadata could not be saved: {e}");
+            self.messages
+                .fail(format!("Metadata could not be saved: {e}"));
         }
         let (text, can_clear) = match &self.fields.location {
             Shared::None | Shared::Same(None) => (String::new(), enabled),
@@ -337,7 +340,8 @@ impl Library {
         if clear.clicked() && can_clear {
             let targets = self.fields.targets.clone();
             if let Err(e) = self.edit_descriptive(&targets, DescriptiveEdit::ClearLocation) {
-                self.message = format!("Location could not be cleared: {e}");
+                self.messages
+                    .fail(format!("Location could not be cleared: {e}"));
             }
         }
     }
@@ -386,7 +390,8 @@ impl Library {
         if let Some(keyword) = remove
             && let Err(e) = self.edit_descriptive(&targets, DescriptiveEdit::RemoveKeyword(keyword))
         {
-            self.message = format!("Keyword could not be removed: {e}");
+            self.messages
+                .fail(format!("Keyword could not be removed: {e}"));
         }
         ui.add_space(space::XS);
         let (rect, _) =
@@ -408,7 +413,7 @@ impl Library {
             });
             match added {
                 Ok(()) => self.fields.keyword_entry.clear(),
-                Err(e) => self.message = format!("Keywords not added: {e}"),
+                Err(e) => self.messages.fail(format!("Keywords not added: {e}")),
             }
             response.request_focus();
         }

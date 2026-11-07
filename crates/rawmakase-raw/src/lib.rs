@@ -3,15 +3,19 @@
 //!
 //! Three operations, cheapest first, each on the file's bytes in memory:
 //! [`open`] reads the header facts ([`RawInfo`]) without decoding the
-//! sensor data, [`preview`] finds the embedded JPEG, and [`decode`] unpacks
+//! sensor data, [`preview`](fn@preview) finds the embedded JPEG, and [`decode`] unpacks
 //! the sensor data ([`Sensor`]), checking `cancel` as it goes. One selector
 //! ([`Variant`]) decides which reader and codec handle a file; a file of a
 //! known container in a variant not decoded here is [`Error::Unsupported`].
-//! [`capture_dates`] and [`exif_tiffs`] read, from the file itself, the few
+//! [`capture_dates`] and [`exif_tiffs`](fn@exif_tiffs) read, from the file itself, the few
 //! parts that date a photo and hold its camera's EXIF in the containers
 //! whose EXIF is not a TIFF at the file's start; [`embedded_xmp`] the XMP a
 //! CR3 keeps in a box of its own.
 #![forbid(unsafe_code)]
+// Every public item says what it is for: the decoders' boundary is a contract
+// the decoding crate builds on (#808 step 4.13).
+#![warn(missing_docs)]
+use rawmakase_cancel::Cancel;
 mod captured;
 mod codec;
 mod color;
@@ -24,6 +28,7 @@ mod info;
 mod io;
 mod levels;
 mod names;
+mod partial;
 mod preview;
 mod sensor;
 mod variant;
@@ -32,17 +37,14 @@ mod vendor;
 pub use captured::{CaptureDates, Stamp};
 pub use error::{Error, Result};
 pub use exif_tiffs::ExifTiffs;
-pub use info::{Cfa, Presets, RawInfo, SuperCcd, UNSET};
+pub use info::{Cfa, MatrixSource, Presets, PreviewSpace, RawInfo, SuperCcd, UNSET};
+pub use partial::{PartialPreview, preview_from_file};
 pub use preview::{NoPreview, is_jpeg_xl};
 pub use sensor::Sensor;
-use std::sync::atomic::AtomicBool;
 pub use variant::Variant;
 
-/// Nikon High Efficiency (JPEG XS) codestream decoding, for the LibRaw
-/// bridge's unpack until RAWmakase's own decoders replace it.
-pub use codec::nikon_he::decode as decode_nikon_high_efficiency;
 /// Synthetic High Efficiency codestreams, for other crates' tests.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub use codec::nikon_he::tests as nikon_high_efficiency_test_support;
 
 /// The decoders' version, for the About window and fingerprints.
@@ -58,7 +60,9 @@ pub fn open(bytes: &[u8]) -> Result<RawInfo> {
 /// "EOS R6 Mark II".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileNames {
+    /// The maker, as the file writes it.
     pub make: String,
+    /// The model, as the file writes it.
     pub model: String,
 }
 
@@ -111,9 +115,10 @@ pub fn embedded_xmp(file: &mut (impl std::io::Read + std::io::Seek)) -> Option<V
 /// the photo info it has of one.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct X3fMetadata {
-    /// The preview's EXIF, a TIFF of its own, as [`exif_tiffs`] finds it;
+    /// The preview's EXIF, a TIFF of its own, as [`exif_tiffs`](fn@exif_tiffs) finds it;
     /// none on the SD9 and SD10.
     pub exif: Option<Vec<u8>>,
+    /// What its property list says.
     pub properties: X3fProperties,
 }
 
@@ -124,10 +129,13 @@ pub struct X3fMetadata {
 pub struct X3fProperties {
     /// CAMMANUF and CAMMODEL, as the file writes them.
     pub make: String,
+    /// CAMMODEL.
     pub model: String,
     /// In seconds.
     pub exposure: Option<f64>,
+    /// The f-number.
     pub aperture: Option<f64>,
+    /// ISO speed.
     pub iso: Option<f64>,
     /// In millimetres.
     pub focal: Option<f64>,
@@ -157,7 +165,7 @@ pub fn preview<'a>(
 }
 
 /// The embedded preview a thumbnail `edge` pixels on its long side is best
-/// made from, as [`preview`] gives it: the smallest JPEG that reaches `edge`
+/// made from, as [`preview`](fn@preview) gives it: the smallest JPEG that reaches `edge`
 /// and has the largest preview's shape, else the largest.
 pub fn preview_reaching<'a>(
     info: &RawInfo,
@@ -189,6 +197,6 @@ fn embedded(
 
 /// The sensor data of the file `info` was read from; stops with
 /// [`Error::Cancelled`] soon after `cancel` is set.
-pub fn decode(info: &RawInfo, bytes: &[u8], cancel: &AtomicBool) -> Result<Sensor> {
+pub fn decode(info: &RawInfo, bytes: &[u8], cancel: Cancel<'_>) -> Result<Sensor> {
     variant::decode(info, bytes, cancel)
 }

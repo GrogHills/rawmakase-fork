@@ -2,9 +2,12 @@
 //!
 //! RAWmakase listens on a loopback socket and announces it in `control.json` in
 //! its data folder (see `rawmakase_protocol::Endpoint`, and
-//! src/app/automation/socket.rs for the app's side). Each command here is one
+//! src/app/shell/automation/socket.rs for the app's side). Each command here is one
 //! request; the app answers once a frame has handled it. The app's own
 //! `rawmakase control` and MCP server use this crate too.
+// Every public item says what it is for: this crate is a contract other crates
+// and clients build on (#808 step 4.13).
+#![warn(missing_docs)]
 use clap::{Parser, Subcommand};
 use rawmakase_protocol::request::{MAX_TICKS, Module, Press};
 use rawmakase_protocol::{Endpoint, PROTOCOL, Request, Target};
@@ -28,8 +31,9 @@ macro_rules! out {
 /// The device's dials and buttons, as mapped with probe.py.
 const CONTROLS: &str = include_str!("../../loupedeck/controls.json");
 
+/// The command line: the app's data folder, what to print, and one command.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, long_about = None)]
 pub struct Cli {
     /// RAWmakase's data folder, where it leaves control.json
     /// [default: $RAWMAKASE_DATA_DIR, else the app's own default]
@@ -101,6 +105,9 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         max_edge: Option<u32>,
+        /// The colour space; sRGB when left out. ProPhoto RGB needs a TIFF path.
+        #[arg(long, value_enum)]
+        color_space: Option<ColorSpace>,
         #[arg(long)]
         no_wait: bool,
         #[arg(long, default_value_t = 120)]
@@ -172,6 +179,16 @@ enum Command {
     Develop,
     /// List the Loupedeck's dial and button names
     Controls,
+}
+
+/// The colour space `export` writes in.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ColorSpace {
+    Srgb,
+    /// Adobe RGB (1998)
+    AdobeRgb,
+    /// ProPhoto RGB, 16-bit TIFF only
+    Prophoto,
 }
 
 /// Which previews `build-previews` builds.
@@ -252,11 +269,14 @@ pub fn default_data_dir() -> PathBuf {
     rawmakase_protocol::paths::data_dir()
 }
 
+/// The running app's socket, as its `control.json` announces it.
 pub struct Connection {
     port: u16,
     token: String,
 }
 impl Connection {
+    /// The app's endpoint, read from `control.json` in its data folder `dir`; an
+    /// error saying how to start it when there is none.
     pub fn read(dir: &std::path::Path) -> Result<Self, String> {
         let path = Endpoint::path(dir);
         let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -387,9 +407,19 @@ fn commands(command: &Command) -> Result<Vec<Request>, String> {
                 PreviewSize::OneToOne => rawmakase_protocol::request::PreviewKind::OneToOne,
             },
         }],
-        Command::Export { path, max_edge, .. } => vec![Request::Export {
+        Command::Export {
+            path,
+            max_edge,
+            color_space,
+            ..
+        } => vec![Request::Export {
             path: absolute(path)?,
             max_edge: *max_edge,
+            color_space: color_space.map(|s| match s {
+                ColorSpace::Srgb => rawmakase_protocol::request::ColorSpace::Srgb,
+                ColorSpace::AdobeRgb => rawmakase_protocol::request::ColorSpace::AdobeRgb,
+                ColorSpace::Prophoto => rawmakase_protocol::request::ColorSpace::Prophoto,
+            }),
         }],
         Command::Preview { path, max_edge, .. } => vec![Request::Preview {
             path: absolute(path)?,
@@ -492,6 +522,8 @@ fn wait_loaded(connection: &Connection, id: Option<i64>, seconds: u64) -> Result
     }
 }
 
+/// Runs `cli`'s command against the running app and prints the answer; `controls`
+/// prints the device's mapping without asking the app.
 pub fn run(cli: Cli) -> Result<(), String> {
     if let Command::Controls = cli.command {
         for (title, section, key) in [
@@ -773,6 +805,30 @@ mod tests {
         assert_eq!(
             requests(&cli.command).unwrap(),
             [json!({"cmd": "set", "param": "exposure", "value": 0.5})]
+        );
+    }
+
+    /// `export --color-space` is forwarded to the socket by its names; without it
+    /// the request leaves the space out, which means sRGB.
+    #[test]
+    fn export_forwards_its_color_space() {
+        let path = std::env::temp_dir().join("e.tif");
+        let path = path.to_str().unwrap();
+        let cli = Cli::try_parse_from(["rawmakase-ctl", "export", path]).unwrap();
+        assert_eq!(
+            requests(&cli.command).unwrap(),
+            [json!({"cmd": "export", "path": path})]
+        );
+        for name in ["srgb", "adobe-rgb", "prophoto"] {
+            let cli = Cli::try_parse_from(["rawmakase-ctl", "export", path, "--color-space", name])
+                .unwrap();
+            assert_eq!(
+                requests(&cli.command).unwrap(),
+                [json!({"cmd": "export", "path": path, "color_space": name})]
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["rawmakase-ctl", "export", path, "--color-space", "p3"]).is_err()
         );
     }
 }

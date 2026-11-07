@@ -14,9 +14,9 @@ use crate::catalog::ingest::{Matched, Place};
 use crate::catalog::{Catalog, PhotoId};
 use crate::storage::{ChecksumRead, FileChecksum, Identity};
 use anyhow::{Result, bail};
+use rawmakase_cancel::Cancel;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What Find on Disk works from: the catalog in one snapshot, as a
 /// synchronization's, and the file picked for a photo.
@@ -77,15 +77,15 @@ enum Evidence {
 /// of its folder in the same directory. Refuses, with why, a file that
 /// isn't that photo by the checksum on record, an unverified file for a
 /// photo whose old location is only offline, and a directory that can't
-/// go in the catalog. `online`, `cancel` and `progress` are as [`super::scan`]'s.
+/// go in the catalog. `online`, `cancel` and `progress` are as [`super::scan`](fn@super::scan)'s.
 pub fn find_on_disk(
     inputs: &FindInputs,
     online: &dyn Fn(&Path) -> bool,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
     progress: &dyn Fn(usize),
 ) -> Result<SyncPlan> {
     let s = &inputs.sync;
-    let go_on = |_: usize| !cancel.load(Ordering::Relaxed);
+    let go_on = |_: usize| !cancel.is_cancelled();
     let stopped = || anyhow::anyhow!("Find on Disk stopped");
     let Some(master) = s.masters.get(&inputs.photo) else {
         bail!("The photo is no longer in the catalog");
@@ -256,7 +256,7 @@ pub fn find_on_disk(
             }
         }
         for (n, path) in files.iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.is_cancelled() {
                 return Err(stopped());
             }
             progress(n + 1);
@@ -336,7 +336,7 @@ pub fn find_on_disk(
             found.insert(path.clone(), (identity, hits));
         }
     }
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.is_cancelled() {
         return Err(stopped());
     }
     // A photo two files claim, or a file two photos claim, is the user's

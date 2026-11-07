@@ -3,7 +3,9 @@ use crate::{
     catalog::{Catalog, HistoryUpdate, PhotoId},
     export_settings::{Destination, Format},
 };
+use rawmakase_cancel::Cancel;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A photo of a batch at `source`, without an edit.
 fn photo(source: &Path) -> BatchPhoto {
@@ -224,11 +226,12 @@ impl Fixture {
             watermark: None,
             demosaic: Default::default(),
             cache: Default::default(),
+            ai: crate::ai_denoise::AiService::refusing("no AI Denoise in tests"),
         }
     }
 }
 fn run_all(batch: &Batch) -> Vec<Outcome> {
-    run(batch, &AtomicBool::new(false), |_| {})
+    run(batch, Cancel::NEVER, |_| {})
 }
 fn exported(outcome: &Outcome) -> &Path {
     match outcome {
@@ -267,6 +270,7 @@ fn every_photo_is_exported_with_its_own_edit_or_said_why_not() -> Result<()> {
         f.catalog.save_edit(
             id,
             path,
+            &crate::storage::Identity::read(path)?,
             &brighter,
             &Default::default(),
             HistoryUpdate::Keep,
@@ -420,7 +424,7 @@ fn cancel_before_a_commit_leaves_nothing_and_after_it_counts_as_exported() -> Re
         let out = f.out().join(format!("{at}"));
         let batch = f.batch(photos.clone(), settings(&out));
         let cancel = AtomicBool::new(false);
-        let outcomes = run(&batch, &cancel, |p| {
+        let outcomes = run(&batch, Cancel::new(&cancel), |p| {
             if p.done == 0 && p.fraction >= at {
                 cancel.store(true, Ordering::Relaxed);
             }
@@ -453,14 +457,26 @@ fn a_batch_exports_the_edits_as_they_were_when_export_was_pressed() -> Result<()
     let (profiles, _) = crate::camera_profiles::installed(&m);
     let mut edit = Recipe::with_profiles(&m, &profiles);
     edit.exposure = 0.5;
-    f.catalog
-        .save_edit(*id, path, &edit, &Default::default(), HistoryUpdate::Keep)?;
+    f.catalog.save_edit(
+        *id,
+        path,
+        &crate::storage::Identity::read(path)?,
+        &edit,
+        &Default::default(),
+        HistoryUpdate::Keep,
+    )?;
     let before = f.batch(f.batch_photos()?, settings(&f.out().join("before")));
     let expected = run_all(&before);
     // Edited again after Export was pressed.
     edit.exposure = -1.;
-    f.catalog
-        .save_edit(*id, path, &edit, &Default::default(), HistoryUpdate::Keep)?;
+    f.catalog.save_edit(
+        *id,
+        path,
+        &crate::storage::Identity::read(path)?,
+        &edit,
+        &Default::default(),
+        HistoryUpdate::Keep,
+    )?;
     let snapshot = Batch {
         settings: settings(&f.out().join("after")),
         plan: plan(&before.photos, &settings(&f.out().join("after")), None).unwrap(),
@@ -591,6 +607,10 @@ fn the_open_photo_is_not_exported_over_a_file_replaced_since() -> Result<()> {
         file,
     };
     photos[0].edit = shown(Some(crate::storage::Identity::read(a)?));
+    // Only its modification time changed (issue #870): still the photo shown.
+    let file = std::fs::File::options().write(true).open(a)?;
+    file.set_modified(file.metadata()?.modified()? + std::time::Duration::from_secs(2))?;
+    drop(file);
     // Another file than the one shown.
     photos[1].edit = shown(Some(crate::storage::Identity::read(b)?));
     let mut bytes = std::fs::read(b)?;
@@ -703,6 +723,7 @@ fn exporting_a_jpeg_never_replaces_it() -> Result<()> {
             watermark: None,
             demosaic: Default::default(),
             cache: Default::default(),
+            ai: crate::ai_denoise::AiService::refusing("no AI Denoise in tests"),
         };
         run_all(&batch)
     };
@@ -765,4 +786,39 @@ fn a_custom_template_names_from_the_fields_taken_at_export() {
         plan.entries[1].notes,
         ["the camera's make and model were not read"]
     );
+}
+
+/// A photo with AI Denoise on and no AI result to be had fails with the reason; the
+/// batch carries on with the others, and never writes that photo without AI Denoise.
+#[test]
+fn a_photo_without_its_ai_result_fails_and_the_batch_carries_on() -> Result<()> {
+    let mut f = fixture(&["a.dng", "b.dng"])?;
+    let [(a, a_path), _] = &f.photos[..] else {
+        panic!("two photos");
+    };
+    let m = crate::photo::open(a_path)?.metadata;
+    let (profiles, _) = crate::camera_profiles::installed(&m);
+    let mut denoised = Recipe::with_profiles(&m, &profiles);
+    denoised.ai_denoise = crate::model::ai_denoise::AiDenoise {
+        enabled: true,
+        amount: 0.5,
+    };
+    f.catalog.save_edit(
+        *a,
+        a_path,
+        &crate::storage::Identity::read(a_path)?,
+        &denoised,
+        &Default::default(),
+        HistoryUpdate::Keep,
+    )?;
+    let outcomes = run_all(&f.batch(f.batch_photos()?, settings(&f.out())));
+    match &outcomes[0] {
+        Outcome::Failed(reason) => {
+            assert!(reason.contains("no AI Denoise in tests"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    exported(&outcomes[1]);
+    assert_eq!(listing(&f.out()), ["b.tif"]);
+    Ok(())
 }

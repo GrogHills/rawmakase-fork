@@ -6,8 +6,6 @@ on:
     paths-ignore:
       - 'website/**'
       - '.github/workflows/website.yml'
-      - 'stats/**'
-      - '.github/workflows/stats.yml'
       - '.github/workflows/codeql.yml'
       - '.github/triage.yml'
       - '.github/workflows/triage.yml'
@@ -17,8 +15,6 @@ on:
     paths-ignore:
       - 'website/**'
       - '.github/workflows/website.yml'
-      - 'stats/**'
-      - '.github/workflows/stats.yml'
       - '.github/workflows/codeql.yml'
       - '.github/triage.yml'
       - '.github/workflows/triage.yml'
@@ -58,11 +54,13 @@ jobs:
     steps:
       # rustup replaces Arch's rolling rust package: the lints a clippy release
       # adds would otherwise break the lint job on an ordinary day. rustup
-      # conflicts with the rust package, so it takes its place here.
+      # conflicts with the rust package, so it takes its place here. libheif
+      # (with its built-in HEVC decoder) lets the HEIC pixel tests run here;
+      # the Ubuntu jobs have none and skip them.
       - name: Install dependencies
         run: >-
           pacman -Syu --noconfirm --needed
-          rustup git pkgconf desktop-file-utils perl-image-exiftool
+          rustup git pkgconf desktop-file-utils perl-image-exiftool libheif
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source-ref || github.sha }}
@@ -92,23 +90,20 @@ jobs:
       # without the RAW decoders or GUI; fmt above covers the whole workspace.
       - name: Check the model, file formats, catalog, renderer, control protocol, remote worker and client
         run: |
-          cargo clippy --locked --all-targets -p rawmakase-tiff -p rawmakase-raw -p rawmakase-model -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine -p rawmakase-protocol -p rawmakase-remote -p rawmakase-ctl -- -D warnings
+          cargo clippy --locked --all-targets -p rawmakase-cancel -p rawmakase-fs -p rawmakase-tiff -p rawmakase-raw -p rawmakase-model -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine -p rawmakase-protocol -p rawmakase-remote -p rawmakase-ctl -- -D warnings
           cargo test --locked -p rawmakase-model --all-features
-          cargo test --locked -p rawmakase-tiff -p rawmakase-raw -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine
+          cargo test --locked -p rawmakase-cancel -p rawmakase-fs -p rawmakase-tiff -p rawmakase-raw -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine
           cargo test --locked -p rawmakase-protocol -p rawmakase-remote -p rawmakase-ctl
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Tests that need private RAW files, camera profiles or a GPU are #[ignore]d.
       # exiftool reads exported metadata back as an independent reader; Arch
       # installs it in vendor_perl, outside PATH.
+      # libheif, installed above, decodes the HEIC pixel tests, which fail
+      # here rather than skip without it.
       - run: PATH="/usr/bin/vendor_perl:$PATH" cargo test --locked -p rawmakase -p rawmakase-decode -p rawmakase-export
         env:
           RAWMAKASE_REQUIRE_EXIFTOOL: "1"
-      # Packagers may leave out RAWmakase's own HEVC decoder (HEVC is
-      # patented; docs/dependencies.md): build, lint and test that too.
-      - name: Without the software HEVC decoder
-        run: |
-          cargo clippy --locked --all-targets --no-default-features -p rawmakase -p rawmakase-decode -- -D warnings
-          cargo test --locked --no-default-features -p rawmakase-decode
+          RAWMAKASE_REQUIRE_HEIF: "1"
       - name: Validate desktop entry
         run: desktop-file-validate packaging/applications/rawmakase.desktop
 
@@ -243,11 +238,40 @@ jobs:
             python -c "import ctypes; ctypes.CDLL('/usr/lib/rawmakase/libonnxruntime.so')"
           fi
 
+  docs:
+    name: Documentation
+    # rustdoc warnings fail this job, among them a link in any item's docs,
+    # private ones included, that no longer resolves. Private items are
+    # documented, so a public item's link to a private one resolves and is
+    # allowed. Linux with every feature: items only built for Windows or macOS
+    # are not documented here (`make check` documents the macOS ones).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libvulkan1 libxkbcommon-dev libwayland-dev
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
+      - run: cargo doc --workspace --all-features --no-deps --locked --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+
   dependencies:
     name: Module dependencies
     # scripts/deps-allowed.txt lists the dependencies between top-level modules;
     # a new one, a listed one the code no longer has, a cycle, or a chain that
-    # scripts/deps-closures.txt forbids fails this job.
+    # scripts/deps-closures.txt forbids fails this job, as does a workspace crate
+    # depending on one scripts/deps-crates.txt forbids.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -290,7 +314,7 @@ jobs:
           rustup default stable
       - run: scripts/crate-closures.sh
       - run: cargo test --locked -p rawmakase-model --all-features
-      - run: cargo test --locked -p rawmakase-tiff -p rawmakase-raw -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine -p rawmakase-protocol
+      - run: cargo test --locked -p rawmakase-cancel -p rawmakase-fs -p rawmakase-tiff -p rawmakase-raw -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine -p rawmakase-protocol
       - run: cargo test --locked -p rawmakase-decode
 
   postgres:

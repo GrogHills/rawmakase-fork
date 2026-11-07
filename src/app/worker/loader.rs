@@ -9,13 +9,10 @@ use crate::{
     raw::thumbnail,
 };
 use eframe::egui;
+use rawmakase_cancel::Cancel;
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
-    },
+    sync::{Arc, Mutex, atomic::Ordering, mpsc::Sender},
     time::Instant,
 };
 /// The slow second stage of opening a photo, run on its own worker so the
@@ -23,6 +20,8 @@ use std::{
 struct FullJob {
     id: u64,
     path: std::path::PathBuf,
+    /// The file as read before its first decode, carried with every image of it.
+    file: Option<crate::storage::Identity>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     started: Instant,
     full: FullSize,
@@ -31,6 +30,18 @@ struct FullJob {
 /// What a failed load says: why Develop refuses the file, or the error.
 fn load_error(path: &std::path::Path, e: &anyhow::Error) -> String {
     crate::app::library::Refusal::opening(path, e).map_or_else(|| format!("{e:#}"), |r| r.detail())
+}
+/// Errs when the file at `path` is no longer `file`, the version read before it
+/// was opened: what was read or decoded since may be of another file. Without
+/// one there is nothing to check (and nothing is decode-cached).
+fn unchanged(path: &Path, file: Option<&crate::storage::Identity>) -> anyhow::Result<()> {
+    if let Some(file) = file {
+        anyhow::ensure!(
+            crate::storage::Identity::read(path).ok().as_ref() == Some(file),
+            "The file changed while it was opening; open it again"
+        );
+    }
+    Ok(())
 }
 /// Runs `load`, turning a panic into an error, so the photo does not stay loading.
 fn caught(load: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
@@ -59,7 +70,7 @@ impl Ahead {
     }
     /// Opens `path` and holds it, dropping what was held first. A cancelled
     /// prefetch keeps nothing: the photo it was for has been moved past or opened.
-    fn prefetch(&self, path: &Path, cancel: &AtomicBool) {
+    fn prefetch(&self, path: &Path, cancel: Cancel<'_>) {
         *self.held() = None;
         let Ok(identity) = crate::storage::Identity::read(path) else {
             return;
@@ -67,7 +78,7 @@ impl Ahead {
         let Ok(Opened::Rendered(image)) = crate::photo::open_source(path, cancel) else {
             return;
         };
-        if !cancel.load(Ordering::Relaxed) {
+        if !cancel.is_cancelled() {
             *self.held() = Some(Held {
                 path: path.into(),
                 identity,
@@ -75,12 +86,15 @@ impl Ahead {
             });
         }
     }
-    /// What was prefetched, if it is `path` as the file is now. Empties the slot
-    /// either way, so a prefetch is never held past the next load.
-    fn take(&self, path: &Path) -> Option<CameraImage> {
+    /// What was prefetched, if it is `path` as `file` (read by the load) names
+    /// it and as the file is now. Empties the slot either way, so a prefetch is
+    /// never held past the next load.
+    fn take(&self, path: &Path, file: Option<&crate::storage::Identity>) -> Option<CameraImage> {
         let held = self.held().take()?;
-        (held.path == path && crate::storage::Identity::read(path).ok() == Some(held.identity))
-            .then_some(held.image)
+        (held.path == path
+            && file == Some(&held.identity)
+            && crate::storage::Identity::read(path).ok() == Some(held.identity))
+        .then_some(held.image)
     }
 }
 /// Develops a neighbour on two threads, leaving the other cores to rendering the
@@ -96,18 +110,37 @@ fn prefetcher(cache: DecodeCache, ahead: Ahead) -> Latest<Prefetch> {
             return;
         }
         if !crate::storage::is_raw(&job.path) {
-            pool.install(|| ahead.prefetch(&job.path, &job.cancel));
+            pool.install(|| ahead.prefetch(&job.path, Cancel::new(&job.cancel)));
             return;
         }
         let full = FullSize::with_cache(&job.path, job.demosaic, cache.clone());
         let open = || crate::photo::open(&job.path);
-        let _ = pool.install(|| full.get(open, DecodePolicy::Prefetch, &job.cancel));
+        let _ = pool.install(|| full.get(open, DecodePolicy::Prefetch, Cancel::new(&job.cancel)));
     })
+}
+/// Runs as a photo's full-size stage starts and once it has opened the file;
+/// tests stand in a file replaced there. Nothing in the app sets one.
+#[derive(Clone, Default)]
+struct Between(Option<Hook>);
+type Hook = Arc<dyn Fn(&Path, FullStage) + Send + Sync>;
+/// Where in the full-size stage [`Between`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullStage {
+    Start,
+    Opened,
+}
+impl Between {
+    fn run(&self, path: &Path, stage: FullStage) {
+        if let Some(hook) = &self.0 {
+            hook(path, stage);
+        }
+    }
 }
 fn full_loader(
     tx: Sender<Event>,
     ctx: egui::Context,
     prefetcher: Mailbox<Prefetch>,
+    between: Between,
 ) -> Latest<FullJob> {
     Latest::new(move |mut job: FullJob| {
         let prefetch = job.prefetch.take();
@@ -115,22 +148,35 @@ fn full_loader(
             if job.cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            between.run(&job.path, FullStage::Start);
             {
+                // Checked before and after: the decoder keeps what it read, so a file
+                // put back between the two would pass the second check alone.
+                unchanged(&job.path, job.file.as_ref())?;
                 let raw = crate::photo::open(&job.path)?;
-                let image = Arc::new(job.full.decode(raw, DecodePolicy::Show, &job.cancel)?);
+                between.run(&job.path, FullStage::Opened);
+                let image = Arc::new(job.full.decode(
+                    raw,
+                    DecodePolicy::Show,
+                    Cancel::new(&job.cancel),
+                )?);
                 if job.cancel.load(Ordering::Relaxed) {
                     return Ok(());
                 }
+                // Opened again: shown and stored only if it is still the version the
+                // first stage read.
+                unchanged(&job.path, job.file.as_ref())?;
                 send(
                     &tx,
                     &ctx,
                     Event::Ready {
                         id: job.id,
                         full: image.clone(),
+                        file: job.file.clone(),
                         status: format!("Developed in {:.2}s", job.started.elapsed().as_secs_f32()),
                     },
                 );
-                job.full.store(&image, &job.cancel);
+                job.full.store(&image, Cancel::new(&job.cancel));
             }
             // Only now, so decoding the neighbour never slows the photo on screen.
             if let Some(prefetch) = prefetch {
@@ -162,13 +208,19 @@ pub(crate) struct Loader {
 }
 impl Loader {
     pub(crate) fn new(tx: Sender<Event>, ctx: egui::Context, cache: DecodeCache) -> Self {
-        Self::with_parts(tx, ctx, cache, Ahead::default())
+        Self::with_parts(tx, ctx, cache, Ahead::default(), Between::default())
     }
-    /// A loader whose full-size decodes are kept in `cache` and whose prefetched
-    /// rendered files in `ahead`.
-    fn with_parts(tx: Sender<Event>, ctx: egui::Context, cache: DecodeCache, ahead: Ahead) -> Self {
+    /// A loader whose full-size decodes are kept in `cache`, whose prefetched
+    /// rendered files in `ahead`, running `between` before each full-size stage.
+    fn with_parts(
+        tx: Sender<Event>,
+        ctx: egui::Context,
+        cache: DecodeCache,
+        ahead: Ahead,
+        between: Between,
+    ) -> Self {
         let prefetch = prefetcher(cache.clone(), ahead.clone());
-        let full = full_loader(tx.clone(), ctx.clone(), prefetch.mailbox());
+        let full = full_loader(tx.clone(), ctx.clone(), prefetch.mailbox(), between);
         let open = opener(tx, ctx, cache, ahead, full.mailbox(), prefetch.mailbox());
         Self {
             open,
@@ -197,27 +249,43 @@ fn opener(
         let result = caught(|| -> anyhow::Result<()> {
             let path = job.path.clone();
             let started = Instant::now();
-            let prefetched = ahead.take(&path);
+            // Read before anything is decoded: every image sent below is of this file or,
+            // if it is replaced meanwhile, of one that no longer matches (AI Denoise then
+            // refuses rather than mixing the two).
+            let file = crate::storage::Identity::read(&path).ok();
+            let prefetched = ahead.take(&path, file.as_ref());
             let was_ahead = prefetched.is_some();
             let opened = match prefetched {
                 Some(image) => Opened::Rendered(image),
-                None => crate::photo::open_source(&path, &job.cancel)?,
+                None => crate::photo::open_source(&path, Cancel::new(&job.cancel))?,
             };
+            unchanged(&path, file.as_ref())?;
             let metadata = opened.metadata().clone();
             let crate::camera_profiles::Listed {
                 profiles,
                 errors,
                 groups,
             } = crate::camera_profiles::listed(&metadata);
+            // A photo without colour data starts from its fitted camera look, fitted
+            // (or read from the fit cache) before its defaults are installed.
+            let profiles = crate::camera_look::with_default(
+                &path,
+                &metadata,
+                profiles,
+                Cancel::new(&job.cancel),
+            );
             // The raw defaults; the catalog's edit replaces them once the header
             // is installed.
-            let recipe = job.defaults.resolve(&metadata, &profiles).recipe;
+            let recipe = crate::edits::Start::Defaults(job.defaults.clone())
+                .resolve(&metadata, &profiles)?
+                .recipe;
             send(
                 &tx,
                 &ctx,
                 Event::Header(Box::new(LoadedHeader {
                     id: job.id,
                     path: path.clone(),
+                    file: file.clone(),
                     metadata,
                     recipe,
                     export: ExportOptions::default(),
@@ -232,6 +300,7 @@ fn opener(
                     profiles,
                     errors,
                     groups,
+                    imported: false,
                 },
             );
             let mut raw = match opened {
@@ -248,6 +317,7 @@ fn opener(
                         Event::Ready {
                             id: job.id,
                             full: Arc::new(image),
+                            file,
                             status: if was_ahead {
                                 "Opened ahead of time".into()
                             } else {
@@ -289,7 +359,7 @@ fn opener(
                 return Ok(());
             }
             let t = Instant::now();
-            let full_size = FullSize::with_cache(&path, job.demosaic, cache.clone());
+            let full_size = FullSize::of_version(file.as_ref(), job.demosaic, cache.clone());
             if let Some(image) = full_size.cached(&raw.metadata) {
                 // Closed before the photo is ready: Windows refuses to rename or
                 // replace a file that is still open.
@@ -300,6 +370,7 @@ fn opener(
                     Event::Ready {
                         id: job.id,
                         full: Arc::new(image),
+                        file,
                         status: format!("Opened from cache in {:.2}s", t.elapsed().as_secs_f32()),
                     },
                 );
@@ -311,19 +382,22 @@ fn opener(
             // Lightroom-style two stages: a half-size decode (about 0.2 s) makes
             // the photo editable at once; the full-resolution decode, which can
             // take seconds, then replaces it for 100% views and export.
-            let quick = Arc::new(raw.develop(Decode::Half, &job.cancel)?);
+            let quick = Arc::new(raw.develop(Decode::Half, Cancel::new(&job.cancel))?);
+            unchanged(&path, file.as_ref())?;
             send(
                 &tx,
                 &ctx,
                 Event::Ready {
                     id: job.id,
                     full: quick,
+                    file: file.clone(),
                     status: "Loading full resolution…".into(),
                 },
             );
             full.submit(FullJob {
                 id: job.id,
                 path,
+                file,
                 cancel: job.cancel.clone(),
                 started: t,
                 full: full_size,
@@ -360,12 +434,22 @@ pub(in crate::app) mod tests {
     }
     /// As [`load`], with `ahead` holding what was prefetched.
     fn load_with(path: &std::path::Path, cache: &std::path::Path, ahead: Ahead) -> Vec<Event> {
+        load_between(path, cache, ahead, Between::default())
+    }
+    /// As [`load_with`], running `between` before the full-size stage.
+    fn load_between(
+        path: &std::path::Path,
+        cache: &std::path::Path,
+        ahead: Ahead,
+        between: Between,
+    ) -> Vec<Event> {
         let (tx, rx) = mpsc::channel();
         let mut loader = Loader::with_parts(
             tx,
             egui::Context::default(),
             DecodeCache::new(cache.into(), u64::MAX),
             ahead,
+            between,
         );
         loader.submit(LoadJob {
             id: 7,
@@ -447,10 +531,20 @@ pub(in crate::app) mod tests {
     }
 
     /// A HEIC opens as a JPEG does: at full size at once, with its own
-    /// profile, and never decode-cached.
-    #[cfg(feature = "software-hevc")]
+    /// profile, and never decode-cached; where this system decodes HEIC
+    /// (macOS, and Linux with libheif).
+    #[cfg(not(windows))]
     #[test]
     fn a_heic_loads_straight_to_full_size() -> anyhow::Result<()> {
+        if let Err(why) = crate::raster::heif_decoder() {
+            // CI's Arch job requires one (see raster's tests).
+            assert!(
+                std::env::var_os("RAWMAKASE_REQUIRE_HEIF").is_none(),
+                "{why}"
+            );
+            eprintln!("HEIC pixels not tested: {why}");
+            return Ok(());
+        }
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("IMG_0001.HEIC");
         std::fs::copy(
@@ -485,20 +579,126 @@ pub(in crate::app) mod tests {
         }
     }
 
+    /// A RAW replaced between its half-size and full-size stages: the full-size
+    /// decode, of the file now there, is neither shown nor stored as the photo
+    /// opened, and the load says why.
+    #[test]
+    fn a_raw_replaced_before_its_full_size_stage_is_not_shown_or_cached() -> anyhow::Result<()> {
+        let charts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/charts");
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("photo.dng");
+        std::fs::copy(charts.join("synthetic-a.dng"), &path)?;
+        let opened = crate::storage::Identity::read(&path)?;
+        let cache = dir.path().join("decoded");
+        let replacement = charts.join("canon-eos-r7-d65.dng");
+        let between = Between(Some(Arc::new(move |path: &Path, stage| {
+            if stage == FullStage::Start {
+                std::fs::copy(&replacement, path).unwrap();
+            }
+        })));
+
+        let events = load_between(&path, &cache, Ahead::default(), between);
+
+        let Event::Header(header) = &events[0] else {
+            panic!("{:?}", events.iter().map(name).collect::<Vec<_>>())
+        };
+        assert_eq!(header.file.as_ref(), Some(&opened));
+        let model = header.metadata.model.clone();
+        for event in &events {
+            if let Event::Ready { full, file, .. } = event {
+                assert!(
+                    full.fast,
+                    "the full-size image of the file now there was shown"
+                );
+                assert_eq!(full.metadata.model, model);
+                assert_eq!(file.as_ref(), Some(&opened));
+            }
+        }
+        match events.last() {
+            Some(Event::Failed {
+                task: TaskKind::Load,
+                error,
+                ..
+            }) => assert!(error.contains("changed"), "{error}"),
+            _ => panic!("{:?}", events.iter().map(name).collect::<Vec<_>>()),
+        }
+        let cached = std::fs::read_dir(&cache).map_or(0, |entries| entries.count());
+        assert_eq!(cached, 0, "nothing stored for the photo opened");
+        Ok(())
+    }
+
+    /// Replaced before its full-size stage and put back once that stage has read
+    /// the replacement: the file then matches again, but what was read is not it.
+    #[test]
+    fn a_raw_put_back_while_its_full_size_stage_reads_is_not_shown() -> anyhow::Result<()> {
+        let charts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/charts");
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("photo.dng");
+        let original = charts.join("synthetic-a.dng");
+        std::fs::copy(&original, &path)?;
+        let modified = std::fs::metadata(&path)?.modified()?;
+        let cache = dir.path().join("decoded");
+        let replacement = charts.join("canon-eos-r7-d65.dng");
+        let between = Between(Some(Arc::new(move |path: &Path, stage| {
+            match stage {
+                FullStage::Start => std::fs::copy(&replacement, path),
+                FullStage::Opened => std::fs::copy(&original, path),
+            }
+            .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        })));
+
+        let events = load_between(&path, &cache, Ahead::default(), between);
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Ready { full, .. } if !full.fast)),
+            "{:?}",
+            events.iter().map(name).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Failed {
+                task: TaskKind::Load,
+                ..
+            })
+        ));
+        let cached = std::fs::read_dir(&cache).map_or(0, |entries| entries.count());
+        assert_eq!(cached, 0, "nothing stored for the photo opened");
+        Ok(())
+    }
+
     #[test]
     fn a_prefetched_jpeg_opens_without_decoding_again() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("next.jpg");
         image::RgbImage::from_pixel(40, 30, image::Rgb([120, 90, 60])).save(&path)?;
         let ahead = Ahead::default();
-        ahead.prefetch(&path, &AtomicBool::new(false));
+        ahead.prefetch(&path, Cancel::NEVER);
 
         let events = load_with(&path, &dir.path().join("decoded"), ahead.clone());
 
         let (full, status) = ready(&events);
         assert_eq!((full.width, full.height), (40, 30));
         assert!(status.starts_with("Opened ahead of time"), "{status}");
-        assert!(ahead.take(&path).is_none(), "taken, not held twice");
+        // The file it was opened from, as for any other load: what its saves, and
+        // its thumbnail in the Library, are kept for.
+        let Some(Event::Ready { file, .. }) = events.last() else {
+            unreachable!()
+        };
+        assert_eq!(file.as_ref(), Some(&crate::storage::Identity::read(&path)?));
+        assert!(
+            ahead
+                .take(&path, crate::storage::Identity::read(&path).ok().as_ref())
+                .is_none(),
+            "taken, not held twice"
+        );
         Ok(())
     }
 
@@ -508,7 +708,7 @@ pub(in crate::app) mod tests {
         let path = dir.path().join("next.jpg");
         image::RgbImage::from_pixel(40, 30, image::Rgb([120, 90, 60])).save(&path)?;
         let ahead = Ahead::default();
-        ahead.prefetch(&path, &AtomicBool::new(false));
+        ahead.prefetch(&path, Cancel::NEVER);
         image::RgbImage::from_pixel(20, 10, image::Rgb([20, 30, 40])).save(&path)?;
 
         let events = load_with(&path, &dir.path().join("decoded"), ahead);
@@ -531,7 +731,7 @@ pub(in crate::app) mod tests {
             (m.len(), m.modified()?)
         };
         let ahead = Ahead::default();
-        ahead.prefetch(&path, &AtomicBool::new(false));
+        ahead.prefetch(&path, Cancel::NEVER);
         image::RgbImage::from_pixel(40, 30, image::Rgb([0, 0, 200])).save(&path)?;
         std::fs::File::options()
             .write(true)
@@ -544,7 +744,11 @@ pub(in crate::app) mod tests {
             "same size and time"
         );
 
-        assert!(ahead.take(&path).is_none());
+        assert!(
+            ahead
+                .take(&path, crate::storage::Identity::read(&path).ok().as_ref())
+                .is_none()
+        );
         Ok(())
     }
 
@@ -555,9 +759,16 @@ pub(in crate::app) mod tests {
         image::RgbImage::new(4, 4).save(&path)?;
         let ahead = Ahead::default();
 
-        ahead.prefetch(&path, &AtomicBool::new(true));
+        ahead.prefetch(
+            &path,
+            Cancel::new(&std::sync::atomic::AtomicBool::new(true)),
+        );
 
-        assert!(ahead.take(&path).is_none());
+        assert!(
+            ahead
+                .take(&path, crate::storage::Identity::read(&path).ok().as_ref())
+                .is_none()
+        );
         Ok(())
     }
 

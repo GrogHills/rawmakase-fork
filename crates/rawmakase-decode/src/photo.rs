@@ -8,9 +8,9 @@
 use crate::raster;
 use crate::raw::Raw;
 use anyhow::Result;
+use rawmakase_cancel::Cancel;
 use rawmakase_model::camera_data::{CameraImage, Metadata};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
 /// The imported lens profiles, shared by everything that opens photos (Develop's
 /// loaders, the Library's previews, exports, Sync Settings) so they are read once
@@ -35,7 +35,7 @@ impl Opened {
 /// Opens `path` as a RAW when its extension is a RAW's, otherwise as a
 /// JPEG, PNG or TIFF. A rendered file opens as the scene its default rendering is of
 /// (`develop::rendered`), which Develop renders as a raw scene.
-pub fn open_source(path: &Path, cancel: &AtomicBool) -> Result<Opened> {
+pub fn open_source(path: &Path, cancel: Cancel<'_>) -> Result<Opened> {
     if rawmakase_model::storage::is_raw(path) {
         open(path).map(Opened::Raw)
     } else {
@@ -63,7 +63,7 @@ pub fn raw_xmp(path: &Path) -> Option<Vec<u8>> {
 pub fn open(path: &Path) -> Result<Raw> {
     let mut raw = Raw::open_file(path)?;
     let metadata = &mut raw.metadata;
-    let builtin = crate::lens::embedded::read_builtin(path, metadata);
+    let builtin = crate::raw::lens::read_builtin(path, metadata);
     (metadata.lens, metadata.lens_stand_in) = (builtin.lens, builtin.stand_in);
     if let Some(dng) = crate::dng::read(path) {
         // 0 is the DNG default; the camera table is for other raw formats.
@@ -87,7 +87,14 @@ pub fn open(path: &Path) -> Result<Raw> {
                 .profile_calibration_signature
                 .filter(|signature| !signature.is_empty());
         }
-        let fits = profile.is_some_and(|p| p.ensure_camera(metadata).is_ok());
+        let fits = profile
+            .as_ref()
+            .is_some_and(|p| p.ensure_camera(metadata).is_ok());
+        metadata.embedded_profile_status = embedded_profile_status(
+            dng.profile.is_some() || dng.profile_unreadable,
+            profile.is_some().then_some(fits),
+            color_matrix.is_some(),
+        );
         metadata.embedded_dcp = dng.profile.filter(|_| fits).map(std::sync::Arc::from);
         // A DNG the decoder found no XYZ-to-camera matrix for, written with
         // colour matrices but no profile, would render without a profile at
@@ -100,6 +107,7 @@ pub fn open(path: &Path) -> Result<Raw> {
             && matrix.iter().flatten().any(|v| *v != 0.)
         {
             metadata.cam_xyz = matrix;
+            metadata.matrix_source = rawmakase_model::camera_data::MatrixSource::File;
         }
         if dng.lens.is_some() {
             metadata.lens = dng.lens;
@@ -120,11 +128,97 @@ pub fn open(path: &Path) -> Result<Raw> {
     if let Some(lens) = metadata.lens_profiles.lens_by_id(metadata) {
         metadata.lens_model = lens.to_string();
     }
+    // Older Nikon bodies record no lens name either, only the lens's focal range and
+    // apertures: name it from those, as Camera Raw does, so Lensfun can match it.
+    if metadata.lens_model.is_empty()
+        && let Some(info) = metadata.lens_info
+    {
+        metadata.lens_model = rawmakase_model::lens::lcp::lens_info_name(info);
+    }
     Ok(raw)
 }
 
+/// What a DNG's embedded profile tags are to its photo: none, a profile that
+/// parses and fits the camera, one for another camera, colour matrices alone, or
+/// tags that are neither (an error that must not read as no profile). `parsed`
+/// is whether a profile parsed, and then whether it fits the camera.
+fn embedded_profile_status(
+    present: bool,
+    parsed: Option<bool>,
+    matrix_only: bool,
+) -> rawmakase_model::camera_data::EmbeddedProfileStatus {
+    use rawmakase_model::camera_data::EmbeddedProfileStatus as S;
+    match (present, parsed, matrix_only) {
+        (false, ..) => S::None,
+        (true, Some(true), _) => S::Usable,
+        (true, Some(false), _) => S::OtherCamera,
+        (true, None, true) => S::MatrixOnly,
+        (true, None, false) => S::Unreadable,
+    }
+}
 #[cfg(test)]
 mod tests {
+    use rawmakase_cancel::Cancel;
+    #[test]
+    fn an_embedded_profile_is_told_from_none_and_from_an_unreadable_one() {
+        use rawmakase_model::camera_data::{EmbeddedProfileStatus as S, MatrixSource};
+        let chart = |name: &str| {
+            let path = format!(
+                "{}/../../tests/corpus/charts/{name}.dng",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            super::open(std::path::Path::new(&path)).unwrap().metadata
+        };
+        let named = chart("synthetic-d65");
+        assert_eq!(named.embedded_profile_status, S::Usable);
+        let matrix = chart("synthetic-d65-matrix-only");
+        assert_eq!(matrix.embedded_profile_status, S::MatrixOnly);
+        assert_eq!(matrix.matrix_source, MatrixSource::File);
+        // The chart's IFD0 entries rewritten by `patch` (tag, then the entry's 12
+        // bytes), in a copy.
+        let dir = tempfile::tempdir().unwrap();
+        let patched = |name: &str, patch: &dyn Fn(u16, &mut [u8])| {
+            let path = format!(
+                "{}/../../tests/corpus/charts/synthetic-d65.dng",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let mut bytes = std::fs::read(path).unwrap();
+            let first = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            let count = u16::from_le_bytes(bytes[first..first + 2].try_into().unwrap()) as usize;
+            for i in 0..count {
+                let at = first + 2 + i * 12;
+                let tag = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+                patch(tag, &mut bytes[at..at + 12]);
+            }
+            let out = dir.path().join(name);
+            std::fs::write(&out, bytes).unwrap();
+            super::open(&out).unwrap().metadata
+        };
+        // A profile tag whose value lies past the file's end: unreadable, not absent.
+        let unreadable = patched("unreadable.dng", &|tag, entry| {
+            if tag == 50936 {
+                entry[8..].copy_from_slice(&0x7fff_ff00u32.to_le_bytes());
+            }
+        });
+        assert_eq!(unreadable.embedded_profile_status, S::Unreadable);
+        // No colour tags at all (UniqueCameraModel alone): no profile.
+        let colourless = patched("colourless.dng", &|tag, entry| {
+            if [50721, 50722, 50938, 50939, 50964, 50965, 50982].contains(&tag) {
+                entry[..2].copy_from_slice(&(tag + 10000).to_le_bytes());
+            }
+        });
+        assert_eq!(colourless.embedded_profile_status, S::None);
+        // Tags that are there but say nothing usable are not "no profile".
+        assert_eq!(
+            super::embedded_profile_status(true, None, false),
+            S::Unreadable
+        );
+        assert_eq!(
+            super::embedded_profile_status(true, Some(false), false),
+            S::OtherCamera
+        );
+        assert_eq!(super::embedded_profile_status(false, None, false), S::None);
+    }
     #[test]
     fn matrix_only_dng_keeps_its_profile_calibration_signature() {
         // Append a new IFD without moving the existing compressed mosaic tiles.
@@ -277,7 +371,8 @@ mod tests {
         (dir, path)
     }
 
-    /// A monochrome DNG develops as grey, its one sample every channel's, and
+    /// A monochrome DNG develops as grey, its one sample every channel's (a
+    /// sample below black as 0), and
     /// renders grey whatever the white balance: through the default profile
     /// and RAWmakase Color, with Temp and Tint changed (which leave its gains
     /// at 1, as it has no white balance), an eyedropper's pick, and gains an
@@ -285,24 +380,22 @@ mod tests {
     #[test]
     fn monochrome_dngs_develop_and_render_grey() {
         use rawmakase_model::model::recipe::Recipe;
-        let (_dir, path) = monochrome_dng(4, &[220, 2236, 8301, 16383, 1000, 4000, 12000, 300]);
+        // 120 lies below the black level: noise there develops as 0.
+        let (_dir, path) = monochrome_dng(4, &[220, 2236, 8301, 16383, 1000, 4000, 12000, 120]);
         let raw = super::open(&path).unwrap();
         let m = raw.metadata.clone();
         assert!(m.monochrome);
         assert_eq!((m.wb, m.daylight_wb), ([1.; 3], [1.; 3]));
         let im = raw
-            .develop(
-                rawmakase_model::camera_data::Decode::Half,
-                &std::sync::atomic::AtomicBool::new(false),
-            )
+            .develop(rawmakase_model::camera_data::Decode::Half, Cancel::NEVER)
             .unwrap();
         assert_eq!((im.width, im.height), (4, 2));
         for (p, v) in im
             .pixels
             .iter()
-            .zip([220, 2236, 8301, 16383, 1000, 4000, 12000, 300])
+            .zip([220, 2236, 8301, 16383, 1000, 4000, 12000, 120])
         {
-            let want = (v as f32 - 220.) / (16383. - 220.);
+            let want = ((v as f32 - 220.) / (16383. - 220.)).max(0.);
             assert_eq!(*p, [want; 3]);
         }
         let color = std::sync::Arc::new(crate::camera_profiles::open::color(&m).unwrap());
@@ -319,7 +412,9 @@ mod tests {
             let mut synced = start.clone();
             synced.wb = [1.5, 1., 0.6];
             for r in [start, warmer, picked, synced] {
-                let out = rawmakase_engine::develop::render(&im, &r.checked().unwrap(), 0).unwrap();
+                let out =
+                    rawmakase_engine::develop::render(&im, &r.checked().unwrap(), 0, Cancel::NEVER)
+                        .unwrap();
                 for p in &out.pixels {
                     assert!(
                         (p[0] - p[1]).abs() < 1e-3 && (p[2] - p[1]).abs() < 1e-3,
@@ -428,17 +523,56 @@ mod tests {
         for name in [
             "metadata.webp",
             "ten-bit.avif",
-            #[cfg(feature = "software-hevc")]
+            // Where this system decodes HEIC: macOS, and Linux with libheif.
             "grid.heic",
             "metadata.jxl",
         ] {
+            if name.ends_with(".heic") && (cfg!(windows) || crate::raster::heif_decoder().is_err())
+            {
+                continue;
+            }
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/data/formats")
                 .join(name);
-            match super::open_source(&path, &cancel).unwrap() {
+            match super::open_source(&path, Cancel::new(&cancel)).unwrap() {
                 super::Opened::Rendered(image) => assert!(image.metadata.is_rendered(), "{name}"),
                 super::Opened::Raw(_) => panic!("{name} must open as rendered"),
             }
+        }
+    }
+
+    /// An HDR file opens for Develop and export as an HDR edit: its light survives
+    /// the conversion to the SDR pseudo-scene, it starts with HDR on, and its master
+    /// at those settings is its light.
+    #[test]
+    fn an_hdr_file_opens_as_an_hdr_edit_whose_master_is_its_light() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/data/formats")
+            .join("pq.avif");
+        let super::Opened::Rendered(image) = super::open_source(&path, Cancel::NEVER).unwrap()
+        else {
+            panic!("an HDR file opens as rendered");
+        };
+        let light = image.hdr().expect("its light").clone();
+        let recipe = rawmakase_model::model::recipe::Recipe::for_new_rendered(&image.metadata);
+        assert!(recipe.hdr.enabled, "an HDR file starts as an HDR edit");
+        let master = rawmakase_engine::develop::render_hdr(
+            &image,
+            &recipe.checked().unwrap(),
+            None,
+            0,
+            Cancel::NEVER,
+        )
+        .unwrap();
+        assert_eq!(
+            (master.width, master.height),
+            (light.width(), light.height())
+        );
+        for (got, want) in master.pixels.iter().zip(light.pixels()) {
+            assert!(
+                (0..3).all(|c| (got[c] - want[c]).abs() <= 1e-5 * want[c].abs().max(1.)),
+                "{got:?} against {want:?}"
+            );
         }
     }
 
@@ -451,8 +585,10 @@ mod tests {
             .save(&path)
             .unwrap();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let raw_pixel = crate::raster::open(&path, &cancel).unwrap().pixels[0];
-        match super::open_source(&path, &cancel).unwrap() {
+        let raw_pixel = crate::raster::open(&path, Cancel::new(&cancel))
+            .unwrap()
+            .pixels[0];
+        match super::open_source(&path, Cancel::new(&cancel)).unwrap() {
             super::Opened::Rendered(image) => {
                 assert!(image.metadata.is_rendered());
                 // The pixels are the pseudo-scene of the file's linear values.
@@ -474,7 +610,7 @@ mod tests {
         let raw = super::open(&path)
             .err()
             .expect("the decoder refuses garbage");
-        let opened = super::open_source(&path, &cancel)
+        let opened = super::open_source(&path, Cancel::new(&cancel))
             .err()
             .expect("the decoder refuses garbage");
         assert_eq!(opened.to_string(), raw.to_string());

@@ -3,9 +3,9 @@
 use super::folder_selection::{Click, FolderSelection};
 use super::tree::{FolderNode, TreeAction, folder_tree_row};
 use super::{Action, Library, collections, volumes};
-use crate::app::design::{Tone, space, text};
-use crate::app::theme;
-use crate::app::widgets::section;
+use crate::app::ui::design::{Tone, space, text};
+use crate::app::ui::theme;
+use crate::app::ui::widgets::section;
 use crate::catalog::{CollectionKind, FolderId, PhotoId, RootId};
 use eframe::egui::{self, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -56,27 +56,27 @@ impl Library {
     fn lists_key(&self) -> ListsKey {
         let members = self
             .session
-            .collection_photos
+            .collection_photos()
             .values()
             .map(|m| m.len())
             .sum();
         (
             self.session.generation(),
-            self.session.folders.len(),
-            self.session.roots.len(),
-            self.session.collections.len(),
+            self.session.folders().len(),
+            self.session.roots().len(),
+            self.session.collections().len(),
             members,
         )
     }
     /// Where the Folders panel's trees start on this computer: each root
     /// (logical path ""), then each folder located apart from its root.
     pub(super) fn anchors(&self) -> Vec<(RootId, String, std::path::PathBuf)> {
-        let roots = self.session.roots.iter().map(|(id, original, mapped)| {
+        let roots = self.session.roots().iter().map(|(id, original, mapped)| {
             let path = mapped.as_deref().unwrap_or(original);
             (*id, String::new(), path.into())
         });
-        let folders = self.session.roots.iter().flat_map(|(id, ..)| {
-            let overrides = self.session.overrides.get(id).into_iter().flatten();
+        let folders = self.session.roots().iter().flat_map(|(id, ..)| {
+            let overrides = self.session.overrides().get(id).into_iter().flatten();
             overrides.map(|o| (*id, o.relative.clone(), o.path.clone()))
         });
         roots.chain(folders).collect()
@@ -84,7 +84,7 @@ impl Library {
     /// Where the folders of root `root` located apart from it are, by
     /// logical path.
     fn located(&self, root: RootId) -> HashMap<&str, &std::path::Path> {
-        let overrides = self.session.overrides.get(&root).into_iter().flatten();
+        let overrides = self.session.overrides().get(&root).into_iter().flatten();
         overrides
             .map(|o| (o.relative.as_str(), o.path.as_path()))
             .collect()
@@ -117,7 +117,7 @@ impl Library {
         // under that drive after its roots, as Lightroom shows them. They
         // stay in their roots' counts and photos, as choosing a root shows.
         let mut apart: Vec<(crate::platform::volume::Volume, FolderNode)> = Vec::new();
-        for (root, original, mapped) in &self.session.roots {
+        for (root, original, mapped) in self.session.roots() {
             let root_path = mapped.as_deref().unwrap_or(original);
             let name = std::path::Path::new(original)
                 .file_name()
@@ -126,7 +126,7 @@ impl Library {
                 .to_string();
             let located = self.located(*root);
             let mut tree = FolderNode::root(*root, name, root_path.into());
-            for f in self.session.folders.iter().filter(|f| f.root == *root) {
+            for f in self.session.folders().iter().filter(|f| f.root == *root) {
                 tree.insert(f, &located);
             }
             tree.finish();
@@ -170,8 +170,8 @@ impl Library {
             drives,
             volumes,
             collections: collections::tree(
-                &self.session.collections,
-                &self.session.collection_photos,
+                self.session.collections(),
+                self.session.collection_photos(),
             ),
         });
         self.sidebar_trees = Some(trees.clone());
@@ -186,13 +186,14 @@ impl Library {
         egui::ScrollArea::vertical()
             .id_salt("library-sources")
             .show(ui, |ui| {
-                section(ui, "Catalog", false, |ui| {
-                    let offline = self.session.photos.len() - self.available_count();
+                section(ui, "Catalog", |ui| {
+                    let offline = self.session.photos().len() - self.available_count();
                     let all = self.filters.folder_scope.is_none()
                         && self.filters.collection.is_none()
                         && !self.filters.only_missing
                         && !self.filters.previous_import;
-                    if source_row(ui, "All Photographs", self.session.photos.len(), all).clicked() {
+                    if source_row(ui, "All Photographs", self.session.photos().len(), all).clicked()
+                    {
                         self.filters.folder_scope = None;
                         self.selected_folders.clear();
                         self.filters.collection = None;
@@ -210,9 +211,10 @@ impl Library {
                     .clicked()
                         && let Err(e) = self.show_quick()
                     {
-                        self.message = format!("Quick Collection unavailable: {e}");
+                        self.messages
+                            .warn(format!("Quick Collection unavailable: {e}"));
                     }
-                    let imported = self.session.previous_import.len();
+                    let imported = self.session.previous_import().len();
                     if imported > 0
                         && source_row(
                             ui,
@@ -238,7 +240,7 @@ impl Library {
                         self.filter()
                     }
                 });
-                section(ui, "Folders", false, |ui| {
+                section(ui, "Folders", |ui| {
                     // Lightroom-style volume headers with an attached light.
                     let anchors = self.anchors().into_iter().map(|(.., path)| path).collect();
                     self.volumes.check(ui.ctx(), anchors);
@@ -252,16 +254,17 @@ impl Library {
                         if k > 0 {
                             ui.add_space(space::L);
                         }
-                        let state = online
-                            .get(volume.mount.as_deref().unwrap_or(std::path::Path::new("/")))
-                            .copied();
+                        let state = online.get(volume).copied();
                         let attached = match &volume.mount {
                             None => Some(true),
                             Some(_) => state.map(|s| s.0),
                         };
                         let space = state.and_then(|s| s.1);
                         let photos = drive.photos;
-                        let key = format!("volume-collapsed:{}", volume.name);
+                        let key = match &volume.id {
+                            Some(id) => format!("volume-collapsed:{}:{id}", volume.name),
+                            None => format!("volume-collapsed:{}", volume.name),
+                        };
                         let collapsed = self.expanded.contains(&key);
                         if volumes::volume_row(ui, volume, attached, space, photos, !collapsed)
                             .clicked()
@@ -293,7 +296,7 @@ impl Library {
                                     action = Action::RelinkFolder(root, logical)
                                 }
                                 Some(TreeAction::Synchronize(scope, name)) => {
-                                    self.sync_request = Some((scope, name));
+                                    self.ask(super::outbox::Request::Sync(scope, name));
                                 }
                                 Some(TreeAction::NewFolder {
                                     root,
@@ -302,45 +305,54 @@ impl Library {
                                     folder,
                                 }) => self.request_new_folder(root, parent, name, folder),
                                 Some(TreeAction::RenameFolder { root, logical }) => {
-                                    self.file_request =
-                                        Some(super::FileRequest::RenameFolder { root, logical })
+                                    self.ask(super::outbox::Request::File(
+                                        super::FileRequest::RenameFolder { root, logical },
+                                    ))
                                 }
                                 Some(TreeAction::MoveFolder { root, logical }) => {
-                                    self.file_request = Some(super::FileRequest::ChooseParent {
-                                        root,
-                                        from: logical,
-                                    })
+                                    self.ask(super::outbox::Request::File(
+                                        super::FileRequest::ChooseParent {
+                                            root,
+                                            from: logical,
+                                        },
+                                    ))
                                 }
                                 Some(TreeAction::TrashFolder { root, logical }) => {
-                                    self.file_request =
-                                        Some(super::FileRequest::TrashFolder { root, logical })
+                                    self.ask(super::outbox::Request::File(
+                                        super::FileRequest::TrashFolder { root, logical },
+                                    ))
                                 }
                                 Some(TreeAction::RemoveRoot(root, name)) => {
-                                    self.removal_request = Some(super::FolderRemoval {
-                                        catalog: self.session.catalog.location().clone(),
-                                        name,
-                                        folders: HashSet::new(),
-                                        photos: 0,
-                                        empty_root: Some(root),
-                                    });
+                                    self.ask(super::outbox::Request::Removal(
+                                        super::FolderRemoval {
+                                            catalog: self.session.catalog().location().clone(),
+                                            name,
+                                            folders: HashSet::new(),
+                                            photos: 0,
+                                            empty_root: Some(root),
+                                            exported: None,
+                                        },
+                                    ));
                                 }
                                 Some(TreeAction::DropFolder {
                                     root,
                                     from,
                                     to_root,
                                     to,
-                                }) => {
-                                    self.file_request = Some(super::FileRequest::MoveFolder {
+                                }) => self.ask(super::outbox::Request::File(
+                                    super::FileRequest::MoveFolder {
                                         root,
                                         from,
                                         to_root,
                                         to,
-                                    })
-                                }
+                                    },
+                                )),
                                 Some(TreeAction::Reveal(path)) => {
                                     if let Err(e) = crate::platform::reveal::reveal(&path) {
-                                        self.message =
-                                            format!("Could not show {}: {e}", path.display());
+                                        self.messages.fail(format!(
+                                            "Could not show {}: {e}",
+                                            path.display()
+                                        ));
                                     }
                                 }
                                 Some(TreeAction::Drop {
@@ -349,14 +361,33 @@ impl Library {
                                     name,
                                     photos,
                                 }) => self.request_move(photos, root, to, name),
-                                Some(TreeAction::Remove(name, folders, photos)) => {
-                                    self.removal_request = Some(super::FolderRemoval {
-                                        catalog: self.session.catalog.location().clone(),
+                                Some(TreeAction::Remove(name, folders, photos)) => self.ask(
+                                    super::outbox::Request::Removal(super::FolderRemoval {
+                                        catalog: self.session.catalog().location().clone(),
                                         name,
                                         folders,
                                         photos,
                                         empty_root: None,
-                                    })
+                                        exported: None,
+                                    }),
+                                ),
+                                Some(TreeAction::ExportCatalog(name, folders, photos)) => {
+                                    let mut ids: Vec<_> = folders.iter().copied().collect();
+                                    ids.sort();
+                                    self.ask(super::outbox::Request::Export(
+                                        super::CatalogExportRequest {
+                                            name: name.clone(),
+                                            scope: crate::catalog::ExportScope::Folders(ids),
+                                            removal: Some(super::FolderRemoval {
+                                                catalog: self.session.catalog().location().clone(),
+                                                name,
+                                                folders,
+                                                photos,
+                                                empty_root: None,
+                                                exported: None,
+                                            }),
+                                        },
+                                    ))
                                 }
                                 Some(TreeAction::ShowSubfolders(shown)) => {
                                     self.show_subfolders(shown)
@@ -377,7 +408,7 @@ impl Library {
                         }
                         self.click_folder(&key, click, &rows);
                     }
-                    if self.session.roots.is_empty() {
+                    if self.session.roots().is_empty() {
                         empty_note(ui, "No folders yet");
                     }
                     ui.add_space(space::XL);
@@ -390,7 +421,7 @@ impl Library {
                         action = Action::AddFolder;
                     }
                 });
-                section(ui, "Collections", false, |ui| {
+                section(ui, "Collections", |ui| {
                     let tree = &trees.collections;
                     for node in tree {
                         if let Some(id) = collections::collection_row(
@@ -414,7 +445,7 @@ impl Library {
     /// Shows Previous Import: the photos the last import added.
     pub(in crate::app) fn show_previous_import(&mut self) {
         self.filters.previous_import = true;
-        self.filters.members = self.session.previous_import.clone();
+        self.filters.members = self.session.previous_import().clone();
         self.filters.collection = None;
         self.filters.folder_scope = None;
         self.filters.only_missing = false;
@@ -427,7 +458,7 @@ impl Library {
         self.filters.collection = Some(id);
         self.filters.members = self
             .session
-            .collection_photos
+            .collection_photos()
             .get(&id)
             .cloned()
             .unwrap_or_default();
@@ -469,11 +500,11 @@ impl Library {
             }
         }
         let mut keys = Vec::new();
-        for (root, original, mapped) in &self.session.roots {
+        for (root, original, mapped) in self.session.roots() {
             let path = std::path::PathBuf::from(mapped.as_deref().unwrap_or(original));
             let mut node = FolderNode::root(*root, String::new(), path);
             let located = self.located(*root);
-            for folder in self.session.folders.iter().filter(|f| f.root == *root) {
+            for folder in self.session.folders().iter().filter(|f| f.root == *root) {
                 node.insert(folder, &located);
             }
             // Actual tree locations respect folder overrides; physical path depth
@@ -548,7 +579,7 @@ impl Library {
         let below = format!("{relative}/");
         let within: Vec<(FolderId, bool)> = self
             .session
-            .folders
+            .folders()
             .iter()
             .filter(|f| f.root == root)
             .filter_map(|f| {
@@ -597,7 +628,7 @@ impl Library {
             .strip_prefix("collection:")
             .and_then(|id| id.parse::<i64>().ok())
             .map(crate::catalog::CollectionId)
-            && self.session.collections.iter().any(|c| {
+            && self.session.collections().iter().any(|c| {
                 c.id == id && (c.kind == CollectionKind::Collection || self.quick() == Some(id))
             })
         {
@@ -625,7 +656,7 @@ impl Library {
             && self
                 .visible
                 .iter()
-                .any(|i| self.session.photos[*i].id == id)
+                .any(|i| self.session.photos()[*i].id == id)
         {
             self.select(Some(id));
         }
@@ -638,7 +669,7 @@ impl Library {
         if let Some(id) = self.filters.collection {
             return self
                 .session
-                .collections
+                .collections()
                 .iter()
                 .find(|c| c.id == id)
                 .map_or_else(
@@ -661,7 +692,7 @@ impl Library {
             Some((_, name)) => name.into(),
             None => self
                 .session
-                .roots
+                .roots()
                 .iter()
                 .find(|(id, _, _)| format!("root:{id}") == *selected)
                 .and_then(|(_, original, _)| {
@@ -716,9 +747,9 @@ fn add_row(ui: &mut egui::Ui, label: &str) -> egui::Response {
     // The icon and label centred together.
     let width = 13. + 6. + text.size().x;
     let left = rect.center().x - width / 2.;
-    crate::app::icons::paint_at(
+    crate::app::ui::icons::paint_at(
         ui.painter(),
-        crate::app::icons::Icon::Add,
+        crate::app::ui::icons::Icon::Add,
         egui::pos2(left + 6.5, rect.center().y),
         13.,
         color,

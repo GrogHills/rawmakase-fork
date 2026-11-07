@@ -2,7 +2,7 @@
 //! Develop and the filmstrip, every selected photo from the grid. Each is one
 //! transaction and is handed to the shared undo log once saved.
 use super::{Library, Place};
-use crate::app::photo_metadata::Edit;
+use crate::app::library::photo_metadata::Edit;
 use crate::catalog::{Photo, PhotoId};
 use anyhow::Result;
 
@@ -40,8 +40,10 @@ impl Library {
     /// Sets the rating, flag or label of `ids` in one transaction. A toggle
     /// takes its value from the active photo, so all of them end up alike.
     /// With `advance` (Shift), a single photo is followed by the next one
-    /// shown, which is returned. A photo the filter now hides leaves the
-    /// selection; when the active one goes, the next one shown is selected.
+    /// shown. A photo the filter now hides leaves the selection; when the
+    /// active one goes, the next one shown is selected. Returns the photo
+    /// Develop moves to: the next one with `advance`, else the one selected in
+    /// place of a hidden active photo.
     pub(in crate::app) fn edit_photos(
         &mut self,
         ids: &[PhotoId],
@@ -75,17 +77,17 @@ impl Library {
         let position = self
             .visible
             .iter()
-            .position(|i| self.session.photos[*i].id == lead);
+            .position(|i| self.session.photos()[*i].id == lead);
         let following: Vec<_> = position.map_or_else(Vec::new, |at| {
             self.visible[at + 1..]
                 .iter()
-                .map(|i| self.session.photos[*i].id)
+                .map(|i| self.session.photos()[*i].id)
                 .filter(|id| !ids.contains(id))
                 .collect()
         });
         let before = ratings_of(changes.iter().filter_map(|(id, ..)| self.photo(*id)));
         self.write_ratings(&changes)?;
-        self.message = match self.photo(lead) {
+        let text: String = match self.photo(lead) {
             Some(p) if changes.len() == 1 => format!(
                 "{} · {} stars · {} · {}",
                 p.filename,
@@ -95,6 +97,7 @@ impl Library {
             ),
             _ => format!("{} photos · {}", changes.len(), summary(&edit, &changes[0])),
         };
+        self.messages.note(text);
         self.filter();
         // Sorted by what changed, the photo may have moved: keep it in view.
         if self.filters.sort != super::sort::Sort::CaptureTime {
@@ -103,19 +106,21 @@ impl Library {
         let next = following.into_iter().find(|next| {
             self.visible
                 .iter()
-                .any(|i| self.session.photos[*i].id == *next)
+                .any(|i| self.session.photos()[*i].id == *next)
         });
         let still_visible = self
             .visible
             .iter()
-            .any(|i| self.session.photos[*i].id == lead);
+            .any(|i| self.session.photos()[*i].id == lead);
         let advance = advance && changes.len() == 1;
+        // Without Shift, the photo the filter hid gives way to the one shown.
+        let mut moved = None;
         if was_active && (advance || !still_visible) {
             let to = next.or_else(|| {
                 if still_visible {
                     Some(lead)
                 } else {
-                    self.visible.last().map(|i| self.session.photos[*i].id)
+                    self.visible.last().map(|i| self.session.photos()[*i].id)
                 }
             });
             // Photos still selected and shown stay selected.
@@ -124,11 +129,12 @@ impl Library {
             } else if let Some(to) = to {
                 self.make_active(to);
             }
+            moved = to.filter(|to| *to != lead);
         }
         // A key that changed nothing (5 on a five-star photo) is no command:
         // it would only hide the real one before it and clear redo.
         if before == changes {
-            return Ok(if advance { next } else { None });
+            return Ok(if advance { next } else { moved });
         }
         self.done.push(MetadataCommand {
             sequence: crate::edit_session::sequence(),
@@ -136,9 +142,9 @@ impl Library {
             after: changes,
             place_before,
             place_after: self.place(),
-            summary: self.message.clone(),
+            summary: self.messages.line().to_string(),
         });
-        Ok(if advance { next } else { None })
+        Ok(if advance { next } else { moved })
     }
     /// The metadata changes made since the last call, for the shared undo log.
     pub(in crate::app) fn take_done(&mut self) -> Vec<MetadataCommand> {

@@ -2,25 +2,7 @@
 //! their ranges for the Rust side, and the `S_*` offsets generated from them for
 //! the shader, so the two sides cannot drift apart. The radial lens tables follow
 //! the header, at [`HEADER`].
-use std::ops::Range;
-
-/// Declares each slot as a `Range` that starts where the previous one ends, the
-/// header's length as `HEADER`, and every slot by name as `ALL`.
-macro_rules! slots {
-    ($($name:ident: $len:expr),* $(,)?) => {
-        slots!(@at 0; $($name: $len,)*);
-        /// Every slot, in order, by the name the shader gives it.
-        pub(crate) const ALL: &[(&str, Range<usize>)] = &[$((stringify!($name), $name)),*];
-    };
-    (@at $at:expr;) => {
-        /// Parameters before the radial tables.
-        pub(crate) const HEADER: usize = $at;
-    };
-    (@at $at:expr; $name:ident: $len:expr, $($rest:tt)*) => {
-        pub(crate) const $name: Range<usize> = $at..$at + $len;
-        slots!(@at $name.end; $($rest)*);
-    };
-}
+use crate::develop::slots::slots;
 
 slots! {
     WIDTH: 1,
@@ -61,11 +43,21 @@ slots! {
     XTRANS: 1,
 }
 
-/// `S_*` offset constants for `local.wgsl`.
+/// `S_*` offset constants for `local.wgsl`, and `RADIAL_STEPS`, the halvings its
+/// table search needs to reach any knot of the largest table `optics::Radial` allows.
 pub(crate) fn wgsl_prelude() -> String {
     ALL.iter()
         .map(|(name, range)| format!("const S_{name}: u32 = {}u;\n", range.start))
+        .chain([format!("const RADIAL_STEPS: u32 = {}u;\n", radial_steps())])
         .collect()
+}
+
+/// The halvings of `local.wgsl`'s `table_eval` that narrow a window of
+/// `optics::Radial::MAX_KNOTS` knots to none.
+pub(crate) fn radial_steps() -> u32 {
+    (crate::optics::Radial::MAX_KNOTS + 1)
+        .next_power_of_two()
+        .trailing_zeros()
 }
 
 #[cfg(test)]

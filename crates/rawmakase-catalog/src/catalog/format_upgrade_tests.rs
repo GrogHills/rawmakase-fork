@@ -84,6 +84,7 @@ fn earlier_catalog() -> Result<(tempfile::TempDir, PathBuf, PathBuf, PhotoId)> {
     cat.save_edit(
         id,
         &file,
+        &crate::storage::Identity::read(&file)?,
         &Recipe::default(),
         &ExportOptions::default(),
         HistoryUpdate::Replace(&history),
@@ -173,7 +174,14 @@ fn storing_an_edit_upgrades_the_catalog_first_and_earlier_releases_refuse_it() -
     let mut cat = Catalog::open(&path)?;
     let mut edit = cat.load_edit(id, &file)?.unwrap();
     edit.recipe.contrast = 0.1;
-    cat.save_edit(id, &file, &edit.recipe, &edit.export, HistoryUpdate::Keep)?;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &edit.recipe,
+        &edit.export,
+        HistoryUpdate::Keep,
+    )?;
     drop(cat);
     assert_eq!(version(&path)?, VERSION);
     // A release before the one engine refuses the upgraded catalog...
@@ -240,7 +248,14 @@ fn a_failed_upgrade_leaves_the_catalog_and_its_backup_intact() -> Result<()> {
     let mut edit = cat.load_edit(id, &file)?.unwrap();
     edit.recipe.contrast = 0.1;
     let error = cat
-        .save_edit(id, &file, &edit.recipe, &edit.export, HistoryUpdate::Keep)
+        .save_edit(
+            id,
+            &file,
+            &crate::storage::Identity::read(&file)?,
+            &edit.recipe,
+            &edit.export,
+            HistoryUpdate::Keep,
+        )
         .unwrap_err();
     assert!(format!("{error:#}").contains("disk full"), "{error:#}");
     assert_eq!(cat.format_version()?, 2);
@@ -269,7 +284,14 @@ fn a_failed_upgrade_leaves_the_catalog_and_its_backup_intact() -> Result<()> {
     assert_eq!(version(&backup)?, 2);
     // Without the failure, the next save upgrades it, beside the first backup.
     let mut cat = Catalog::open(&path)?;
-    cat.save_edit(id, &file, &edit.recipe, &edit.export, HistoryUpdate::Keep)?;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &edit.recipe,
+        &edit.export,
+        HistoryUpdate::Keep,
+    )?;
     assert_eq!(cat.format_version()?, VERSION);
     assert_eq!(backups(dir.path())?.len(), 2);
     assert!(
@@ -295,6 +317,7 @@ fn a_failed_save_or_snapshot_does_not_upgrade_the_catalog() -> Result<()> {
         cat.save_edit(
             id,
             &missing,
+            &crate::storage::Identity::read(&file)?,
             &edit.recipe,
             &edit.export,
             HistoryUpdate::Keep
@@ -307,6 +330,7 @@ fn a_failed_save_or_snapshot_does_not_upgrade_the_catalog() -> Result<()> {
         cat.save_edit(
             id,
             &changed,
+            &crate::storage::Identity::read(&changed)?,
             &edit.recipe,
             &edit.export,
             HistoryUpdate::Keep
@@ -352,7 +376,14 @@ fn the_upgrade_keeps_what_it_does_not_know_in_a_history() -> Result<()> {
     drop(db);
     let mut cat = Catalog::open(&path)?;
     let edit = cat.load_edit(id, &file)?.unwrap();
-    cat.save_edit(id, &file, &edit.recipe, &edit.export, HistoryUpdate::Keep)?;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &edit.recipe,
+        &edit.export,
+        HistoryUpdate::Keep,
+    )?;
     drop(cat);
     let after = decompress(&stored(&Connection::open(&path)?, id)?.history)?;
     let mut expected = history;
@@ -393,10 +424,379 @@ fn the_upgrade_leaves_a_damaged_edit_as_it_was() -> Result<()> {
     drop(db);
     let mut cat = Catalog::open(&path)?;
     let edit = cat.load_edit(id, &file)?.unwrap();
-    cat.save_edit(id, &file, &edit.recipe, &edit.export, HistoryUpdate::Keep)?;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &edit.recipe,
+        &edit.export,
+        HistoryUpdate::Keep,
+    )?;
     assert_eq!(cat.format_version()?, VERSION);
     drop(cat);
     let after = stored(&Connection::open(&path)?, id)?;
     assert_eq!((after.snapshot.as_str(), after.history), (damaged, history));
+    Ok(())
+}
+
+/// A recipe naming a Lensfun lens, as the edit chose it.
+fn with_lensfun(on: bool) -> Recipe {
+    let mut r = Recipe {
+        lens_profile: on,
+        ..Default::default()
+    };
+    r.lens_profile_choice
+        .choose_lensfun(rawmakase_model::lens::lensfun::fixture::choice());
+    r
+}
+/// A new catalog (format 3) with one photo; the catalog's path and the photo's.
+fn current_catalog() -> Result<(tempfile::TempDir, PathBuf, PathBuf, PhotoId)> {
+    let dir = tempfile::tempdir()?;
+    let photos = dir.path().join("photos");
+    std::fs::create_dir(&photos)?;
+    let file = photos.join("a.dng");
+    std::fs::write(&file, b"synthetic raw")?;
+    let path = dir.path().join("Current.rawmakase");
+    let mut cat = Catalog::create(&path)?;
+    cat.add_folder(&photos)?;
+    let id = cat.photos()?[0].id;
+    drop(cat);
+    assert_eq!(version(&path)?, VERSION);
+    Ok((dir, path, file, id))
+}
+
+/// Version 4 holds Lensfun lens choices: releases that open up to 3 refuse it.
+#[test]
+fn releases_before_lensfun_refuse_its_format() {
+    use super::db::{LENSFUN, NEWEST};
+    assert!(!opens(LENSFUN, VERSION));
+    assert!(opens(LENSFUN, NEWEST) && opens(VERSION, NEWEST));
+    assert!(!opens(LENSFUN, LENSFUN - 1));
+}
+
+/// Only a write that stores a Lensfun choice raises the catalog to version 4, with a
+/// backup of it as it was, in that write's transaction; other edits leave it at 3.
+#[test]
+fn storing_a_lensfun_choice_raises_the_format_and_nothing_else_does() -> Result<()> {
+    let (dir, path, file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    let plain = Recipe {
+        exposure: 0.5,
+        ..Default::default()
+    };
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &plain,
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    cat.add_snapshot(id, "Plain", &plain)?;
+    assert_eq!(cat.format_version()?, VERSION);
+    assert!(backups(dir.path())?.is_empty());
+    // Switched off still names it.
+    let off = with_lensfun(false);
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &off,
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    assert_eq!(cat.format_version()?, super::db::LENSFUN);
+    let [backup] = backups(dir.path())?.try_into().unwrap();
+    assert_eq!(version(&backup)?, VERSION);
+    drop(cat);
+    // It reads back as saved: the lens, its calibration and where it came from.
+    let cat = Catalog::open(&path)?;
+    let edit = cat.load_edit(id, &file)?.unwrap();
+    assert_eq!(edit.recipe.lens_profile_choice, off.lens_profile_choice);
+    assert_eq!(
+        edit.recipe
+            .lens_profile_choice
+            .lensfun()
+            .unwrap()
+            .provenance
+            .license_uri,
+        "https://creativecommons.org/licenses/by-sa/3.0/"
+    );
+    Ok(())
+}
+
+/// Every state of a saved History counts, a step that was undone too; and a snapshot.
+#[test]
+fn a_lensfun_choice_anywhere_in_history_or_a_snapshot_raises_the_format() -> Result<()> {
+    let (_dir, path, file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    // Chosen, then undone: the edit doesn't name it, a redo step does.
+    let history = SavedHistory {
+        origin: Recipe::default(),
+        steps: vec![SavedStep {
+            name: "Lens Profile".into(),
+            value: "Lensfun".into(),
+            recipe: with_lensfun(true),
+        }],
+        applied: 0,
+    };
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &Recipe::default(),
+        &ExportOptions::default(),
+        HistoryUpdate::Replace(&history),
+    )?;
+    assert_eq!(cat.format_version()?, super::db::LENSFUN);
+    drop(cat);
+    let (_dir, path, _file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    cat.add_snapshot(id, "Lensfun", &with_lensfun(true))?;
+    assert_eq!(cat.format_version()?, super::db::LENSFUN);
+    Ok(())
+}
+
+/// A save that fails as it writes leaves the catalog at 3 and the edit unsaved, to
+/// be saved again; the backup stays beside it.
+#[test]
+fn a_failed_lensfun_save_leaves_the_format_and_the_edit() -> Result<()> {
+    let (dir, path, file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    cat.db_for_tests().execute_batch(
+        "CREATE TEMP TRIGGER fail_edit BEFORE UPDATE ON photos
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )?;
+    let lensfun = with_lensfun(true);
+    let error = cat
+        .save_edit(
+            id,
+            &file,
+            &crate::storage::Identity::read(&file)?,
+            &lensfun,
+            &ExportOptions::default(),
+            HistoryUpdate::Keep,
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("disk full"), "{error:#}");
+    assert_eq!(cat.format_version()?, VERSION);
+    assert!(cat.load_edit(id, &file)?.is_none());
+    drop(cat);
+    assert_eq!(version(&path)?, VERSION);
+    assert_eq!(backups(dir.path())?.len(), 1);
+    let mut cat = Catalog::open(&path)?;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &lensfun,
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    assert_eq!(cat.format_version()?, super::db::LENSFUN);
+    Ok(())
+}
+
+/// A photo added with an edit an earlier save left beside it, naming a Lensfun lens,
+/// raises the format in the same transaction.
+#[test]
+fn a_legacy_sidecar_naming_a_lensfun_lens_raises_the_format() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let photos = dir.path().join("photos");
+    std::fs::create_dir(&photos)?;
+    let file = photos.join("a.dng");
+    std::fs::write(&file, b"synthetic raw with a sidecar")?;
+    super::legacy_sidecar::save(&file, &with_lensfun(true), &ExportOptions::default())?;
+    let sidecar: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        super::legacy_sidecar::sidecar_path(&file),
+    )?)?;
+    assert_eq!(sidecar["schema"], 12);
+    let path = dir.path().join("Photos.rawmakase");
+    let mut cat = Catalog::create(&path)?;
+    cat.add_folder(&photos)?;
+    assert_eq!(cat.format_version()?, super::db::LENSFUN);
+    let id = cat.photos()?[0].id;
+    assert!(cat.load_edit(id, &file)?.unwrap().recipe.uses_lensfun());
+    Ok(())
+}
+
+/// Export as Catalog of a Lensfun edit is a catalog of version 4, whose edit carries
+/// the calibration with its source and license.
+#[test]
+fn an_exported_lensfun_edit_keeps_its_format_and_attribution() -> Result<()> {
+    let (dir, path, file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &with_lensfun(true),
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    let destination = dir.path().join("Exported.rawmakase");
+    let export = cat.export_catalog(&super::ExportScope::Photos(vec![id]), &destination)?;
+    assert!(
+        export.lens_profiles.is_empty(),
+        "{:?}",
+        export.lens_profiles
+    );
+    assert_eq!(version(&destination)?, super::db::LENSFUN);
+    let exported = Catalog::open(&destination)?;
+    let edit = exported.load_edit(id, &file)?.unwrap();
+    let provenance = &edit
+        .recipe
+        .lens_profile_choice
+        .lensfun()
+        .unwrap()
+        .provenance;
+    assert_eq!(provenance.license, "CC BY-SA 3.0");
+    assert_eq!(provenance.attribution, "Lensfun contributors");
+    assert_eq!(
+        provenance.source,
+        "https://lensfun.github.io/db/version_2.tar.bz2"
+    );
+    Ok(())
+}
+
+fn with_ai_denoise(enabled: bool, amount: f32) -> Recipe {
+    Recipe {
+        ai_denoise: rawmakase_model::model::ai_denoise::AiDenoise { enabled, amount },
+        ..Default::default()
+    }
+}
+
+/// Version 5 holds AI Denoise settings: releases that open up to 4 refuse it.
+#[test]
+fn releases_before_ai_denoise_refuse_its_format() {
+    use super::db::{AI_DENOISE, LENSFUN, NEWEST};
+    assert!(!opens(AI_DENOISE, LENSFUN));
+    assert!(opens(AI_DENOISE, NEWEST) && opens(LENSFUN, NEWEST));
+    assert!(!opens(NEWEST + 1, NEWEST));
+}
+
+/// AI Denoise on, or off with its Amount moved, in the edit, a History state or a
+/// snapshot raises the catalog to version 5 (over Lensfun's 4); the default does not.
+#[test]
+fn storing_ai_denoise_anywhere_raises_the_format() -> Result<()> {
+    let (dir, path, file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &with_ai_denoise(false, 0.5),
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    assert_eq!(cat.format_version()?, VERSION);
+    let lensfun = with_lensfun(true);
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &lensfun,
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    assert_eq!(cat.format_version()?, super::db::LENSFUN);
+    let off = with_ai_denoise(false, 0.8);
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &off,
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    assert_eq!(cat.format_version()?, super::db::AI_DENOISE);
+    assert_eq!(backups(dir.path())?.len(), 2);
+    drop(cat);
+    let cat = Catalog::open(&path)?;
+    assert_eq!(
+        cat.load_edit(id, &file)?.unwrap().recipe.ai_denoise,
+        off.ai_denoise
+    );
+
+    // In a History step only.
+    let (_dir, path, file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    let history = SavedHistory {
+        origin: Recipe::default(),
+        steps: vec![SavedStep {
+            name: "AI Denoise".into(),
+            value: "On".into(),
+            recipe: with_ai_denoise(true, 0.5),
+        }],
+        applied: 0,
+    };
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &Recipe::default(),
+        &ExportOptions::default(),
+        HistoryUpdate::Replace(&history),
+    )?;
+    assert_eq!(cat.format_version()?, super::db::AI_DENOISE);
+    // In a snapshot only.
+    let (_dir, path, _file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    cat.add_snapshot(id, "Denoised", &with_ai_denoise(true, 1.))?;
+    assert_eq!(cat.format_version()?, super::db::AI_DENOISE);
+    Ok(())
+}
+
+/// Version 6 holds HDR edits: releases that open up to 5 refuse it.
+#[test]
+fn releases_before_hdr_refuse_its_format() {
+    use super::db::{AI_DENOISE, HDR, NEWEST};
+    assert!(!opens(HDR, AI_DENOISE));
+    assert!(opens(HDR, NEWEST) && opens(AI_DENOISE, NEWEST));
+    // Any write holding an HDR edit asks for it, over every other setting's version.
+    let mut on = with_ai_denoise(true, 0.5);
+    on.hdr.enabled = true;
+    assert_eq!(super::format_upgrade::Stores::of([&on]).version(), HDR);
+    on.hdr.enabled = false;
+    assert_eq!(
+        super::format_upgrade::Stores::of([&on]).version(),
+        AI_DENOISE
+    );
+}
+
+/// HDR values kept while HDR is off save and load back without raising the format;
+/// an edit with HDR on saves, raising the catalog to the HDR version that earlier
+/// releases refuse, and loads back as it was saved.
+#[test]
+fn kept_hdr_values_save_and_an_active_hdr_edit_raises_the_format() -> Result<()> {
+    let (_dir, path, file, id) = current_catalog()?;
+    let mut cat = Catalog::open(&path)?;
+    let mut kept = Recipe::default();
+    kept.hdr.limit = 3.;
+    kept.hdr.sdr.shadows = -0.4;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &kept,
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    assert_eq!(cat.format_version()?, VERSION);
+    assert_eq!(cat.load_edit(id, &file)?.unwrap().recipe.hdr, kept.hdr);
+
+    let mut on = kept.clone();
+    on.hdr.enabled = true;
+    cat.save_edit(
+        id,
+        &file,
+        &crate::storage::Identity::read(&file)?,
+        &on,
+        &ExportOptions::default(),
+        HistoryUpdate::Keep,
+    )?;
+    assert!(cat.format_version()? >= super::db::HDR);
+    assert_eq!(cat.load_edit(id, &file)?.unwrap().recipe, on);
+    cat.add_snapshot(id, "HDR", &on)?;
     Ok(())
 }

@@ -19,7 +19,7 @@ use std::{
 };
 
 #[derive(clap::Args)]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Data folder of the running app; defaults to RAWMAKASE_DATA_DIR or the platform default.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -27,8 +27,16 @@ pub struct Cli {
 
 /// The protocol's [`rawmakase_protocol::Target`], with the guards an MCP client
 /// must always send.
+///
+/// Parameter types are inlined rather than referenced through `$defs`: some
+/// clients, Claude among them, don't resolve `$ref` and send the object as a
+/// JSON string instead (issue 881).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(
+    inline,
+    description = "The open photo and the guards from the latest state."
+)]
 struct McpTarget {
     /// Catalog photo ID from get_state (omit only for an uncataloged photo).
     photo_id: Option<i64>,
@@ -89,6 +97,16 @@ struct Export {
     target: McpTarget,
     /// Optional maximum edge; omit for full size.
     max_edge: Option<u32>,
+    /// Optional colour space; omit for sRGB. ProPhoto RGB needs a .tif path.
+    color_space: Option<McpColorSpace>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[schemars(inline)]
+enum McpColorSpace {
+    Srgb,
+    AdobeRgb,
+    Prophoto,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -116,6 +134,7 @@ impl From<McpTarget> for rawmakase_protocol::Target {
 /// The protocol's [`rawmakase_protocol::CurveChannel`], described for MCP clients.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline, description = "Tone curve channel to replace.")]
 enum CurveChannel {
     Rgb,
     Red,
@@ -142,6 +161,7 @@ struct ToneCurve {
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 enum CurvePreset {
     Linear,
     MediumContrast,
@@ -434,12 +454,18 @@ impl Server {
             .await
     }
     #[tool(
-        description = "Start exporting the guarded edit to a new JPEG, TIFF or PNG file. Returns a job ID; call get_job until status is completed before claiming the file exists. Does not overwrite files."
+        description = "Start exporting the guarded edit to a new JPEG, TIFF or PNG file, in sRGB unless color_space is adobe-rgb or prophoto (TIFF only). Returns a job ID; call get_job until status is completed before claiming the file exists. Does not overwrite files."
     )]
     async fn export_photo(&self, Parameters(p): Parameters<Export>) -> CallToolResult {
+        use rawmakase_protocol::request::ColorSpace;
         let request = Request::Export {
             path: p.path.into(),
             max_edge: p.max_edge,
+            color_space: p.color_space.map(|s| match s {
+                McpColorSpace::Srgb => ColorSpace::Srgb,
+                McpColorSpace::AdobeRgb => ColorSpace::AdobeRgb,
+                McpColorSpace::Prophoto => ColorSpace::Prophoto,
+            }),
         };
         self.send(request, Some(p.target)).await
     }
@@ -525,7 +551,7 @@ impl ServerHandler for Server {
     }
 }
 
-pub fn run(cli: Cli) -> anyhow::Result<()> {
+pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -536,4 +562,54 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         service.waiting().await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Some MCP clients, Claude among them, don't resolve `$ref`. They send a
+    /// referenced object as a JSON string, which the adapter then rejects
+    /// (issue 881), so every tool schema must be self-contained.
+    #[test]
+    fn tool_schemas_inline_every_parameter_type() {
+        let tools = Server::tool_router().list_all();
+        assert!(!tools.is_empty());
+        for tool in tools {
+            let schema = Value::Object((*tool.input_schema).clone());
+            let text = schema.to_string();
+            assert!(
+                !text.contains("$ref") && !text.contains("$defs"),
+                "{} references a shared definition: {text}",
+                tool.name
+            );
+            if let Some(target) = schema["properties"].get("target") {
+                assert_eq!(target["type"], "object", "{}: {target}", tool.name);
+            }
+        }
+    }
+
+    /// export_photo's colour space takes the socket's names and is optional.
+    #[test]
+    fn export_photo_takes_an_optional_color_space() {
+        let read = |value: Value| serde_json::from_value::<Export>(value);
+        let target = json!({"photo_id": 1, "generation": 2, "revision": 3});
+        let export = read(json!({"path": "/tmp/a.tif", "target": target})).unwrap();
+        assert!(export.color_space.is_none());
+        for name in ["srgb", "adobe-rgb", "prophoto"] {
+            let export =
+                read(json!({"path": "/tmp/a.tif", "target": target, "color_space": name})).unwrap();
+            assert!(export.color_space.is_some(), "{name}");
+        }
+        assert!(
+            read(json!({"path": "/tmp/a.tif", "target": target, "color_space": "p3"})).is_err()
+        );
+        let tools = Server::tool_router().list_all();
+        let tool = tools.iter().find(|t| t.name == "export_photo").unwrap();
+        let schema = Value::Object((*tool.input_schema).clone()).to_string();
+        assert!(
+            schema.contains("adobe-rgb") && schema.contains("prophoto"),
+            "{schema}"
+        );
+    }
 }

@@ -24,6 +24,7 @@ pub enum SettingGroup {
     Shadows,
     Whites,
     Blacks,
+    HighDynamicRange,
     Texture,
     Clarity,
     Dehaze,
@@ -37,6 +38,7 @@ pub enum SettingGroup {
     Sharpening,
     LuminanceNoiseReduction,
     ColorNoiseReduction,
+    AiDenoise,
     LensProfileCorrections,
     ChromaticAberration,
     LensVignetting,
@@ -60,7 +62,7 @@ pub struct Section {
 }
 
 impl SettingGroup {
-    pub const ALL: [SettingGroup; 33] = [
+    pub const ALL: [SettingGroup; 35] = [
         SettingGroup::WhiteBalance,
         SettingGroup::Exposure,
         SettingGroup::Contrast,
@@ -68,6 +70,7 @@ impl SettingGroup {
         SettingGroup::Shadows,
         SettingGroup::Whites,
         SettingGroup::Blacks,
+        SettingGroup::HighDynamicRange,
         SettingGroup::Texture,
         SettingGroup::Clarity,
         SettingGroup::Dehaze,
@@ -81,6 +84,7 @@ impl SettingGroup {
         SettingGroup::Sharpening,
         SettingGroup::LuminanceNoiseReduction,
         SettingGroup::ColorNoiseReduction,
+        SettingGroup::AiDenoise,
         SettingGroup::LensProfileCorrections,
         SettingGroup::ChromaticAberration,
         SettingGroup::LensVignetting,
@@ -112,10 +116,11 @@ impl SettingGroup {
                 | SpotRemoval
                 | Crop
                 | Masking
+                | HighDynamicRange
         )
     }
     /// Copy Settings' sections, in Lightroom's order.
-    pub const SECTIONS: [Section; 13] = {
+    pub const SECTIONS: [Section; 14] = {
         use SettingGroup::*;
         [
             Section {
@@ -125,6 +130,10 @@ impl SettingGroup {
             Section {
                 title: "Basic Tone",
                 groups: &[Exposure, Contrast, Highlights, Shadows, Whites, Blacks],
+            },
+            Section {
+                title: "High Dynamic Range",
+                groups: &[HighDynamicRange],
             },
             Section {
                 title: "Presence",
@@ -144,7 +153,12 @@ impl SettingGroup {
             },
             Section {
                 title: "Detail",
-                groups: &[Sharpening, LuminanceNoiseReduction, ColorNoiseReduction],
+                groups: &[
+                    Sharpening,
+                    LuminanceNoiseReduction,
+                    ColorNoiseReduction,
+                    AiDenoise,
+                ],
             },
             Section {
                 title: "Lens Corrections",
@@ -183,6 +197,7 @@ impl SettingGroup {
             Shadows => "Shadows",
             Whites => "White Clipping",
             Blacks => "Black Clipping",
+            HighDynamicRange => "High Dynamic Range",
             Texture => "Texture",
             Clarity => "Clarity",
             Dehaze => "Dehaze",
@@ -196,6 +211,7 @@ impl SettingGroup {
             Sharpening => "Sharpening",
             LuminanceNoiseReduction => "Luminance Noise Reduction",
             ColorNoiseReduction => "Color Noise Reduction",
+            AiDenoise => "AI Denoise",
             LensProfileCorrections => "Lens Profile Corrections",
             ChromaticAberration => "Chromatic Aberration",
             LensVignetting => "Lens Vignetting",
@@ -220,7 +236,7 @@ impl SettingGroup {
             ColorAdjustments => Panel::ColorMixer,
             BlackWhiteMix => Panel::BlackWhiteMix,
             ColorGrading => Panel::ColorGrading,
-            Sharpening | LuminanceNoiseReduction | ColorNoiseReduction => Panel::Detail,
+            Sharpening | LuminanceNoiseReduction | ColorNoiseReduction | AiDenoise => Panel::Detail,
             LensProfileCorrections | ChromaticAberration | LensVignetting => Panel::LensCorrections,
             UprightMode | UprightTransforms | TransformAdjustments => Panel::Transform,
             PostCropVignetting | Grain => Panel::Effects,
@@ -247,6 +263,9 @@ impl SettingGroup {
             Shadows => to.shadows = from.shadows,
             Whites => to.whites = from.whites,
             Blacks => to.blacks = from.blacks,
+            // The mode, the limit and the SDR rendition travel together; the profile
+            // stays with Treatment & Profile.
+            HighDynamicRange => to.hdr = from.hdr,
             Texture => {
                 e.texture = f.texture;
             }
@@ -295,6 +314,7 @@ impl SettingGroup {
                 e.luma_detail = f.luma_detail;
                 e.luma_contrast = f.luma_contrast;
             }
+            AiDenoise => to.ai_denoise = from.ai_denoise,
             ColorNoiseReduction => {
                 to.noise_chroma = from.noise_chroma;
                 e.chroma_detail = f.chroma_detail;
@@ -445,20 +465,51 @@ fn display_axes(r: &Recipe, m: &Metadata) -> [[f32; 2]; 2] {
 }
 
 /// The source's settings in `selection` applied over `to`, with everything that depends
-/// on the photo worked out again for `target`.
+/// on the photo worked out again for `target`. A Lensfun lens takes the target's camera
+/// as the database installed now knows it.
 pub fn transfer(
     source: Source<'_>,
     to: &Recipe,
     selection: &GroupSelection,
     target: Target<'_>,
 ) -> Transferred {
+    transfer_with_lensfun(
+        source,
+        to,
+        selection,
+        target,
+        &crate::lens::lensfun::installed::Handle::Installed,
+    )
+}
+/// [`transfer`], with a Lensfun lens taken to the target's camera against `lensfun`.
+pub(crate) fn transfer_with_lensfun(
+    source: Source<'_>,
+    to: &Recipe,
+    selection: &GroupSelection,
+    target: Target<'_>,
+    lensfun: &crate::lens::lensfun::installed::Handle,
+) -> Transferred {
     let from = source.recipe;
     let mut recipe = to.clone();
     let mut notes = Vec::new();
+    let m = target.metadata;
+    // AI Denoise works on a RAW's mosaic: a rendered file keeps its own setting, which a
+    // RAW's would leave on with nothing to run (and its export failing). The group is
+    // not copied at all, so it does not carry the Detail panel's switch either.
+    let skip_ai = selection.contains(SettingGroup::AiDenoise) && m.is_rendered();
+    if skip_ai && from.ai_denoise != to.ai_denoise {
+        notes.push("AI Denoise applies to RAW files only".into());
+    }
     for group in selection.groups() {
+        if skip_ai && group == SettingGroup::AiDenoise {
+            continue;
+        }
         group.copy(from, &mut recipe);
     }
-    let m = target.metadata;
+    // A Lensfun lens takes the target's camera, which its correction is scaled for.
+    if selection.contains(SettingGroup::LensProfileCorrections) {
+        recipe.lens_profile_choice.for_photo(m, lensfun);
+    }
     // RAW and rendered files keep white balance in different terms (Kelvin against
     // relative) and have profiles of their own: between them, the target keeps its
     // white balance and profile, and everything else transfers.
@@ -500,12 +551,17 @@ pub fn transfer(
     {
         // A profile file belongs to one photo's camera (or its DNG): use the target's of
         // that name, else the source's when it fits this camera, else keep the target's.
+        // A fitted camera look is the source photo's own, never another fit of its name.
         let name = profile.name.as_str();
-        match target
-            .profiles
-            .iter()
-            .find(|p| p.name == name && p.ensure_camera(m).is_ok())
-        {
+        let same_name = (!crate::camera_profiles::fitted::is_fitted(profile))
+            .then(|| {
+                target
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == name && p.ensure_camera(m).is_ok())
+            })
+            .flatten();
+        match same_name {
             Some(p) => recipe.profile = Some(p.clone()),
             None if profile.ensure_camera(m).is_ok() => {}
             None => {
@@ -521,11 +577,12 @@ pub fn transfer(
     // sensor) is kept as the edit names it, and said, as on import.
     let embedded = recipe
         .lens_profile_choice
-        .id
-        .as_ref()
+        .adobe()
         .is_some_and(|id| id.embedded);
     if selection.contains(SettingGroup::LensProfileCorrections)
-        && (embedded || recipe.lens_profile_in_use(m).missing.is_some())
+        && (embedded
+            || recipe.lens_profile_in_use(m).missing.is_some()
+            || recipe.lensfun_in_use().is_some())
     {
         notes.extend(recipe.missing_lens_profile(m));
     }
@@ -632,6 +689,8 @@ pub(crate) fn every_setting(r: &Recipe) -> Vec<(&'static str, Kind)> {
         grading: _,
         noise_luma: _,
         noise_chroma: _,
+        ai_denoise: _,
+        hdr: _,
         sharpening: _,
         crop: _,
         straighten: _,
@@ -721,6 +780,8 @@ pub(crate) fn every_setting(r: &Recipe) -> Vec<(&'static str, Kind)> {
         ("grading", Group(ColorGrading)),
         ("noise_luma", Group(LuminanceNoiseReduction)),
         ("noise_chroma", Group(ColorNoiseReduction)),
+        ("ai_denoise", Group(AiDenoise)),
+        ("hdr", Group(HighDynamicRange)),
         ("sharpening", Group(Sharpening)),
         ("crop", Group(Crop)),
         ("straighten", Group(Crop)),

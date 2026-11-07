@@ -39,7 +39,7 @@ check() {
         status=1
     fi
 }
-for crate in rawmakase-tiff rawmakase-model rawmakase-interop rawmakase-catalog rawmakase-protocol; do
+for crate in rawmakase-cancel rawmakase-fs rawmakase-tiff rawmakase-model rawmakase-interop rawmakase-catalog rawmakase-protocol; do
     check "$crate" "$leaf"
 done
 check rawmakase-engine "rawmakase|rawmakase-catalog|rawmakase-export|$gui|$native|$inference"
@@ -72,13 +72,13 @@ if [ -n "$asm" ]; then
 fi
 check rawmakase-export "rawmakase|eframe|winit|egui-wgpu|egui-winit|egui_extras|$c_imaging|$inference"
 # Inference itself is a leaf: it takes pixels and returns coverage, and knows no
-# workspace crate, window, GPU or imaging library.
+# workspace crate but the cancellation token, and no window, GPU or imaging library.
 check rawmakase-inference "rawmakase|rawmakase-model|rawmakase-catalog|rawmakase-engine|rawmakase-export|rawmakase-interop|rawmakase-decode|rawmakase-protocol|wgpu.*|naga|$gui|$native"
-# The remote worker and its client sit on top of inference alone: the protocol
+# The remote worker and its client sit on top of inference (and the cancellation token) alone: the protocol
 # and the worker know no catalog, renderer, GUI or native library, and only the
 # app composes the client.
 check rawmakase-remote "rawmakase|rawmakase-model|rawmakase-catalog|rawmakase-engine|rawmakase-export|rawmakase-interop|rawmakase-decode|rawmakase-protocol|wgpu.*|naga|$gui|$native"
-# RAWmakase's own RAW decoders sit on the TIFF reader alone: no workspace crate
+# RAWmakase's own RAW decoders sit on the TIFF reader and the cancellation token alone: no workspace crate
 # above them, no GPU, GUI or inference, and nothing built from C (no build
 # script crates).
 check rawmakase-raw "rawmakase|rawmakase-model|rawmakase-interop|rawmakase-catalog|rawmakase-engine|rawmakase-export|rawmakase-decode|rawmakase-protocol|rawmakase-remote|wgpu.*|naga|cc|pkg-config|$gui|$c_imaging|$inference"

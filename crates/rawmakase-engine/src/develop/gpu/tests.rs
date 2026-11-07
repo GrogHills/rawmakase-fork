@@ -1,13 +1,35 @@
 use super::*;
 use crate::develop::masks::local::LocalDeltas;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
-fn windows_leaves_vulkan_out_by_default() {
+fn windows_leaves_vulkan_out_while_directx_works() {
     // Intel's Vulkan driver crashed the app at launch where DirectX 12 worked (#623).
-    let windows = default_backends(true);
-    assert!(windows.contains(wgpu::Backends::DX12 | wgpu::Backends::GL));
-    assert!(!windows.contains(wgpu::Backends::VULKAN));
-    let elsewhere = default_backends(false);
+    let mut tried = Vec::new();
+    let windows = default_backends(true, |backends| {
+        tried.push(backends);
+        true
+    });
+    assert_eq!(windows, wgpu::Backends::DX12 | wgpu::Backends::GL);
+    assert_eq!(tried, [wgpu::Backends::DX12]);
+}
+
+#[test]
+fn windows_moves_on_from_a_backend_whose_device_fails() {
+    // A driver refusing DirectX 12's device ended the app at launch (#768).
+    use wgpu::Backends;
+    let chosen = |working: Backends| default_backends(true, |backends| working.contains(backends));
+    assert_eq!(
+        chosen(Backends::VULKAN | Backends::GL),
+        Backends::VULKAN | Backends::GL
+    );
+    assert_eq!(chosen(Backends::GL), Backends::GL);
+    assert_eq!(chosen(Backends::empty()), Backends::DX12 | Backends::GL);
+}
+
+#[test]
+fn other_systems_keep_their_backends_without_trying_them() {
+    let elsewhere = default_backends(false, |_| panic!("tried a device"));
     assert!(elsewhere.contains(wgpu::Backends::VULKAN | wgpu::Backends::METAL));
 }
 
@@ -56,6 +78,7 @@ fn gpu_clarity_reconstructs_fine_edges_like_the_cpu() -> Result<()> {
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     };
     let samples = Arc::new(Samples {
         width: w,
@@ -113,8 +136,14 @@ fn gpu_clarity_reconstructs_fine_edges_like_the_cpu() -> Result<()> {
             if let Some(weights) = &weights {
                 assert!(params.set_masks(source, &recipe, Some(weights)));
             }
-            let expected = develop_samples(source, &recipe, &samples, &cancel, weights.as_ref())?;
-            let actual = gpu.develop(&samples, &params, &cancel)?;
+            let expected = develop_samples(
+                source,
+                &recipe,
+                &samples,
+                Cancel::new(&cancel),
+                weights.as_ref(),
+            )?;
+            let actual = gpu.develop(&samples, &params, Cancel::new(&cancel))?;
             let max = actual
                 .pixels
                 .iter()
@@ -170,6 +199,7 @@ fn gpu_measured_tails_match_cpu_globally_and_in_masks() -> Result<()> {
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     };
     let samples = Arc::new(Samples {
         width: 240,
@@ -238,8 +268,14 @@ fn gpu_measured_tails_match_cpu_globally_and_in_masks() -> Result<()> {
             if let Some(weights) = &weights {
                 assert!(params.set_masks(source, &recipe, Some(weights)));
             }
-            let expected = develop_samples(source, &recipe, &samples, &cancel, weights.as_ref())?;
-            let actual = gpu.develop(&samples, &params, &cancel)?;
+            let expected = develop_samples(
+                source,
+                &recipe,
+                &samples,
+                Cancel::new(&cancel),
+                weights.as_ref(),
+            )?;
+            let actual = gpu.develop(&samples, &params, Cancel::new(&cancel))?;
             let max = actual
                 .pixels
                 .iter()
@@ -282,10 +318,11 @@ fn gpu_matches_cpu_finishing_and_reuses_buffers() -> Result<()> {
                         ..Recipe::default()
                     };
                     let mut expected = image.clone();
-                    crate::develop::quality::sharpen(&mut expected, &recipe);
+                    crate::develop::quality::sharpen(&mut expected, &recipe, None, Cancel::NEVER)
+                        .unwrap();
                     let expected = crate::develop::quality::resize(expected, max_edge);
                     for _ in 0..2 {
-                        let actual = gpu.finish(&image, &recipe, max_edge, &cancel)?;
+                        let actual = gpu.finish(&image, &recipe, max_edge, Cancel::new(&cancel))?;
                         assert_eq!(
                             (actual.width, actual.height),
                             (expected.width, expected.height)
@@ -312,7 +349,10 @@ fn gpu_matches_cpu_finishing_and_reuses_buffers() -> Result<()> {
         height: 1,
         pixels: vec![[0.5; 3]],
     };
-    assert!(gpu.finish(&image, &Recipe::default(), 1, &cancel).is_err());
+    assert!(
+        gpu.finish(&image, &Recipe::default(), 1, Cancel::new(&cancel))
+            .is_err()
+    );
     Ok(())
 }
 
@@ -344,6 +384,7 @@ fn gpu_preview_preserves_regions_spatial_effects_and_falls_back() -> Result<()> 
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     };
     let mut renderer = PreviewRenderer::with_gpu();
     assert!(
@@ -368,14 +409,14 @@ fn gpu_preview_preserves_regions_spatial_effects_and_falls_back() -> Result<()> 
             }
             // Reduced Fit sizes render from the pyramid on the CPU; full size and
             // regions use GPU finishing.
-            let expected = super::super::quality::render_cancellable(
+            let expected = super::super::quality::render(
                 &image,
                 &recipe.checked()?,
                 0,
                 region,
-                &cancel,
+                Cancel::new(&cancel),
             )?;
-            let actual = renderer.render(&image, &recipe, 0, region, &cancel)?;
+            let actual = renderer.render(&image, &recipe, 0, region, Cancel::new(&cancel))?;
             assert_eq!(renderer.used_gpu(), !spatial || region.is_none());
             assert_eq!(
                 (actual.width, actual.height),
@@ -402,14 +443,15 @@ fn gpu_preview_preserves_regions_spatial_effects_and_falls_back() -> Result<()> 
     };
     assert!(
         renderer
-            .finish(&invalid, &Recipe::default(), 0, &cancel)
+            .finish(&invalid, &Recipe::default(), 0, Cancel::new(&cancel))
             .is_none()
     );
     assert!(renderer.adapter_name().is_none());
     assert!(renderer.fallback_reason().is_some());
     let recipe = Recipe::default();
-    let expected = super::super::quality::render(&image, &recipe.checked()?, 0, None)?;
-    let actual = renderer.render(&image, &recipe, 0, None, &cancel)?;
+    let expected =
+        super::super::quality::render(&image, &recipe.checked()?, 0, None, Cancel::NEVER)?;
+    let actual = renderer.render(&image, &recipe, 0, None, Cancel::new(&cancel))?;
     assert_eq!(actual.pixels, expected.pixels);
     assert!(!renderer.used_gpu());
     Ok(())
@@ -452,6 +494,7 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     });
     // The same with its darkest level lifted to about 2^-6, where Camera Raw's default
     // black adapts to it (`GlobalTone`'s default black).
@@ -602,8 +645,20 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
     let cancel = AtomicBool::new(false);
     // The swatches select part of the test image (the same source for both).
     let source = Source::new(&image);
-    let without = develop_samples(source, &recipes[point_colors - 1], &samples, &cancel, None)?;
-    let with = develop_samples(source, &recipes[point_colors], &samples, &cancel, None)?;
+    let without = develop_samples(
+        source,
+        &recipes[point_colors - 1],
+        &samples,
+        Cancel::new(&cancel),
+        None,
+    )?;
+    let with = develop_samples(
+        source,
+        &recipes[point_colors],
+        &samples,
+        Cancel::new(&cancel),
+        None,
+    )?;
     let changed = (with.pixels.iter().zip(&without.pixels))
         .filter(|(a, b)| (0..3).any(|c| (a[c] - b[c]).abs() > 0.01))
         .count();
@@ -671,8 +726,8 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
     for (i, (image, recipe, samples)) in cases.enumerate() {
         let source = Source::new(image);
         let params = pixel_params(source, recipe).expect("GPU port covers this recipe");
-        let expected = develop_samples(source, recipe, samples, &cancel, None)?;
-        let actual = gpu.develop(samples, &params, &cancel)?;
+        let expected = develop_samples(source, recipe, samples, Cancel::new(&cancel), None)?;
+        let actual = gpu.develop(samples, &params, Cancel::new(&cancel))?;
         // At a rendered file's defaults the GPU reproduces the file, as the CPU does.
         if std::ptr::eq(samples, &rendered_samples) && std::ptr::eq(recipe, &rendered_recipes[0]) {
             let off = |pixels: &[[f32; 3]]| -> Vec<_> {
@@ -847,6 +902,7 @@ fn check_presented_previews(w: u32, h: u32, ca_only: bool) -> Result<()> {
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     };
     let profile = CameraProfile::camera_matrix_default(&metadata)
         .unwrap()
@@ -954,9 +1010,15 @@ fn check_presented_previews(w: u32, h: u32, ca_only: bool) -> Result<()> {
                 samples: true,
                 drawn: Vec::new(),
             };
-            let expected = cpu.render(&image, &recipe, max_edge, region, &cancel)?;
-            let Output::Frame(frame) =
-                gpu.render_to(&image, &recipe, max_edge, region, &cancel, Some(&display))?
+            let expected = cpu.render(&image, &recipe, max_edge, region, Cancel::new(&cancel))?;
+            let Output::Frame(frame) = gpu.render_to(
+                &image,
+                &recipe,
+                max_edge,
+                region,
+                Cancel::new(&cancel),
+                Some(&display),
+            )?
             else {
                 panic!("{:?}", gpu.fallback_reason());
             };
@@ -1069,6 +1131,7 @@ fn panning_never_writes_the_drawn_region() -> Result<()> {
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     };
     let recipe = Recipe {
         profile: Some(std::sync::Arc::new(
@@ -1096,7 +1159,7 @@ fn panning_never_writes_the_drawn_region() -> Result<()> {
             &recipe,
             0,
             Some([x, 10, 60, 40]),
-            &cancel,
+            Cancel::new(&cancel),
             Some(&display),
         )?
         else {
@@ -1154,6 +1217,7 @@ fn gpu_masks_match_cpu_pixel_stage() -> Result<()> {
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     });
     let n = 4000;
     let samples = Arc::new(Samples {
@@ -1232,8 +1296,8 @@ fn gpu_masks_match_cpu_pixel_stage() -> Result<()> {
         r.effects.dehaze = dehaze;
         let mut params = pixel_params(source, &r).expect("GPU port covers this recipe");
         assert!(params.set_masks(source, &r, Some(&weights)));
-        let expected = develop_samples(source, &r, &samples, &cancel, Some(&weights))?;
-        let actual = gpu.develop(&samples, &params, &cancel)?;
+        let expected = develop_samples(source, &r, &samples, Cancel::new(&cancel), Some(&weights))?;
+        let actual = gpu.develop(&samples, &params, Cancel::new(&cancel))?;
         let d: Vec<f32> = actual
             .pixels
             .iter()
@@ -1381,6 +1445,7 @@ fn kept_stages_present_the_frames_of_a_fresh_renderer() -> Result<()> {
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     });
     let profile = CameraProfile::camera_matrix_default(&metadata)
         .unwrap()
@@ -1418,7 +1483,7 @@ fn kept_stages_present_the_frames_of_a_fresh_renderer() -> Result<()> {
     ];
     let frame = |renderer: &mut PreviewRenderer, r: &Recipe| -> Result<Vec<u8>> {
         let Output::Frame(frame) =
-            renderer.render_to(&image, r, 90, None, &cancel, Some(&display))?
+            renderer.render_to(&image, r, 90, None, Cancel::new(&cancel), Some(&display))?
         else {
             panic!("{:?}", renderer.fallback_reason());
         };
@@ -1470,6 +1535,7 @@ fn an_unsubmitted_pass_leaves_its_kept_colour_unwritten() -> Result<()> {
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     };
     let samples = |step: usize| {
         Arc::new(Samples {
@@ -1494,16 +1560,16 @@ fn an_unsubmitted_pass_leaves_its_kept_colour_unwritten() -> Result<()> {
     params.color = Some(color_recipe(&recipe));
     let mut gpu = Processor::new()?;
     let cancel = AtomicBool::new(false);
-    let expected = gpu.develop(&fit, &params, &cancel)?;
+    let expected = gpu.develop(&fit, &params, Cancel::new(&cancel))?;
     // The second render of the recipe would keep the colour, but is cancelled after
     // recording its pass.
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     gpu.record_develop(Input::Cpu(&fit), &params, &mut encoder);
     drop(encoder);
     // Zoomed in, the region renders and submits.
-    gpu.develop(&region, &params, &cancel)?;
+    gpu.develop(&region, &params, Cancel::new(&cancel))?;
     // Back at Fit.
-    let actual = gpu.develop(&fit, &params, &cancel)?;
+    let actual = gpu.develop(&fit, &params, Cancel::new(&cancel))?;
     assert_eq!(actual.pixels, expected.pixels);
     Ok(())
 }
@@ -1591,9 +1657,68 @@ fn installed_zoom_profile_cpu_gpu_agree() -> Result<()> {
     Ok(())
 }
 
+/// A Lensfun-style correction (see `optics::lensfun`): tables of more knots than the
+/// 64 the GPU search once allowed, and lateral CA as a function of green's source
+/// radius, render alike on the CPU and the GPU at Distortion amounts 0, 100% and
+/// 200%.
+#[test]
+#[ignore = "Requires a hardware compute adapter; run explicitly on supported machines"]
+fn long_tables_and_source_radius_aberration_match_cpu() -> Result<()> {
+    use crate::{
+        camera_data::Metadata,
+        optics::{LensCorrection, Radial},
+    };
+    let n = crate::optics::Radial::MAX_KNOTS - 3;
+    let table = |f: &dyn Fn(f32) -> f32| {
+        // Uneven spacing, denser at the corners, as Lensfun's tables are sampled.
+        let knots: Vec<f32> = (0..n)
+            .map(|i| 1.3 * (i as f32 / (n - 1) as f32).sqrt())
+            .collect();
+        Radial {
+            values: knots.iter().map(|r| f(*r)).collect(),
+            knots,
+        }
+    };
+    let lens = LensCorrection {
+        source: "Lensfun: synthetic".into(),
+        distortion: Some(table(&|r| 1. - 0.06 * r * r + 0.02 * r.powi(3))),
+        chromatic: Some([
+            table(&|r| 1.0004 + 0.0008 * r * r),
+            table(&|r| 0.9996 - 0.0006 * r),
+        ]),
+        chromatic_at_source: true,
+        vignetting: Some(table(&|r| 1. / (1. - 0.4 * r * r + 0.1 * r.powi(4)))),
+        ..Default::default()
+    };
+    assert!(lens.validate());
+    for amount in [0., 1., 2.] {
+        let metadata = Metadata {
+            make: "Synthetic".into(),
+            width: 150,
+            height: 100,
+            lens: Some(lens.clone()),
+            ..Default::default()
+        };
+        check_lens_render(metadata, None, &|r: &mut Recipe| {
+            r.lens_builtin = true;
+            r.lens_profile = false;
+            r.lens_distortion = amount;
+        })?;
+    }
+    Ok(())
+}
+
 fn check_imported_profile_render(
+    metadata: crate::camera_data::Metadata,
+    oracle: Option<crate::optics::LensCorrection>,
+) -> Result<()> {
+    check_lens_render(metadata, oracle, &|_| {})
+}
+
+fn check_lens_render(
     mut metadata: crate::camera_data::Metadata,
     oracle: Option<crate::optics::LensCorrection>,
+    tweak: &dyn Fn(&mut Recipe),
 ) -> Result<()> {
     use crate::{
         camera_data::CameraImage,
@@ -1604,7 +1729,7 @@ fn check_imported_profile_render(
     metadata.daylight_wb = [1.; 3];
     metadata.cam_xyz = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
     let (w, h) = (metadata.width, metadata.height);
-    let recipe = Recipe {
+    let mut recipe = Recipe {
         profile: Some(std::sync::Arc::new(
             CameraProfile::camera_matrix_default(&metadata)
                 .unwrap()
@@ -1617,6 +1742,7 @@ fn check_imported_profile_render(
         },
         ..Default::default()
     };
+    tweak(&mut recipe);
     assert!(
         recipe.lens_correction(&metadata).is_some(),
         "profile must be active"
@@ -1635,12 +1761,13 @@ fn check_imported_profile_render(
         fast: false,
         scale_factor: 1.,
         scale_clipped: 0,
+        hdr: Default::default(),
     };
     let cancel = AtomicBool::new(false);
     let mut cpu = PreviewRenderer::default();
     let mut gpu = PreviewRenderer::with_gpu();
     for (max_edge, region) in [(75, None), (0, None), (0, Some([10, 10, 80, 60]))] {
-        let expected = cpu.render(&image, &recipe, max_edge, region, &cancel)?;
+        let expected = cpu.render(&image, &recipe, max_edge, region, Cancel::new(&cancel))?;
         if let Some(ref oracle) = oracle {
             // Recovery captures metadata with its pixels; use an independent
             // source for the oracle rather than mutating an already rendered image.
@@ -1657,7 +1784,7 @@ fn check_imported_profile_render(
                 &oracle_recipe,
                 max_edge,
                 region,
-                &cancel,
+                Cancel::new(&cancel),
             )?;
             let worst = expected
                 .pixels
@@ -1681,8 +1808,14 @@ fn check_imported_profile_render(
             samples: false,
             drawn: Vec::new(),
         };
-        let Output::Frame(frame) =
-            gpu.render_to(&image, &recipe, max_edge, region, &cancel, Some(&display))?
+        let Output::Frame(frame) = gpu.render_to(
+            &image,
+            &recipe,
+            max_edge,
+            region,
+            Cancel::new(&cancel),
+            Some(&display),
+        )?
         else {
             panic!("GPU fallback: {:?}", gpu.fallback_reason());
         };

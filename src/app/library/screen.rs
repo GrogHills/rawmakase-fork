@@ -9,6 +9,8 @@ use super::previews::EditSource;
 use super::thumbnails;
 use crate::catalog::{Photo, PhotoId};
 use eframe::egui;
+use rawmakase_cancel::Cancel;
+use rawmakase_decode::ai::cache::AiCache;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
@@ -31,7 +33,7 @@ const THREADS: usize = 2;
 /// the edit's stamp, so an edit saved anywhere renders it again.
 type Key = (PhotoId, PathBuf, u32, u64);
 /// Renders a preview, giving up once the flag is set.
-type Render = fn(&Path, u32, Option<&EditSource>, &AtomicBool) -> anyhow::Result<image::RgbImage>;
+type Render = fn(&Path, u32, Option<&EditSource>, Cancel<'_>) -> anyhow::Result<image::RgbImage>;
 
 struct Job {
     key: Key,
@@ -62,13 +64,16 @@ struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
     cancel: AtomicBool,
+    /// Where AI Denoise's finished results are; none until the app sets it.
+    ai: Mutex<Option<AiCache>>,
 }
 
 /// What a view can draw for a photo.
 pub(super) enum Shown<'a> {
     Ready(&'a egui::TextureHandle),
     Loading,
-    Failed(&'a str),
+    /// Failed; why is said in the top bar (`take_failures`).
+    Failed,
 }
 
 pub(super) struct ScreenPreviews {
@@ -81,13 +86,21 @@ pub(super) struct ScreenPreviews {
     /// Requests on their way, by the ticket of the latest.
     pending: HashMap<Key, u64>,
     next_ticket: u64,
-    failed: HashMap<Key, String>,
+    /// Failed previews, each with why until it is shown and that is said.
+    failed: HashMap<Key, Option<String>>,
+    /// Why previews shown since the Library last asked failed, for the top
+    /// bar.
+    to_say: Vec<String>,
     textures: HashMap<Key, egui::TextureHandle>,
     order: VecDeque<Key>,
 }
 impl ScreenPreviews {
     pub(super) fn new(ctx: &egui::Context) -> Self {
         Self::with(ctx, render)
+    }
+    /// Previews of edits with AI Denoise render from the finished results in `cache`.
+    pub(super) fn set_ai_cache(&self, cache: &AiCache) {
+        *self.shared.ai.lock().unwrap() = Some(cache.clone());
     }
     fn with(ctx: &egui::Context, render: Render) -> Self {
         let shared: Arc<Shared> = Default::default();
@@ -109,6 +122,7 @@ impl ScreenPreviews {
             pending: HashMap::new(),
             next_ticket: 0,
             failed: HashMap::new(),
+            to_say: Vec::new(),
             textures: HashMap::new(),
             order: VecDeque::new(),
         }
@@ -149,11 +163,18 @@ impl ScreenPreviews {
             self.order.retain(|k| *k != key);
             self.order.push_back(key);
             Shown::Ready(texture)
-        } else if let Some(error) = self.failed.get(&key) {
-            Shown::Failed(error)
+        } else if let Some(why) = self.failed.get_mut(&key) {
+            // Said when shown, so a photo no longer in view says nothing.
+            self.to_say.extend(why.take());
+            Shown::Failed
         } else {
             Shown::Loading
         }
+    }
+    /// Why the previews shown since last asked failed, each once, for the
+    /// top bar.
+    pub(super) fn take_failures(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.to_say)
     }
     pub(super) fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(Done {
@@ -193,7 +214,7 @@ impl ScreenPreviews {
                     self.textures.insert(key, texture);
                 }
                 Outcome::Failed(error) => {
-                    self.failed.insert(key, error);
+                    self.failed.insert(key, Some(error));
                 }
                 Outcome::Skipped => {}
             }
@@ -280,8 +301,22 @@ fn work(
         let outcome = if !wanted.lock().unwrap().contains(&key) {
             Outcome::Skipped
         } else {
+            let ai = shared.ai.lock().unwrap().clone();
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                render(&key.1, key.2, edit.as_ref(), &shared.cancel)
+                match (&edit, &ai) {
+                    // As the Library's edited previews: from a finished result, else plain.
+                    (Some(source), Some(_)) if source.renders_ai() => {
+                        super::previews::develop_for_preview(
+                            &key.1,
+                            source,
+                            key.2,
+                            ai.as_ref(),
+                            Cancel::new(&shared.cancel),
+                        )
+                        .map(|(image, _)| image)
+                    }
+                    _ => render(&key.1, key.2, edit.as_ref(), Cancel::new(&shared.cancel)),
+                }
             }));
             match rendered {
                 Ok(Ok(image)) => Outcome::Ready(image),
@@ -303,12 +338,13 @@ fn work(
 
 /// `path` within `edge` pixels: developed with its edit (or, for a RAW, the
 /// defaults Develop opens it with), as `previews::develop_quickly` does; a JPEG,
-/// TIFF or PNG without an edit as it is, which its defaults reproduce.
+/// TIFF or PNG without an edit as it is, which its defaults reproduce. An edit with
+/// AI Denoise renders from a finished result instead (see `work`).
 fn render(
     path: &Path,
     edge: u32,
     edit: Option<&EditSource>,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> anyhow::Result<image::RgbImage> {
     let edited = matches!(edit, Some(EditSource::Recipe(_) | EditSource::Lightroom(_)));
     if !edited && !crate::storage::is_raw(path) {
@@ -327,13 +363,13 @@ mod tests {
         let path = directory.path().join("photo.jpg");
         let edit = super::super::previews::tests::edited_jpeg(&path)?;
         let cancel = AtomicBool::new(false);
-        let edited = render(&path, 64, Some(&edit), &cancel)?;
+        let edited = render(&path, 64, Some(&edit), Cancel::new(&cancel))?;
         assert!(
             edited.pixels().all(|p| p.0[1] > 75),
             "{:?}",
             edited.get_pixel(0, 0)
         );
-        let unedited = render(&path, 64, None, &cancel)?;
+        let unedited = render(&path, 64, None, Cancel::new(&cancel))?;
         assert!(unedited.pixels().all(|p| p.0[1].abs_diff(60) <= 2));
         Ok(())
     }
@@ -373,7 +409,7 @@ mod tests {
             path: &Path,
             _: u32,
             _: Option<&EditSource>,
-            _: &AtomicBool,
+            _: Cancel<'_>,
         ) -> anyhow::Result<image::RgbImage> {
             match path.to_str() {
                 Some("panics") => panic!("render panics"),
@@ -395,12 +431,18 @@ mod tests {
         screen.wait(&ctx);
         assert!(matches!(
             screen.get(&photos[0], 100, 0, || None),
-            Shown::Failed("The preview could not be rendered")
+            Shown::Failed
         ));
         assert!(matches!(
             screen.get(&photos[1], 100, 0, || None),
-            Shown::Failed("no such photo")
+            Shown::Failed
         ));
+        let mut failures = screen.take_failures();
+        failures.sort();
+        assert_eq!(
+            failures,
+            ["The preview could not be rendered", "no such photo"]
+        );
         assert!(matches!(
             screen.get(&photos[2], 100, 0, || None),
             Shown::Ready(_)
@@ -459,9 +501,28 @@ mod tests {
         let a = photo(PhotoId(1), Path::new("a"));
         let _ = screen.get(&a, 100, 0, || None);
         screen.wait(&ctx);
-        assert!(matches!(screen.get(&a, 100, 0, || None), Shown::Failed(_)));
+        assert!(matches!(screen.get(&a, 100, 0, || None), Shown::Failed));
+        // Its failure is for the top bar once, however often it is shown.
+        assert_eq!(screen.take_failures(), ["offline"]);
+        let _ = screen.get(&a, 100, 0, || None);
+        screen.poll(&ctx);
+        assert!(screen.take_failures().is_empty());
         screen.retry_failed();
         assert!(matches!(screen.get(&a, 100, 0, || None), Shown::Loading));
+    }
+
+    /// A preview that fails once its photo is out of view says nothing:
+    /// its failure is said when it is shown again.
+    #[test]
+    fn a_preview_failing_out_of_view_is_said_only_when_shown() {
+        let ctx = egui::Context::default();
+        let mut screen = ScreenPreviews::with(&ctx, |_, _, _, _| anyhow::bail!("offline"));
+        let a = photo(PhotoId(1), Path::new("a"));
+        let _ = screen.get(&a, 100, 0, || None);
+        screen.wait(&ctx);
+        assert!(screen.take_failures().is_empty());
+        assert!(matches!(screen.get(&a, 100, 0, || None), Shown::Failed));
+        assert_eq!(screen.take_failures(), ["offline"]);
     }
 
     #[test]
@@ -490,11 +551,11 @@ mod tests {
             _: &Path,
             _: u32,
             _: Option<&EditSource>,
-            cancel: &AtomicBool,
+            cancel: Cancel<'_>,
         ) -> anyhow::Result<image::RgbImage> {
             STARTED.store(true, Ordering::Relaxed);
             // A render that only a cancel ends.
-            while !cancel.load(Ordering::Relaxed) {
+            while !cancel.is_cancelled() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             anyhow::bail!("Cancelled")

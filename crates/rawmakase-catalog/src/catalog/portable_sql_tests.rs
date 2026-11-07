@@ -149,7 +149,7 @@ fn adopting_legacy_mappings_of_duplicate_folders_keeps_the_last_added() -> Resul
         .location_rows()?
         .remove(&folder.root)
         .unwrap_or_default();
-    assert_eq!(rows, vec![(folder.relative.clone(), newer)]);
+    assert_eq!(rows, vec![(folder.relative, newer)]);
     Ok(())
 }
 
@@ -197,6 +197,7 @@ fn edit_times_keep_their_text_form() -> Result<()> {
     cat.save_edit(
         ids[0],
         &folder.join("image0.ARW"),
+        &crate::storage::Identity::read(&folder.join("image0.ARW"))?,
         &Recipe::default(),
         &ExportOptions::default(),
         HistoryUpdate::Keep,

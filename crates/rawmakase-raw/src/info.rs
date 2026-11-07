@@ -4,28 +4,68 @@ use crate::variant::Variant;
 /// A crop position that is not known.
 pub const UNSET: u32 = 0xffff;
 
+/// The colour space a camera rendered its embedded JPEGs in, as its maker notes
+/// say (Nikon's ColorSpace, Olympus's CameraSettings ColorSpace), where the EXIF
+/// may not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PreviewSpace {
+    /// The camera's sRGB setting.
+    Srgb,
+    /// The camera's Adobe RGB (1998) setting.
+    AdobeRgb,
+}
+
+/// Where the colour matrix in [`RawInfo::cam_xyz`] comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MatrixSource {
+    /// None: the camera table has no row and the file holds none.
+    #[default]
+    Absent,
+    /// The camera table's row from Adobe DNG Converter's output.
+    AdobeDng,
+    /// The camera table's row from RAWmakase's earlier decoder, for a camera
+    /// Adobe has no matrix for.
+    CompatObserved,
+    /// The DNG's own ColorMatrix tags (or a table rule from them).
+    File,
+    /// The DNG's own ColorMatrix, of a tungsten calibration alone.
+    FileTungstenOnly,
+    /// A matrix the camera's maker notes give (Olympus), with its D65 levels.
+    MakerNote,
+    /// A monochrome DNG's neutral colour, by definition.
+    Neutral,
+}
+
 /// A RAW file's header facts: identity, geometry, levels' sources, colour and
 /// exposure. Names, sizes, crops and levels follow the conventions RAWmakase
 /// has always read them with, so saved edits keep their geometry and scale.
 #[derive(Clone, Debug)]
 pub struct RawInfo {
+    /// How the sensor data is stored, which says how it decodes.
     pub variant: Variant,
+    /// RAWmakase's name for the camera's maker ("Canon").
     pub make: String,
+    /// RAWmakase's name for the model ("EOS R6 Mark II").
     pub model: String,
     /// The make and model as the file writes them, trimmed, before any of
     /// RAWmakase's naming (`names::apply`): what export file names use.
     pub file_make: String,
+    /// The model, as the file writes it.
     pub file_model: String,
     /// The canonical name of a body sold under several names (empty make
     /// when there is none).
     pub normalized_make: String,
+    /// The canonical model name, with [`RawInfo::normalized_make`].
     pub normalized_model: String,
     /// The stored sensor data's size.
     pub raw_width: u32,
+    /// The stored sensor data's height.
     pub raw_height: u32,
     /// The visible area, `margins` (left, top) into the sensor data.
     pub width: u32,
+    /// The visible area's height.
     pub height: u32,
+    /// Where the visible area starts in the sensor data: left, top.
     pub margins: [u32; 2],
     /// A Fujifilm Super CCD's stored rows, which develop turned by 45° (the
     /// visible area is the stored one); `None` for other sensors.
@@ -34,7 +74,12 @@ pub struct RawInfo {
     /// width, height]` in sensor coordinates ([`UNSET`] positions when only a
     /// size is known; all [`UNSET`] and zero sizes when there is none).
     pub frame: [u32; 4],
+    /// The camera's aspect-ratio crop, as [`RawInfo::frame`] gives the default.
     pub aspect: [u32; 4],
+    /// How much smaller than the sensor's the frame's diagonal is, when the camera
+    /// recorded only part of its sensor in a crop mode (Canon's APS-C and APS-H
+    /// modes); `None` for the whole sensor or when not known.
+    pub sensor_crop: Option<f32>,
     /// Panasonic's sensor borders (RW2 tags 4 to 7), `[left, top, width,
     /// height]` in sensor coordinates, when the default crop is the camera's
     /// aspect ratio inside them.
@@ -66,27 +111,47 @@ pub struct RawInfo {
     /// scanners): its one sample is every channel's, and its colour neutral
     /// (`color::apply`).
     pub monochrome: bool,
+    /// Fujifilm's DevelopmentDynamicRange in percent (400 for DR400), 0xffff when
+    /// there is none.
     pub fuji_dynamic_range: u32,
     /// Fujifilm's exposure midpoint shift in EV, -999 when there is none.
     pub fuji_exposure_shift: f32,
+    /// ISO speed, 0 when unknown.
     pub iso: f32,
+    /// Exposure time in seconds, 0 when unknown.
     pub shutter: f32,
+    /// The f-number, 0 when unknown.
     pub aperture: f32,
+    /// Focal length in millimetres, 0 when unknown.
     pub focal: f32,
+    /// Focal length in 35 mm equivalent, 0 when unknown.
     pub focal_35mm: f32,
     /// As-shot white balance multipliers (red, green, blue, second green);
     /// zero when the file has none.
     pub cam_mul: [f32; 4],
     /// Daylight multipliers derived from the colour matrix.
     pub pre_mul: [f32; 4],
+    /// The white balance presets the camera stored.
     pub presets: Presets,
     /// XYZ (D65) to camera, rows red, green, blue; zero when unknown.
     pub cam_xyz: [[f32; 3]; 3],
+    /// Where `cam_xyz` comes from.
+    pub matrix_source: MatrixSource,
+    /// The colour space of the camera's JPEGs, when the maker notes say it.
+    pub preview_space: Option<PreviewSpace>,
+    /// The look the camera's JPEGs were made with, by the maker's name for it: a
+    /// Fujifilm film simulation, Sony Creative Style, Nikon Picture Control or Canon
+    /// Picture Style.
+    pub camera_look: Option<String>,
     /// Camera to sRGB primaries (rows sum to one).
     pub rgb_cam: [[f32; 3]; 3],
+    /// The lens model as the file records it, empty when it records none.
     pub lens: String,
     /// The maker's numeric lens ID (Nikon's LensIDNumber, Pentax's LensType).
     pub lens_id: u32,
+    /// The lens's focal range and maximum apertures, as the maker notes give them
+    /// (Nikon's Lens tag): shortest and longest focal length, aperture at each.
+    pub lens_info: Option<[f32; 4]>,
     /// Canon Highlight Tone Priority: 0 off, 1 on, 2 enhanced.
     pub highlight_tone_priority: i32,
     /// The sensor data's mean black, its white and the samples' maximum
@@ -103,8 +168,10 @@ pub struct RawInfo {
     pub(crate) uncompressed_preview: bool,
     /// A DNG's AsShotWhiteXY, when it gives the white balance so.
     pub(crate) as_shot_xy: Option<[f64; 2]>,
-    /// The XYZ (D65) to camera matrix the file itself holds (a DNG's).
+    /// The XYZ (D65) to camera matrix the file itself holds (a DNG's), and
+    /// where in the file it comes from.
     pub(crate) file_matrix: Option<[[f32; 3]; 3]>,
+    pub(crate) file_matrix_source: MatrixSource,
     /// The canonical name the file itself gives (Hasselblad's sensor
     /// names), where the camera table has none.
     pub(crate) canonical: Option<[String; 2]>,
@@ -150,7 +217,8 @@ impl SuperCcd {
 }
 
 /// White balance presets the camera stored (red, green, blue), zero when
-/// absent.
+/// absent. Each field is the preset of its name.
+#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Presets {
     pub daylight: [f32; 3],
@@ -164,8 +232,11 @@ pub struct Presets {
 /// green, 2 blue, 3 the second green of a Bayer pattern).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cfa {
+    /// The pattern's period in rows.
     pub rows: usize,
+    /// The pattern's period in columns.
     pub cols: usize,
+    /// `rows × cols` filters, row by row.
     pub colors: Vec<u8>,
 }
 
@@ -176,6 +247,7 @@ pub(crate) fn base(variant: Variant) -> RawInfo {
         variant,
         make: String::new(),
         model: String::new(),
+        sensor_crop: None,
         file_make: String::new(),
         file_model: String::new(),
         normalized_make: String::new(),
@@ -208,9 +280,13 @@ pub(crate) fn base(variant: Variant) -> RawInfo {
         pre_mul: [0.; 4],
         presets: Presets::default(),
         cam_xyz: [[0.; 3]; 3],
+        matrix_source: MatrixSource::Absent,
+        preview_space: None,
+        camera_look: None,
         rgb_cam: [[0.; 3]; 3],
         lens: String::new(),
         lens_id: 0,
+        lens_info: None,
         highlight_tone_priority: 0,
         levels: None,
         plan: crate::variant::Plan::None,
@@ -218,6 +294,7 @@ pub(crate) fn base(variant: Variant) -> RawInfo {
         uncompressed_preview: false,
         as_shot_xy: None,
         file_matrix: None,
+        file_matrix_source: MatrixSource::Absent,
         canonical: None,
         image_size: None,
     }
@@ -250,6 +327,7 @@ impl Cfa {
             colors,
         }
     }
+    /// The filter at visible row `row`, column `col`.
     pub fn color(&self, row: usize, col: usize) -> u8 {
         self.colors[(row % self.rows) * self.cols + col % self.cols]
     }

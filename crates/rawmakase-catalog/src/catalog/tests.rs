@@ -4,7 +4,7 @@ use crate::lr_develop::{convert_develop, develop_fields};
 use crate::metadata::{LangAlt, PhotoInfo, Value};
 use crate::{export_settings::ExportOptions, model::recipe::Recipe, storage::Identity};
 use rusqlite::{Connection, params};
-fn fixture(path: &Path) -> Result<()> {
+pub(super) fn fixture(path: &Path) -> Result<()> {
     let db = Connection::open(path)?;
     db.execute_batch("CREATE TABLE AgLibraryRootFolder(id_local INTEGER, absolutePath TEXT);
         CREATE TABLE AgLibraryFolder(id_local INTEGER,rootFolder INTEGER,pathFromRoot TEXT);
@@ -62,6 +62,43 @@ fn lightroom_folder_stacks_are_imported_with_their_top_and_collapse() -> Result<
         .db_for_tests()
         .query_row("SELECT count(*) FROM stacks", [], |r| r.get(0))?;
     assert_eq!(stacks, 2);
+    Ok(())
+}
+#[test]
+fn lightroom_original_filenames_become_import_facts() -> Result<()> {
+    let d = tempfile::tempdir()?;
+    // A catalog without the column gives no facts: none is invented.
+    let source = d.path().join("old.lrcat");
+    fixture(&source)?;
+    let destination = d.path().join("old.rawmakase");
+    import_lightroom(&source, &destination)?;
+    assert_eq!(
+        Catalog::open(&destination)?.import_facts(PhotoId(40))?,
+        None
+    );
+    // Lightroom Classic's: the name the file had when Lightroom imported
+    // it, for the master only (a virtual copy reads its master's).
+    let source = d.path().join("renamed.lrcat");
+    fixture(&source)?;
+    {
+        let db = Connection::open(&source)?;
+        db.execute_batch(
+            "ALTER TABLE AgLibraryFile ADD COLUMN originalFilename TEXT;
+             UPDATE AgLibraryFile SET originalFilename='DSCF0001.RAF' WHERE id_local=30;
+             INSERT INTO AgLibraryFile VALUES(31,20,'other.ARW','other','ARW',NULL),(32,20,'third.ARW','third','ARW','');
+             INSERT INTO Adobe_images VALUES(42,31,'',0,0,'','RAW','',NULL,'AB'),(43,32,'',0,0,'','RAW','',NULL,'AB');",
+        )?;
+    }
+    let destination = d.path().join("renamed.rawmakase");
+    import_lightroom(&source, &destination)?;
+    let cat = Catalog::open(&destination)?;
+    assert_eq!(
+        cat.import_facts(PhotoId(40))?,
+        Some(("DSCF0001.RAF".into(), None, None, false))
+    );
+    for id in [41, 42, 43] {
+        assert_eq!(cat.import_facts(PhotoId(id))?, None, "{id}");
+    }
     Ok(())
 }
 #[test]
@@ -221,6 +258,7 @@ fn import_is_lossless_atomic_and_virtual_copies_are_independent() -> Result<()> 
     cat.save_edit(
         PhotoId(40),
         &p,
+        &crate::storage::Identity::read(&p)?,
         &edit,
         &ExportOptions::default(),
         crate::catalog::HistoryUpdate::Keep,
@@ -237,6 +275,7 @@ fn import_is_lossless_atomic_and_virtual_copies_are_independent() -> Result<()> 
         cat.save_edit(
             PhotoId(40),
             &p,
+            &crate::storage::Identity::read(&p)?,
             &edit,
             &ExportOptions::default(),
             crate::catalog::HistoryUpdate::Keep
@@ -673,6 +712,7 @@ fn catalog_keeps_spots_and_masks_out_of_the_recipe_column() -> Result<()> {
     c.save_edit(
         id,
         &photo,
+        &crate::storage::Identity::read(&photo)?,
         &r,
         &ExportOptions::default(),
         crate::catalog::HistoryUpdate::Keep,
@@ -692,6 +732,7 @@ fn catalog_keeps_spots_and_masks_out_of_the_recipe_column() -> Result<()> {
     c.save_edit(
         id,
         &photo,
+        &crate::storage::Identity::read(&photo)?,
         &Recipe::default(),
         &ExportOptions::default(),
         crate::catalog::HistoryUpdate::Keep,
@@ -769,6 +810,7 @@ fn virtual_copies_are_created_promoted_renamed_and_removed() -> Result<()> {
     cat.save_edit(
         original.id,
         &path,
+        &crate::storage::Identity::read(&path)?,
         &edit,
         &ExportOptions::default(),
         crate::catalog::HistoryUpdate::Keep,
@@ -803,6 +845,7 @@ fn virtual_copies_are_created_promoted_renamed_and_removed() -> Result<()> {
     cat.save_edit(
         first,
         &path,
+        &crate::storage::Identity::read(&path)?,
         &other,
         &ExportOptions::default(),
         crate::catalog::HistoryUpdate::Keep,
@@ -1068,6 +1111,7 @@ fn reopening_a_catalog_adds_the_tables_a_newer_release_needs() -> Result<()> {
     cat.save_edit(
         id,
         &photo,
+        &crate::storage::Identity::read(&photo)?,
         &Recipe::default(),
         &ExportOptions::default(),
         crate::catalog::HistoryUpdate::Keep,
@@ -1254,13 +1298,21 @@ fn develop_history_saves_with_the_edit_and_goes_with_the_photo() -> Result<()> {
     c.save_edit(
         id,
         &photo,
+        &crate::storage::Identity::read(&photo)?,
         &edited,
         &export,
         HistoryUpdate::Replace(&history),
     )?;
     assert_eq!(c.load_history(id)?, Some(history.clone()));
     // Saving from outside Develop keeps it.
-    c.save_edit(id, &photo, &Recipe::default(), &export, HistoryUpdate::Keep)?;
+    c.save_edit(
+        id,
+        &photo,
+        &crate::storage::Identity::read(&photo)?,
+        &Recipe::default(),
+        &export,
+        HistoryUpdate::Keep,
+    )?;
     assert_eq!(c.load_history(id)?, Some(history.clone()));
     // A History from a newer release is left unread, not misread.
     c.db_for_tests().execute(
@@ -1282,7 +1334,14 @@ fn develop_history_saves_with_the_edit_and_goes_with_the_photo() -> Result<()> {
         steps: Vec::new(),
         applied: 0,
     };
-    c.save_edit(id, &photo, &edited, &export, HistoryUpdate::of(&empty))?;
+    c.save_edit(
+        id,
+        &photo,
+        &crate::storage::Identity::read(&photo)?,
+        &edited,
+        &export,
+        HistoryUpdate::of(&empty),
+    )?;
     let count = |c: &Catalog| -> Result<i64> {
         Ok(c.db_for_tests()
             .query_row("SELECT COUNT(*) FROM develop_history", [], |r| r.get(0))?)
@@ -1291,6 +1350,7 @@ fn develop_history_saves_with_the_edit_and_goes_with_the_photo() -> Result<()> {
     c.save_edit(
         id,
         &photo,
+        &crate::storage::Identity::read(&photo)?,
         &edited,
         &export,
         HistoryUpdate::Replace(&history),
@@ -1503,12 +1563,32 @@ fn lightroom_15_controls_at_rest_are_not_reported() -> Result<()> {
     let (r, w) = convert_develop(text, &crate::camera_data::Metadata::default(), &[], None)?;
     assert!(w.is_empty(), "{w:?}");
     assert_eq!(r.exposure, 0.5);
-    // Active, they are still reported.
-    for active in ["Glow = 20", "HDREditMode = 1"] {
-        let text = format!("s = {{ {active}, GlowRange = 50, HDRMaxValue = 2.3 }}");
-        let (_, w) = convert_develop(&text, &crate::camera_data::Metadata::default(), &[], None)?;
-        assert!(!w.is_empty(), "{active}");
-    }
+    // An active Glow is still reported.
+    let text = "s = { Glow = 20, GlowRange = 50, HDRMaxValue = 2.3 }";
+    let (_, w) = convert_develop(text, &crate::camera_data::Metadata::default(), &[], None)?;
+    assert!(!w.is_empty());
+    // HDR on is kept, never dropped: rendered without it, the edit would be SDR. With
+    // an adjustment HDR does not render yet, its HDR master is what is refused.
+    let text = "s = { Exposure2012 = 0.5, HDREditMode = 1, HDRMaxValue = 5 }";
+    let (r, _) = convert_develop(text, &crate::camera_data::Metadata::default(), &[], None)?;
+    assert!(r.hdr.is_active());
+    assert_eq!(r.hdr.limit, 5.);
+    assert!(crate::model::hdr::check_recipe(&r).is_ok());
+    let text = "s = { Exposure2012 = 0.5, Contrast2012 = 20, HDREditMode = 1, HDRMaxValue = 5 }";
+    let (r, _) = convert_develop(text, &crate::camera_data::Metadata::default(), &[], None)?;
+    assert!(r.hdr.is_active());
+    let error = crate::model::hdr::check_recipe(&r).unwrap_err().to_string();
+    assert!(error.contains("HDR"), "{error}");
+    // HDR values set while HDR is off are kept, so switching it on restores them.
+    let text = "s = { Exposure2012 = 0.5, HDREditMode = 0, HDRMaxValue = 3.5, SDRBrightness = 20, SDRBlend = -40 }";
+    let (r, w) = convert_develop(text, &crate::camera_data::Metadata::default(), &[], None)?;
+    assert!(w.is_empty(), "{w:?}");
+    assert!(!r.hdr.enabled);
+    assert_eq!(r.hdr.limit, 3.5);
+    assert_eq!(
+        (r.hdr.sdr.brightness, r.hdr.sdr.blend),
+        (20. * 0.01, -40. * 0.01)
+    );
     Ok(())
 }
 #[test]

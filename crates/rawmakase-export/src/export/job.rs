@@ -14,12 +14,10 @@ use crate::{
     raw::Raw,
 };
 use anyhow::{Result, ensure};
+use rawmakase_cancel::Cancel;
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 /// The photo as it was when Export was chosen.
@@ -37,6 +35,12 @@ pub struct Photo {
     pub demosaic: Demosaic,
     /// Where a full-size decode is looked up first.
     pub cache: DecodeCache,
+    /// Where the AI Denoise source comes from when the edit has AI Denoise on.
+    pub ai: crate::ai_denoise::AiService,
+    /// The file as it was before `image` was decoded from it, for AI Denoise: a file
+    /// changed since fails the export rather than mixing two files, and so does one
+    /// whose identity could not be read (`None`).
+    pub file: Option<crate::storage::Identity>,
 }
 
 /// Exports `photo` to `target`, reporting progress from 0 to 1. Stops between
@@ -48,14 +52,25 @@ pub fn run(
     settings: &ExportSettings,
     target: &Path,
     replace: super::Replace,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
     progress: impl Fn(f32),
 ) -> Result<Option<String>> {
+    // The target's format, not only the settings', must hold the colour space or the
+    // HDR encoding; checked before anything renders.
+    let format = crate::export_settings::Format::from_path(target);
+    if let Some(output) = settings.hdr_output()? {
+        let format = format.ok_or_else(|| {
+            anyhow::anyhow!("An HDR export is a TIFF or JPEG XL: name it .tif, .tiff or .jxl")
+        })?;
+        crate::export_settings::Format::check_hdr(format, output)?;
+    } else if let Some(format) = format {
+        format.supports(settings.output_space()?)?;
+    }
     let prepared = prepare(&photo, settings, cancel, &progress)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    super::export_with(
+    super::export_pixels(
         target,
         &photo.source,
         &prepared.rendered,
@@ -70,7 +85,8 @@ pub fn run(
 
 /// A photo rendered for export, with what goes in the file beside its pixels.
 pub struct Prepared {
-    pub rendered: crate::rendered::Rendered,
+    /// The pixels, in the colour space or HDR encoding the settings chose.
+    pub rendered: super::Pixels,
     pub metadata: crate::camera_data::Metadata,
     pub options: crate::export_settings::ExportOptions,
     pub embed: Embed,
@@ -79,15 +95,29 @@ pub struct Prepared {
 }
 
 /// Renders `photo` for an export with `settings`, reporting progress up to 0.85.
-/// Stops between stages once `cancel` is set.
+/// Stops between stages once `cancel` is set. Settings whose colour space can't be
+/// exported (in their format, or from a later release) are refused first.
 pub fn prepare(
     photo: &Photo,
     settings: &ExportSettings,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
     progress: &impl Fn(f32),
 ) -> Result<Prepared> {
+    settings.check_output()?;
+    let hdr = settings.hdr_output()?;
+    if hdr.is_some() {
+        // Captured with the job: the edit's own intent, never the editor's or display's.
+        ensure!(
+            photo.recipe.hdr.is_active(),
+            "This photo's edit has HDR off: turn on High Dynamic Range in Develop, or export it in SDR"
+        );
+        ensure!(
+            photo.watermark.is_none(),
+            "Watermarks are not supported in HDR exports yet"
+        );
+    }
     let cancelled = || -> Result<()> {
-        ensure!(!cancel.load(Ordering::Relaxed), "Cancelled");
+        ensure!(!cancel.is_cancelled(), "Cancelled");
         Ok(())
     };
     progress(0.05);
@@ -125,12 +155,45 @@ pub fn prepare(
     cancelled()?;
     progress(0.4);
     let options = settings.options();
-    let mut rendered = crate::develop::render(&image, &photo.recipe.checked()?, options.max_edge)?;
-    if let Some(w) = &watermark
-        && !w.apply(&mut rendered)
-    {
-        notice = Some("the watermark's text has no characters its font can draw".into());
-    }
+    let ai = ai_source(photo, &image, cancel)?;
+    cancelled()?;
+    let recipe = photo.recipe.checked()?;
+    let rendered = match hdr {
+        Some(output) => {
+            let master =
+                crate::develop::render_hdr(&image, &recipe, ai.as_ref(), options.max_edge, cancel)?;
+            if output.gain_map {
+                // The base is the edit's SDR rendition, rendered as an sRGB export.
+                let base = crate::develop::render_export(
+                    &image,
+                    &recipe,
+                    ai.as_ref(),
+                    options.max_edge,
+                    crate::color::OutputSpace::Srgb,
+                    cancel,
+                )?;
+                super::Pixels::GainMap(super::GainMapPixels::new(base, &master)?)
+            } else {
+                super::Pixels::Hdr(super::HdrPixels::encode(&master, output))
+            }
+        }
+        None => {
+            let mut rendered = crate::develop::render_export(
+                &image,
+                &recipe,
+                ai.as_ref(),
+                options.max_edge,
+                settings.output_space()?,
+                cancel,
+            )?;
+            if let Some(w) = &watermark
+                && !w.apply(&mut rendered)
+            {
+                notice = Some("the watermark's text has no characters its font can draw".into());
+            }
+            super::Pixels::Sdr(rendered)
+        }
+    };
     cancelled()?;
     progress(0.85);
     let file = file.filter(|_| policy.reads_file());
@@ -172,7 +235,7 @@ pub fn decode_full(
     source: &Path,
     demosaic: Demosaic,
     cache: &DecodeCache,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<CameraImage> {
     let full = FullSize::with_cache(source, demosaic, cache.clone());
     match full.cached(&raw.metadata) {
@@ -181,13 +244,39 @@ pub fn decode_full(
     }
 }
 
+/// The complete AI Denoise source of `photo` (full-size `image`) when its edit renders
+/// AI Denoise: from the service's cache, a running job, or computed now. An export never
+/// renders the plain image, or a partial result, in its place: without one it fails
+/// with the reason.
+fn ai_source(
+    photo: &Photo,
+    image: &Arc<CameraImage>,
+    cancel: Cancel<'_>,
+) -> Result<Option<crate::develop::AiSource>> {
+    if !photo.recipe.as_rendered().ai_denoise.renders() {
+        return Ok(None);
+    }
+    let file = photo.file.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "AI Denoise: the photo's file could not be identified when it was opened; open it again"
+        )
+    })?;
+    let ai = photo
+        .ai
+        .0
+        .get(&photo.source, &file, image, cancel)
+        .map_err(|e| anyhow::anyhow!("AI Denoise: {e:#}"))?;
+    let ai = Arc::try_unwrap(ai).unwrap_or_else(|shared| (*shared).clone());
+    crate::develop::AiSource::recover(ai, cancel).map(Some)
+}
+
 /// The full-resolution image: the open one, the decode cache's, or a new decode.
 fn full_size(
     image: Arc<CameraImage>,
     source: &Path,
     demosaic: Demosaic,
     cache: &DecodeCache,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Arc<CameraImage>> {
     if !image.fast {
         return Ok(image);
@@ -241,6 +330,7 @@ fn xmp(
 mod tests {
     use super::*;
     use crate::exif::{CameraExif, Field, tag};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// The photo at `source`, its image decoded already, as Develop has it.
     fn photo(source: &Path, cache: &Path) -> Photo {
@@ -263,6 +353,7 @@ mod tests {
                 fast: false,
                 scale_factor: 1.,
                 scale_clipped: 0,
+                hdr: Default::default(),
             }),
             source: source.to_path_buf(),
             recipe: Recipe::default(),
@@ -270,7 +361,130 @@ mod tests {
             watermark: None,
             demosaic: Demosaic::default(),
             cache: DecodeCache::new(cache.to_path_buf(), u64::MAX),
+            ai: crate::ai_denoise::AiService::refusing("no AI Denoise here"),
+            file: None,
         }
+    }
+
+    /// An AI Denoise service that answers with a fixed pattern, and counts its calls.
+    struct Flat(std::sync::atomic::AtomicUsize, f32);
+    impl crate::ai_denoise::AiBase for Flat {
+        fn get(
+            &self,
+            _: &Path,
+            _: &crate::storage::Identity,
+            plain: &Arc<CameraImage>,
+            _: Cancel<'_>,
+        ) -> Result<Arc<CameraImage>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut image = (**plain).clone();
+            image.recovered = Default::default();
+            // Not the plain image's pattern: rows instead of columns.
+            for (i, p) in image.pixels.iter_mut().enumerate() {
+                *p = [0.02 + self.1 * ((i / plain.width as usize) % 7) as f32 / 30.; 3];
+            }
+            Ok(Arc::new(image))
+        }
+    }
+
+    fn with_ai(mut photo: Photo, amount: f32) -> Photo {
+        photo.recipe.ai_denoise = crate::model::ai_denoise::AiDenoise {
+            enabled: true,
+            amount,
+        };
+        photo
+    }
+
+    /// Without the AI result, an export with AI Denoise on fails with the reason and
+    /// writes nothing; it never renders the plain image in its place.
+    #[test]
+    fn an_export_with_ai_denoise_and_no_service_fails_closed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("a.dng");
+        std::fs::write(&source, b"synthetic")?;
+        let mut photo = with_ai(photo(&source, &dir.path().join("cache")), 1.);
+        photo.file = crate::storage::Identity::read(&source).ok();
+        let target = dir.path().join("out.jpg");
+        let error = run(
+            photo,
+            &ExportSettings::default(),
+            &target,
+            super::super::Replace::NoClobber,
+            Cancel::NEVER,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no AI Denoise here"), "{error}");
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    /// A photo whose file could not be identified when it was decoded gets no AI result:
+    /// nothing proves the service's would be of the same file.
+    #[test]
+    fn an_export_without_the_decoded_files_identity_fails_closed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("a.dng");
+        std::fs::write(&source, b"synthetic")?;
+        let flat = Arc::new(Flat(Default::default(), 0.6));
+        let mut photo = with_ai(photo(&source, &dir.path().join("cache")), 1.);
+        photo.ai = crate::ai_denoise::AiService(flat.clone());
+        let error = prepare(&photo, &ExportSettings::default(), Cancel::NEVER, &|_| {})
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("could not be identified"),
+            "{error}"
+        );
+        assert_eq!(flat.0.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// The service's source is what the export renders, blended by Amount; with AI
+    /// Denoise off the service is never asked and the render is the plain one.
+    #[test]
+    fn an_export_renders_the_services_source_and_off_never_asks() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("a.dng");
+        std::fs::write(&source, b"synthetic")?;
+        let flat = Arc::new(Flat(Default::default(), 0.6));
+        let render = |photo: &Photo| -> Result<Vec<[f32; 3]>> {
+            match prepare(photo, &ExportSettings::default(), Cancel::NEVER, &|_| {})?.rendered {
+                crate::export::Pixels::Sdr(image) => Ok(image.pixels().to_vec()),
+                crate::export::Pixels::Hdr(_) | crate::export::Pixels::GainMap(_) => {
+                    anyhow::bail!("an SDR export rendered HDR")
+                }
+            }
+        };
+        let mut plain = photo(&source, &dir.path().join("cache"));
+        plain.ai = crate::ai_denoise::AiService(flat.clone());
+        plain.file = crate::storage::Identity::read(&source).ok();
+        // Big enough for the tone stage to keep a pattern.
+        let mut image = (*plain.image).clone();
+        (image.width, image.height) = (64, 48);
+        // A frame of that size and a camera that renders (the engine's fixtures').
+        (image.metadata.width, image.metadata.height) = (64, 48);
+        image.metadata.matrix = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
+        image.metadata.wb = [1.; 3];
+        image.metadata.daylight_wb = [1.; 3];
+        image.pixels = (0..64 * 48)
+            .map(|i| [0.02 + (i % 64) as f32 / 300.; 3])
+            .collect();
+        plain.image = Arc::new(image);
+        let off = render(&plain)?;
+        // Off at a moved Amount, and on at Amount 0, are the plain render.
+        let mut moved = plain.clone();
+        moved.recipe.ai_denoise.amount = 0.9;
+        assert_eq!(render(&moved)?, off);
+        assert_eq!(render(&with_ai(plain.clone(), 0.))?, off);
+        assert_eq!(flat.0.load(Ordering::SeqCst), 0);
+        let full = render(&with_ai(plain.clone(), 1.))?;
+        let half = render(&with_ai(plain, 0.5))?;
+        assert_eq!(flat.0.load(Ordering::SeqCst), 2);
+        assert_ne!(full, off);
+        // Half way is neither (the tone stage is not linear, so not checked as a mean).
+        assert!(half != full && half != off);
+        Ok(())
     }
 
     /// The EXIF of `photo`'s JPEG export.
@@ -287,7 +501,7 @@ mod tests {
             &settings,
             &target,
             super::super::Replace::NoClobber,
-            &cancel,
+            Cancel::new(&cancel),
             |_| {},
         )?;
         crate::exif::read(&target).ok_or_else(|| anyhow::anyhow!("no EXIF in the export"))
@@ -395,17 +609,59 @@ mod tests {
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         };
         let _ = cached.recovered.set(Arc::new(cached.clone()));
         cache.store(&DecodeCache::key(&chart, Demosaic::default())?, &cached)?;
-        let image = decode_full(
-            raw,
-            &chart,
-            Demosaic::default(),
-            &cache,
-            &AtomicBool::new(false),
-        )?;
+        let image = decode_full(raw, &chart, Demosaic::default(), &cache, Cancel::NEVER)?;
         assert_eq!((image.width, image.height), (4, 3));
+        Ok(())
+    }
+
+    /// A full-size export read from the decode cache measures its own lateral
+    /// chromatic aberration (Auto CA), never the one the half-size image on screen
+    /// was measured with, as a decode of the file would (#868).
+    #[test]
+    fn a_cached_full_size_image_keeps_no_half_size_measurement() -> Result<()> {
+        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/corpus/charts/synthetic-d65.dng");
+        let dir = tempfile::tempdir()?;
+        let cache = DecodeCache::new(dir.path().to_path_buf(), u64::MAX);
+        let metadata = crate::photo::open(&chart)?.metadata;
+        let image = |width: u32, height: u32, fast: bool| {
+            let image = CameraImage {
+                width,
+                height,
+                recovered: Default::default(),
+                pixels: vec![[0.5; 3]; (width * height) as usize],
+                metadata: metadata.clone(),
+                fast,
+                scale_factor: 1.,
+                scale_clipped: 0,
+                hdr: Default::default(),
+            };
+            let _ = image.recovered.set(Arc::new(image.clone()));
+            image
+        };
+        cache.store(
+            &DecodeCache::key(&chart, Demosaic::default())?,
+            &image(4, 3, false),
+        )?;
+        // The half-size image, measured by a preview render.
+        let half = Arc::new(image(2, 2, true));
+        let measured = rawmakase_model::optics::Radial::new(vec![0., 1.], vec![1., 1.001]).unwrap();
+        let _ = half
+            .metadata
+            .lateral_ca
+            .set(Some([measured.clone(), measured]));
+        let full = full_size(half, &chart, Demosaic::default(), &cache, Cancel::NEVER)?;
+        assert_eq!((full.width, full.height), (4, 3));
+        assert!(full.metadata.lateral_ca.get().is_none());
+        // Its recovered image is the same decode, with the same measurement.
+        assert!(std::sync::Arc::ptr_eq(
+            &full.metadata.lateral_ca,
+            &full.recovered.get().unwrap().metadata.lateral_ca
+        ));
         Ok(())
     }
 }

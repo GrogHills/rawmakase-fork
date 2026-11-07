@@ -83,7 +83,7 @@ pub(crate) struct Sr2 {
 impl Sr2 {
     /// The file's SR2SubIFD, decrypted; `None` when it has none or it is not
     /// inside the file.
-    pub fn read(t: &TiffFile) -> Option<Self> {
+    pub(crate) fn read(t: &TiffFile) -> Option<Self> {
         let private = t.bytes_of(&t.ifds[0], DNG_PRIVATE_DATA)?;
         let at = u64::from(t.u32(private.get(..4)?));
         let ifd = t.ifd_at(at)?;
@@ -142,7 +142,7 @@ impl Sr2 {
         Some((kind, value))
     }
     /// The values of a SHORT or SSHORT tag, as stored.
-    pub fn shorts(&self, tag: u16) -> Option<Vec<u16>> {
+    pub(crate) fn shorts(&self, tag: u16) -> Option<Vec<u16>> {
         let (k, v) = self.entry(tag)?;
         matches!(k, kind::SHORT | kind::SSHORT)
             .then(|| v.as_chunks::<2>().0.iter().map(|c| self.u16(c)).collect())
@@ -168,6 +168,9 @@ const BLACK_LEVEL: u16 = 0x7310;
 const WB_RGGB: u16 = 0x7313;
 const CROP_TOP_LEFT: u16 = 0x74c7;
 const CROP_SIZE: u16 = 0x74c8;
+/// DNG's DefaultCropOrigin and DefaultCropSize, in the same directory.
+const DEFAULT_CROP_ORIGIN: u16 = 0xc61f;
+const DEFAULT_CROP_SIZE: u16 = 0xc620;
 const WHITE_LEVEL: u16 = 50717;
 /// The SR2SubIFD's older levels: black, and as-shot white balance green,
 /// red, blue, green.
@@ -187,6 +190,8 @@ const FULL_IMAGE_SIZE: u16 = 0xb02b;
 /// Reads the facts Sony keeps in its private directories into `info`: white
 /// balance and presets, the default crop; returns the levels.
 pub(crate) fn read(t: &TiffFile, raw: &Ifd, info: &mut RawInfo) -> Levels {
+    // A style's name is short whatever length the file gives the record.
+    info.camera_look = maker_note(t).and_then(|mn| creative_style(&t.raw_upto(&mn, 0xb020, 64)?));
     let sr2 = Sr2::read(t);
     // One value more than any record read, so that a longer one still
     // fails its length check.
@@ -237,7 +242,16 @@ pub(crate) fn read(t: &TiffFile, raw: &Ifd, info: &mut RawInfo) -> Levels {
     }
     info.frame = match (raw_shorts(CROP_TOP_LEFT), raw_shorts(CROP_SIZE)) {
         (Some(at), Some(size)) if at.len() == 2 && size.len() == 2 => {
-            [at[0], at[1], size[0], size[1]]
+            // The a7R III's and a7R IV's own tag starts at column 0, 8 and 32
+            // columns left of what their JPEGs and Camera Raw show. Along a side
+            // the crop does not cut, the default crop places it.
+            let origin = raw_shorts(DEFAULT_CROP_ORIGIN).filter(|v| v.len() == 2);
+            let whole = raw_shorts(DEFAULT_CROP_SIZE).filter(|v| v.len() == 2);
+            let place = |axis: usize| match (&origin, &whole) {
+                (Some(origin), Some(whole)) if whole[axis] == size[axis] => origin[axis],
+                _ => at[axis],
+            };
+            [place(0), place(1), size[0], size[1]]
         }
         _ => match maker_note(t).and_then(|mn| t.ints(&mn, FULL_IMAGE_SIZE, 2)) {
             Some(s) if s.len() == 2 && s[0] > 0 && s[1] > 0 => [UNSET, UNSET, s[1], s[0]],
@@ -281,7 +295,7 @@ pub(crate) struct Mrw {
 }
 
 impl Mrw {
-    pub fn read(t: &TiffFile) -> Option<Self> {
+    pub(crate) fn read(t: &TiffFile) -> Option<Self> {
         let private = t.bytes_of(&t.ifds[0], DNG_PRIVATE_DATA)?;
         let at = u64::from(t.u32(private.get(..4)?));
         let head = t.bytes.slice(at, 8).ok()?;
@@ -354,6 +368,22 @@ impl Mrw {
     }
 }
 
+/// CreativeStyle (0xB020), by the name the camera gives it, its short names in full.
+fn creative_style(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes.split(|b| *b == 0).next()?);
+    let name = match text.trim() {
+        "" | "None" | "n/a" => return None,
+        "ST" => "Standard",
+        "PT" => "Portrait",
+        "NT" => "Neutral",
+        "VV" => "Vivid",
+        "VV2" => "Vivid 2",
+        "BW" => "B&W",
+        other => other,
+    };
+    Some(name.to_owned())
+}
+
 /// The maker note's directory: Sony's notes start with "SONY DSC " or "SONY
 /// CAM " and three zero bytes before it; its offsets are from the TIFF
 /// header.
@@ -373,6 +403,13 @@ fn maker_note(t: &TiffFile) -> Option<Ifd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_creative_style_is_named_in_full() {
+        assert_eq!(creative_style(b"Portrait\0\0").as_deref(), Some("Portrait"));
+        assert_eq!(creative_style(b"PT\0").as_deref(), Some("Portrait"));
+        assert_eq!(creative_style(b"\0\0"), None);
+    }
 
     #[test]
     fn older_black_levels_are_by_filter_position() {

@@ -2,11 +2,12 @@
 // Command output still attaches to the parent console when there is one.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 use anyhow::Result;
+use rawmakase_cancel::Cancel;
 mod mcp;
 use clap::{Parser, Subcommand};
 use rawmakase::model::recipe::Recipe;
 use rawmakase::{camera_data, develop, export_settings::ExportOptions, raw};
-use std::{path::PathBuf, sync::atomic::AtomicBool, time::Instant};
+use std::{path::PathBuf, time::Instant};
 #[derive(Parser)]
 #[command(version, about = "A personal RAW photo editor")]
 struct Args {
@@ -38,6 +39,10 @@ enum Command {
         #[arg(required = true, num_args = 1..)]
         files: Vec<PathBuf>,
     },
+    /// Lensfun's community lens profiles (CC BY-SA 3.0, from lensfun.github.io):
+    /// what is installed, installing, updating and removing them.
+    #[command(subcommand)]
+    Lensfun(LensfunCommand),
     ImportCatalog {
         source: PathBuf,
         output: PathBuf,
@@ -88,11 +93,16 @@ enum Command {
     /// say so.
     SystemInfo,
     /// Render one RAW with several XMP sidecars, developing it once: for comparisons
-    /// with Camera Raw. `jobs` is a JSON list of {"xmp", "output", "max_edge"}; existing
-    /// outputs are skipped.
+    /// with Camera Raw. `jobs` is a JSON list of {"xmp", "output", "max_edge",
+    /// "color_space"}; existing outputs are skipped. A job's `color_space` (srgb,
+    /// adobe-rgb or prophoto) replaces --color-space.
     RenderBatch {
         input: PathBuf,
         jobs: PathBuf,
+        /// The colour space of every job without its own: srgb, adobe-rgb or prophoto
+        /// (16-bit TIFF only).
+        #[arg(long, value_parser = parse_color_space, default_value = "srgb")]
+        color_space: rawmakase::color::OutputSpace,
     },
     Thumbnail {
         input: PathBuf,
@@ -112,12 +122,22 @@ enum Command {
         exposure: Option<f32>,
         #[arg(long, default_value_t = 0)]
         max_edge: u32,
+        /// The output's colour space: srgb, adobe-rgb or prophoto (16-bit TIFF only).
+        /// An output whose format can't hold it is refused before anything renders.
+        #[arg(long, value_parser = parse_color_space, default_value = "srgb", conflicts_with = "tap")]
+        color_space: rawmakase::color::OutputSpace,
         #[arg(long)]
         fast: bool,
         #[arg(long)]
         overwrite: bool,
         #[arg(long)]
         recipe: Option<PathBuf>,
+        /// Start from the photo's edit in this RAWmakase catalog (a virtual copy's is
+        /// the master's): its saved edit, else its Lightroom edit, else the raw
+        /// defaults. Without it, a legacy sidecar, else the raw defaults chosen in
+        /// Preferences. `--recipe` comes before both.
+        #[arg(long)]
+        catalog: Option<PathBuf>,
         /// Apply Auto tone, as the Basic panel's Auto button does; white balance is kept.
         /// Auto sets Exposure itself, so it cannot be combined with --exposure.
         #[arg(long, conflicts_with = "exposure")]
@@ -129,12 +149,64 @@ enum Command {
         /// of linear ProPhoto RGB at full size (docs/scene-tone-stage.md).
         #[arg(long, value_enum)]
         tap: Option<Tap>,
+        /// Write the edit's HDR master (the edit needs HDR on) as a 32-bit float TIFF
+        /// of linear ProPhoto RGB, 1 = graphics white, for comparisons with Camera Raw.
+        #[arg(long, conflicts_with_all = ["tap", "color_space"])]
+        hdr: bool,
+        /// Export the edit's HDR master in this encoding (pq, hlg or linear: TIFF or
+        /// JPEG XL; gain-map: JPEG), as the Export dialog's HDR export writes it (the
+        /// edit needs HDR on).
+        #[arg(long, value_enum, conflicts_with_all = ["tap", "color_space", "hdr"])]
+        hdr_export: Option<HdrTransferArg>,
+        /// The HDR export's gamut: rec2020, display-p3 or rec709.
+        #[arg(long, value_enum, default_value = "rec2020", requires = "hdr_export")]
+        hdr_gamut: HdrGamutArg,
     },
     /// Print each file's decode fingerprint as a line of JSON: what opening and
     /// unpacking it yields, for decode regression checks.
     Fingerprint {
         #[arg(required = true, num_args = 1..)]
         files: Vec<PathBuf>,
+    },
+    /// Development command: run AI Denoise (RawNIND UtNet2) on one RAW and print the
+    /// times and the fitted gain as JSON; optionally render it and the plain image.
+    Denoise {
+        input: PathBuf,
+        /// The model's folder (the installed model by default).
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// cpu or coreml.
+        #[arg(long, default_value = "cpu")]
+        provider: String,
+        #[arg(long, default_value_t = 1.0)]
+        amount: f32,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        plain_output: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        max_edge: u32,
+        #[arg(long)]
+        dump: Option<PathBuf>,
+        /// Read and write the user's AI Denoise cache.
+        #[arg(long)]
+        cache: bool,
+        /// Time Develop's renders while Amount moves (Fit view of this long edge, and a
+        /// 100% region).
+        #[arg(long)]
+        bench_fit: Option<u32>,
+        /// With --bench-fit: the baseline without AI Denoise.
+        #[arg(long)]
+        bench_plain: bool,
+        /// Write centre crops of the camera image (plain, AI, manual noise reduction)
+        /// to this folder, for phase 0's quality measures.
+        #[arg(long)]
+        camera_dump: Option<PathBuf>,
+        #[arg(long, default_value_t = 2048)]
+        camera_crop: u32,
+        /// Luminance noise reduction amounts (0–1) for --camera-dump.
+        #[arg(long, value_delimiter = ',')]
+        nr_luma: Vec<f32>,
     },
     /// Print each file's develop fingerprint as a line of JSON: the image each
     /// decode mode (full, half) makes, hashed, for decoder regression checks.
@@ -157,17 +229,60 @@ enum Command {
         #[arg(long, value_parser = parse_reference)]
         reference: Option<rawmakase::half_check::Reference>,
     },
+    /// Fit Camera Look (fitted) to each RAW's embedded JPEG, the camera's own
+    /// rendering, and say whether the look was used or why not, with its held-out
+    /// error against the JPEG (docs/lightroom-profiles.md#camera-look-fitted).
+    /// Nothing is saved.
+    FitLook {
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+        /// Print each file's full measurements as a line of JSON.
+        #[arg(long)]
+        report: bool,
+        /// Fit a matrix even for a camera that has one, as for a camera without, and
+        /// compare it with the camera's own (the no-matrix trial).
+        #[arg(long)]
+        drop_matrix: bool,
+    },
     Benchmark {
         input: PathBuf,
         #[arg(long, default_value_t = 20)]
         iterations: usize,
     },
 }
+/// A `--color-space`, by the names the automation socket uses too.
+fn parse_color_space(name: &str) -> Result<rawmakase::color::OutputSpace, String> {
+    rawmakase::color::OutputSpace::from_name(name)
+        .ok_or_else(|| format!("unknown color space {name:?}; use srgb, adobe-rgb or prophoto"))
+}
+/// Refuses an `output` whose format can't hold `space`, before anything renders.
+fn check_output(output: &std::path::Path, space: rawmakase::color::OutputSpace) -> Result<()> {
+    use rawmakase::export_settings::Format;
+    Format::from_path(output)
+        .ok_or_else(|| anyhow::anyhow!("Export extension must be {}", Format::extensions_listed()))?
+        .supports(space)
+}
 /// A half-size check's `--reference`.
 fn parse_reference(json: &str) -> Result<rawmakase::half_check::Reference, String> {
     serde_json::from_str(json).map_err(|e| e.to_string())
 }
 /// An `import-profiles --lut-space`.
+#[derive(Subcommand)]
+enum LensfunCommand {
+    /// The version installed, and where it came from.
+    Status,
+    /// Download and install Lensfun's database, or install an archive already
+    /// downloaded (Lensfun's version_2.tar.bz2).
+    Install {
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Install Lensfun's newest database if it is newer than the one installed.
+    Update,
+    /// Remove the installed database; edits keep the corrections they use.
+    Remove,
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum LutSpace {
     Srgb,
@@ -187,6 +302,22 @@ impl From<LutSpace> for rawmakase::camera_profiles::LutSpace {
             LutSpace::Rec2020 => Self::Rec2020,
         }
     }
+}
+/// `render --hdr-export`'s transfer.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum HdrTransferArg {
+    Pq,
+    Hlg,
+    Linear,
+    /// A gain-map JPEG over the SDR rendition (with --hdr-gamut rec709).
+    GainMap,
+}
+/// `render --hdr-gamut`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum HdrGamutArg {
+    Rec2020,
+    DisplayP3,
+    Rec709,
 }
 /// A stage `render --tap` writes.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -257,6 +388,7 @@ fn main() -> Result<()> {
             }
             anyhow::ensure!(!done.imported.is_empty(), "No lens profiles imported");
         }
+        Some(Command::Lensfun(command)) => lensfun(command)?,
         Some(Command::ImportProfiles { lut_space, files }) => {
             // Files and folders, imported as the app's Import does: a file that
             // can't be imported is reported and leaves the rest importing.
@@ -364,28 +496,43 @@ fn main() -> Result<()> {
                 serde_json::to_string_pretty(&r.metadata)?
             );
         }
-        Some(Command::RenderBatch { input, jobs }) => {
+        Some(Command::RenderBatch {
+            input,
+            jobs,
+            color_space,
+        }) => {
             #[derive(serde::Deserialize)]
             struct Job {
                 xmp: PathBuf,
                 output: PathBuf,
                 #[serde(default)]
                 max_edge: u32,
+                #[serde(default)]
+                color_space: Option<String>,
             }
             let jobs: Vec<Job> = serde_json::from_str(&std::fs::read_to_string(&jobs)?)?;
+            // Read before decoding: AI Denoise's result must be of the same file.
+            let file = rawmakase::storage::Identity::read(&input)?;
             let photo = rawmakase::photo::open(&input)?;
-            let im = photo.develop(
-                camera_data::Decode::full(Default::default()),
-                &AtomicBool::new(false),
-            )?;
+            let im = std::sync::Arc::new(
+                photo.develop(camera_data::Decode::full(Default::default()), Cancel::NEVER)?,
+            );
             let (profiles, _) = rawmakase::camera_profiles::installed(&im.metadata);
             let base = Recipe::with_profiles(&im.metadata, &profiles);
             let camera = Some(
                 rawmakase::photo::camera_exif(&input)
                     .unwrap_or_else(|| rawmakase::export::job::stand_in(&input, &im.metadata)),
             );
+            // One AI Denoise service for every job: the model loads once.
+            let ai_denoise =
+                rawmakase::ai_denoise::CommandLine::new(rawmakase::app::user_ai_denoise_cache());
             for job in jobs.iter().filter(|j| !j.output.exists()) {
                 let rendered = (|| -> Result<()> {
+                    let space = match &job.color_space {
+                        Some(name) => parse_color_space(name).map_err(anyhow::Error::msg)?,
+                        None => color_space,
+                    };
+                    check_output(&job.output, space)?;
                     let preset =
                         rawmakase::xmp::parse(&job.xmp, &std::fs::read_to_string(&job.xmp)?)?;
                     let edit = preset.apply(
@@ -394,8 +541,16 @@ fn main() -> Result<()> {
                         &profiles,
                         Some(&rawmakase::develop::Measures(&im)),
                     )?;
-                    let out = develop::render(&im, &edit.checked()?, job.max_edge)?;
-                    rawmakase::export::export_with(
+                    let ai = ai_denoise.source(&input, &file, &im, &edit)?;
+                    let out = develop::render_export(
+                        &im,
+                        &edit.checked()?,
+                        ai.as_ref(),
+                        job.max_edge,
+                        space,
+                        Cancel::NEVER,
+                    )?;
+                    rawmakase::export::export_image(
                         &job.output,
                         &input,
                         &out,
@@ -434,26 +589,79 @@ fn main() -> Result<()> {
             output,
             exposure,
             max_edge,
+            color_space,
             fast,
             overwrite,
             recipe,
+            catalog,
             auto,
             auto_wb,
             tap,
+            hdr,
+            hdr_export,
+            hdr_gamut,
         }) => {
+            use rawmakase::color::hdr_output::{HdrGamut, HdrOutput, HdrTransfer};
+            let hdr_output = hdr_export.map(|transfer| HdrOutput {
+                transfer: match transfer {
+                    HdrTransferArg::Pq => HdrTransfer::Pq,
+                    HdrTransferArg::Hlg => HdrTransfer::Hlg,
+                    HdrTransferArg::Linear => HdrTransfer::Linear,
+                    HdrTransferArg::GainMap => HdrTransfer::default(),
+                },
+                gamut: match hdr_gamut {
+                    HdrGamutArg::Rec2020 => HdrGamut::Rec2020,
+                    HdrGamutArg::DisplayP3 => HdrGamut::DisplayP3,
+                    HdrGamutArg::Rec709 => HdrGamut::Rec709,
+                },
+                gain_map: matches!(transfer, HdrTransferArg::GainMap),
+            });
+            if let Some(encoding) = hdr_output {
+                let format = rawmakase::export_settings::Format::from_path(&output).ok_or_else(
+                    || anyhow::anyhow!("An HDR export is a TIFF, JPEG XL or gain-map JPEG: name the output .tif, .tiff, .jxl or .jpg"),
+                )?;
+                rawmakase::export_settings::Format::check_hdr(format, encoding)?;
+            }
+            if tap.is_none() && !hdr && hdr_output.is_none() {
+                check_output(&output, color_space)?;
+            }
             let t = Instant::now();
+            // Read before decoding: AI Denoise's result must be of the same file.
+            let file = rawmakase::storage::Identity::read(&input)?;
             let r = rawmakase::photo::open(&input)?;
             let mut edit = if let Some(p) = recipe {
                 rawmakase::presets::load_preset(&p)?.recipe
+            } else if let Some(sidecar) = catalog
+                .is_none()
+                .then(|| rawmakase::catalog::legacy_sidecar::load(&input))
+                .transpose()?
+                .flatten()
+            {
+                sidecar.recipe
             } else {
-                rawmakase::catalog::legacy_sidecar::load(&input)?
-                    .map(|s| s.recipe)
-                    .unwrap_or_else(|| {
-                        Recipe::with_profiles(
-                            &r.metadata,
-                            &rawmakase::camera_profiles::installed(&r.metadata).0,
-                        )
-                    })
+                let record = match &catalog {
+                    Some(catalog) => catalog_edit(catalog, &input)?,
+                    None => rawmakase::edits::EditRecord::default(),
+                };
+                // As the app opens it: a photo without colour data starts from its
+                // fitted camera look.
+                let profiles = rawmakase::camera_look::with_default(
+                    &input,
+                    &r.metadata,
+                    rawmakase::camera_profiles::installed(&r.metadata).0,
+                    Cancel::NEVER,
+                );
+                let resolved = rawmakase::edits::resolve(
+                    &record,
+                    &input,
+                    &r.metadata,
+                    &profiles,
+                    &rawmakase::app::user_raw_defaults(),
+                )?;
+                for warning in &resolved.warnings {
+                    eprintln!("{warning}");
+                }
+                resolved.recipe
             };
             if let Some(e) = exposure {
                 edit.exposure = e;
@@ -471,7 +679,7 @@ fn main() -> Result<()> {
             } else {
                 camera_data::Decode::full(Default::default())
             };
-            let im = r.develop(decode, &AtomicBool::new(false))?;
+            let im = r.develop(decode, Cancel::NEVER)?;
             if let Some(path) = xmp {
                 let preset = rawmakase::xmp::parse(&path, &std::fs::read_to_string(&path)?)?;
                 let (profiles, _) = rawmakase::camera_profiles::installed(&im.metadata);
@@ -487,7 +695,7 @@ fn main() -> Result<()> {
             }
             if auto_wb {
                 let t = Instant::now();
-                edit = develop::auto_white_balance(&im, &edit)?;
+                edit = develop::auto_white_balance(&im, &edit, Cancel::NEVER)?;
                 eprintln!(
                     "Auto white balance ({:?}): temperature {:.0} tint {:+.0}",
                     t.elapsed(),
@@ -497,7 +705,7 @@ fn main() -> Result<()> {
             }
             if auto {
                 let t = Instant::now();
-                edit = develop::auto_tone(&im, &edit)?;
+                edit = develop::auto_tone(&im, &edit, Cancel::NEVER)?;
                 eprintln!(
                     "Auto ({:?}): exposure {:+.2} contrast {:+.0} highlights {:+.0} shadows {:+.0} whites {:+.0} blacks {:+.0} vibrance {:+.0} saturation {:+.0}",
                     t.elapsed(),
@@ -516,19 +724,108 @@ fn main() -> Result<()> {
                 rawmakase::presets::save_preset(&path, &edit, &im.metadata)?;
             }
             if let Some(tap) = tap {
+                // A stage tap renders without AI Denoise: refused rather than written
+                // as if the recipe had none.
+                anyhow::ensure!(
+                    !edit.as_rendered().ai_denoise.renders(),
+                    "--tap does not render AI Denoise; switch it off in the recipe"
+                );
                 let stage = match tap {
                     Tap::SceneInput => develop::quality::Stage::SceneInput,
                     Tap::SceneOutput => develop::quality::Stage::SceneOutput,
                 };
-                let out =
-                    develop::quality::render_stage(&im, &edit, stage, &AtomicBool::new(false))?;
+                let out = develop::quality::render_stage(&im, &edit, stage, Cancel::NEVER)?;
                 save_stage(&output, &input, out, overwrite)?;
                 return Ok(());
             }
             let developed = t.elapsed();
-            let out = develop::render(&im, &edit.checked()?, max_edge)?;
+            let im = std::sync::Arc::new(im);
+            let ai =
+                rawmakase::ai_denoise::CommandLine::new(rawmakase::app::user_ai_denoise_cache())
+                    .source(&input, &file, &im, &edit)?;
+            if let Some(encoding) = hdr_output {
+                let master = develop::render_hdr(
+                    &im,
+                    &edit.checked()?,
+                    ai.as_ref(),
+                    max_edge,
+                    Cancel::NEVER,
+                )?;
+                let pixels = if encoding.gain_map {
+                    let base = develop::render_export(
+                        &im,
+                        &edit.checked()?,
+                        ai.as_ref(),
+                        max_edge,
+                        rawmakase::color::OutputSpace::Srgb,
+                        Cancel::NEVER,
+                    )?;
+                    rawmakase::export::Pixels::GainMap(rawmakase::export::GainMapPixels::new(
+                        base, &master,
+                    )?)
+                } else {
+                    rawmakase::export::Pixels::Hdr(rawmakase::export::HdrPixels::encode(
+                        &master, encoding,
+                    ))
+                };
+                rawmakase::export::export_pixels(
+                    &output,
+                    &input,
+                    &pixels,
+                    &im.metadata,
+                    &ExportOptions {
+                        max_edge,
+                        ..Default::default()
+                    },
+                    &rawmakase::export::Embed::default(),
+                    if overwrite {
+                        rawmakase::export::Replace::Overwrite
+                    } else {
+                        rawmakase::export::Replace::NoClobber
+                    },
+                )?;
+                println!(
+                    "{}x{} HDR export, peak {} | total {:?}",
+                    master.width,
+                    master.height,
+                    master.peak,
+                    t.elapsed()
+                );
+                return Ok(());
+            }
+            if hdr {
+                let out = develop::render_hdr(
+                    &im,
+                    &edit.checked()?,
+                    ai.as_ref(),
+                    max_edge,
+                    Cancel::NEVER,
+                )?;
+                let rendered = rawmakase::rendered::Rendered {
+                    width: out.width,
+                    height: out.height,
+                    pixels: out.pixels,
+                };
+                save_stage(&output, &input, rendered, overwrite)?;
+                println!(
+                    "{}x{} HDR master, peak {} | total {:?}",
+                    out.width,
+                    out.height,
+                    out.peak,
+                    t.elapsed()
+                );
+                return Ok(());
+            }
+            let out = develop::render_export(
+                &im,
+                &edit.checked()?,
+                ai.as_ref(),
+                max_edge,
+                color_space,
+                Cancel::NEVER,
+            )?;
             let rendered = t.elapsed() - developed;
-            rawmakase::export::export_with(
+            rawmakase::export::export_image(
                 &output,
                 &input,
                 &out,
@@ -554,8 +851,8 @@ fn main() -> Result<()> {
             let max = im.pixels.iter().flatten().copied().fold(0f32, f32::max);
             println!(
                 "{}x{} | develop {:?} | render {:?} | total {:?} | camera max {:.4} | scale {:.6} | integer clipped {}",
-                out.width,
-                out.height,
+                out.width(),
+                out.height(),
                 developed,
                 rendered,
                 t.elapsed(),
@@ -582,16 +879,92 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&check)?);
             }
         }
+        Some(Command::FitLook {
+            files,
+            report,
+            drop_matrix,
+        }) => {
+            use rawmakase::camera_look::{FitInputs, fit};
+            let inputs = FitInputs { drop_matrix };
+            for path in &files {
+                let result = fit(path, &inputs, Cancel::NEVER);
+                let (measured, outcome) = match &result {
+                    Ok(f) => (Some(&f.report), format!("{:?} look", f.report.kind)),
+                    Err(e) => (e.report.as_deref(), format!("refused: {}", e.reason)),
+                };
+                if report {
+                    // A file that could not even be opened still gets its line.
+                    let mut line = match measured {
+                        Some(r) => serde_json::to_value(r)?,
+                        None => serde_json::json!({
+                            "refusal": result.as_ref().err().map(|e| e.reason.clone()),
+                        }),
+                    };
+                    if let Some(o) = line.as_object_mut() {
+                        o.insert("file".into(), path.display().to_string().into());
+                    }
+                    println!("{line}");
+                } else {
+                    let scores = measured.map_or(String::new(), |r| {
+                        // The look used, else the first tried.
+                        let shown = r
+                            .candidates
+                            .iter()
+                            .find(|c| Some(c.kind) == r.kind)
+                            .or(r.candidates.first());
+                        let fitted = shown.map_or(f32::NAN, |c| c.scores.de00);
+                        format!(" (held-out ΔE00 {:.2} → {fitted:.2})", r.baseline.de00)
+                    });
+                    println!("{}: {outcome}{scores}", path.display());
+                }
+            }
+        }
+        Some(Command::Denoise {
+            input,
+            model,
+            provider,
+            amount,
+            output,
+            plain_output,
+            max_edge,
+            dump,
+            cache,
+            bench_fit,
+            bench_plain,
+            camera_dump,
+            camera_crop,
+            nr_luma,
+        }) => {
+            let provider = match provider.as_str() {
+                "cpu" => rawmakase_inference::Provider::Cpu,
+                "coreml" => rawmakase_inference::Provider::CoreML,
+                other => anyhow::bail!("Unknown provider {other}"),
+            };
+            rawmakase::ai_denoise::command(rawmakase::ai_denoise::Command {
+                input,
+                model,
+                provider,
+                amount,
+                output,
+                plain_output,
+                max_edge,
+                dump,
+                cache: cache.then(rawmakase::app::user_ai_denoise_cache),
+                bench_fit,
+                bench_plain,
+                camera_dump,
+                camera_crop,
+                nr_luma,
+            })?;
+        }
         Some(Command::Benchmark { input, iterations }) => {
             anyhow::ensure!(
                 (1..=1000).contains(&iterations),
                 "Iterations must be 1–1000"
             );
             let t = Instant::now();
-            let im = rawmakase::photo::open(&input)?.develop(
-                camera_data::Decode::full(Default::default()),
-                &AtomicBool::new(false),
-            )?;
+            let im = rawmakase::photo::open(&input)?
+                .develop(camera_data::Decode::full(Default::default()), Cancel::NEVER)?;
             let decode = t.elapsed();
             let small = develop::preview(&im, 1600);
             let mut r = Recipe::for_metadata(&im.metadata);
@@ -599,7 +972,7 @@ fn main() -> Result<()> {
             for i in 0..iterations {
                 r.exposure = (i % 8) as f32 / 8.;
                 let t = Instant::now();
-                std::hint::black_box(develop::render(&small, &r.checked()?, 1600)?);
+                std::hint::black_box(develop::render(&small, &r.checked()?, 1600, Cancel::NEVER)?);
                 times.push(t.elapsed().as_secs_f64() * 1000.);
             }
             times.sort_by(f64::total_cmp);
@@ -623,6 +996,39 @@ fn main() -> Result<()> {
 
 /// `rawmakase sync-folder`: scans, prints the plan, and applies it with
 /// `apply`.
+/// The stored edit of the photo at `input` in `catalog`: of the master, as a path
+/// names it, not of a virtual copy. A photo the catalog doesn't have, or has more
+/// than once (two folders found at the same place), is an error.
+fn catalog_edit(
+    catalog: &std::path::Path,
+    input: &std::path::Path,
+) -> Result<rawmakase::edits::EditRecord> {
+    let c = rawmakase::catalog::Catalog::open(catalog)?;
+    let input = input.canonicalize()?;
+    let found: Vec<_> = c
+        .photos()?
+        .into_iter()
+        .filter(|p| p.master.is_none() && p.path.canonicalize().is_ok_and(|p| p == input))
+        .map(|p| p.id)
+        .collect();
+    let photo = match found[..] {
+        [photo] => photo,
+        [] => anyhow::bail!("{} is not in the catalog", input.display()),
+        _ => anyhow::bail!(
+            "{} is {} photos in the catalog: two of its folders are found at the same place",
+            input.display(),
+            found.len()
+        ),
+    };
+    // Masks made from a selection are read back from the catalog, as in the app.
+    rawmakase::storage::mask_assets::add_loader(c.mask_asset_loader());
+    // One consistent read: the recipe with the spots and masks saved with it.
+    c.photo_records(&[photo])?
+        .pop()
+        .map(|record| record.edit)
+        .ok_or_else(|| anyhow::anyhow!("{} is not in the catalog", input.display()))
+}
+
 fn sync_folder(
     catalog: &std::path::Path,
     folder: Option<&std::path::Path>,
@@ -647,7 +1053,7 @@ fn sync_folder(
     let inputs = c.sync_inputs(scope)?;
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let online = |path: &std::path::Path| rawmakase::volume_mounted(path);
-    let plan = scan(&inputs, &online, &cancel, &|_| {})?;
+    let plan = scan(&inputs, &online, Cancel::new(&cancel), &|_| {})?;
     let shown = |p: &std::path::Path| p.display().to_string();
     for m in &plan.moves {
         let how = if m.verified {
@@ -698,7 +1104,8 @@ fn sync_folder(
             rawmakase::catalog::MetadataDefaults::load(),
             rawmakase::photo::camera_exif,
             rawmakase::photo::raw_xmp,
-        ),
+        )
+        .with_options(rawmakase::catalog::ImportOptions::load()),
     )?;
     for s in &applied.skipped {
         println!("skipped: {} ({})", shown(&s.path), s.reason);
@@ -728,7 +1135,7 @@ fn find_photo(
     let inputs = c.find_inputs(photo, file)?;
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let online = |path: &std::path::Path| rawmakase::volume_mounted(path);
-    let plan = find_on_disk(&inputs, &online, &cancel, &|_| {})?;
+    let plan = find_on_disk(&inputs, &online, Cancel::new(&cancel), &|_| {})?;
     let shown = |p: &std::path::Path| p.display().to_string();
     let ticked = plan.default_accepted();
     for m in &plan.moves {
@@ -818,6 +1225,80 @@ fn save_stage(
     })
 }
 
+/// `rawmakase lensfun`.
+fn lensfun(command: LensfunCommand) -> Result<()> {
+    use rawmakase::lens::lensfun::{choice, installed};
+    use rawmakase::lensfun_install::{self as install, Installed, Progress, Source};
+    let dir = installed::dir();
+    let terms = || {
+        println!(
+            "Lensfun lens database by {}, {} ({}), from {}",
+            choice::ATTRIBUTION,
+            choice::LICENSE,
+            choice::LICENSE_URI,
+            install::ARCHIVE_URL
+        )
+    };
+    let progress = Progress::default();
+    match command {
+        LensfunCommand::Status => {
+            match install::current(&dir) {
+                Some(m) => println!(
+                    "Installed: version {} ({}), {} lenses, {} cameras, downloaded {} from {}, SHA-256 {}",
+                    m.version,
+                    m.date(),
+                    m.lenses,
+                    m.cameras,
+                    m.downloaded,
+                    m.url,
+                    m.sha256
+                ),
+                None => println!("Not installed"),
+            }
+            println!("Folder: {}", dir.display());
+            terms();
+        }
+        LensfunCommand::Install { from } => {
+            if from.is_none()
+                && let Some(m) = install::current(&dir)
+            {
+                println!(
+                    "Version {} ({}) is installed; `rawmakase lensfun update` installs a newer one",
+                    m.version,
+                    m.date()
+                );
+                return Ok(());
+            }
+            terms();
+            let source = from.map_or(Source::Lensfun, Source::File);
+            match install::install(&dir, &source, &progress)? {
+                Installed::New(m) => println!(
+                    "Installed version {} ({}): {} lenses, {} cameras",
+                    m.version,
+                    m.date(),
+                    m.lenses,
+                    m.cameras
+                ),
+                Installed::Current(m) => {
+                    println!("Version {} ({}) is already installed", m.version, m.date())
+                }
+            }
+        }
+        LensfunCommand::Update => match install::install(&dir, &Source::Lensfun, &progress)? {
+            Installed::New(m) => println!("Updated to version {} ({})", m.version, m.date()),
+            Installed::Current(m) => println!("Up to date: version {} ({})", m.version, m.date()),
+        },
+        LensfunCommand::Remove => {
+            if install::remove(&dir, &progress)? {
+                println!("Removed; edits keep the Lensfun corrections they use");
+            } else {
+                println!("Not installed");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +1335,47 @@ mod tests {
         let written = image::open(&output).unwrap().to_rgb32f();
         assert_eq!(written.dimensions(), (2, 1));
         assert_eq!(written.get_pixel(1, 0).0, [0.4, 0.5, 0.6]);
+    }
+
+    /// `--color-space` takes the socket's names, and an output whose format can't hold
+    /// the space is refused before anything is read.
+    #[test]
+    fn render_takes_a_color_space_and_refuses_prophoto_outside_tiff() {
+        use rawmakase::color::OutputSpace;
+        let parse = |args: &[&str]| {
+            Args::try_parse_from(
+                ["rawmakase", "render", "in.dng", "out.tif"]
+                    .iter()
+                    .chain(args),
+            )
+        };
+        for (name, space) in [
+            ("srgb", OutputSpace::Srgb),
+            ("adobe-rgb", OutputSpace::AdobeRgb),
+            ("prophoto", OutputSpace::ProPhoto),
+        ] {
+            let cli = parse(&["--color-space", name]).unwrap();
+            assert!(
+                matches!(cli.command, Some(Command::Render { color_space, .. }) if color_space == space),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            parse(&[]).unwrap().command,
+            Some(Command::Render {
+                color_space: OutputSpace::Srgb,
+                ..
+            })
+        ));
+        assert!(parse(&["--color-space", "display-p3"]).is_err());
+        assert!(parse(&["--color-space", "prophoto", "--tap", "scene-input"]).is_err());
+        for name in ["a.jpg", "a.png"] {
+            let refused = check_output(std::path::Path::new(name), OutputSpace::ProPhoto);
+            assert!(refused.unwrap_err().to_string().contains("TIFF"), "{name}");
+            check_output(std::path::Path::new(name), OutputSpace::AdobeRgb).unwrap();
+        }
+        check_output(std::path::Path::new("a.tiff"), OutputSpace::ProPhoto).unwrap();
+        assert!(check_output(std::path::Path::new("a.webp"), OutputSpace::Srgb).is_err());
     }
 
     #[test]

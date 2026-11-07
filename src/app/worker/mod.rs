@@ -14,6 +14,9 @@ use std::{
 pub(crate) struct LoadedHeader {
     pub id: u64,
     pub path: PathBuf,
+    /// The file as read before it was opened: what the header, and every image
+    /// of this load, are of.
+    pub file: Option<crate::storage::Identity>,
     pub metadata: Metadata,
     pub recipe: Recipe,
     pub export: ExportOptions,
@@ -59,17 +62,35 @@ pub(crate) enum AutoKind {
     WhiteBalance,
 }
 pub(crate) enum Event {
+    /// A verified camera profile was installed into the library, or why not.
+    ProfileDownloaded {
+        id: u64,
+        result: Result<PathBuf, String>,
+    },
     DialogClosed,
-    /// The system report's probe answered, or stopped (see `app::report_issue`).
+    /// The system report's probe answered, or stopped (see `app::shell::report_issue`).
     SystemProbed {
         generation: u64,
         system: Box<crate::diagnostics::System>,
     },
     /// A Subject or Background selection finished (or failed).
-    Selection(Box<crate::app::subject_mask::Done>),
+    Selection(Box<crate::app::develop::tools::subject_mask::Done>),
+    /// News of AI Denoise for a photo Develop asked for (`app::develop::ai_denoise`).
+    AiDenoise(Box<crate::ai_denoise::Update>),
+    /// An AI Denoise result was stored for the photo at this path, by any job.
+    AiDenoiseStored(std::path::PathBuf),
     /// The selection model finished installing, or why not.
-    ModelInstalled(Result<(), String>),
-    ModelRemoved(Result<(), String>),
+    ModelInstalled(
+        crate::model_install::Pack,
+        Result<(), crate::model_install::InstallError>,
+    ),
+    ModelRemoved(crate::model_install::Pack, Result<(), String>),
+    /// A Lensfun database job finished (`app::develop::lensfun`).
+    Lensfun {
+        generation: u64,
+        job: crate::app::develop::lensfun::Job,
+        result: Result<crate::app::develop::lensfun::Done, crate::app::develop::lensfun::Failure>,
+    },
     /// A catalog upgrade for raster masks finished: the backup it made, or why not.
     CatalogUpgraded {
         generation: u64,
@@ -84,19 +105,22 @@ pub(crate) enum Event {
         source: Vec<String>,
     },
     /// A Synchronize Folder scan finished, or failed.
-    FolderSyncScanned(Box<crate::app::folder_sync::Scanned>),
+    FolderSyncScanned(Box<crate::app::catalog::folder_sync::Scanned>),
     /// Find on Disk's file picked for a photo.
     FileOnDiskPicked(crate::catalog::PhotoId, PathBuf),
     /// Applying a synchronization finished: the catalog opened again.
-    FolderSyncApplied(Result<Box<crate::app::folder_sync::Synced>, String>),
+    FolderSyncApplied(Result<Box<crate::app::catalog::folder_sync::Synced>, String>),
     /// A folder change waiting for the user's answer.
-    FolderQuestion(Box<crate::app::folder_locations::FolderQuestion>),
+    FolderQuestion(Box<crate::app::catalog::folder_locations::FolderQuestion>),
+    /// Export as Catalog finished: what it wrote, nothing when the user
+    /// chose no file, or why it failed.
+    CatalogExported(Box<Result<Option<crate::app::catalog::export_catalog::Exported>, String>>),
     /// A file operation was planned (see `app::file_ops`).
     /// What export file names need from the photos' files, for the read
-    /// `request` (see `app::naming::read`).
+    /// `request` (see `app::export::naming::read`).
     NamesRead {
         request: u64,
-        read: Result<crate::app::naming::read::Reads, String>,
+        read: Result<crate::app::export::naming::read::Reads, String>,
     },
     /// Rename Photo(s)' photos in the order they are numbered in, for the
     /// catalog they were read from.
@@ -141,15 +165,18 @@ pub(crate) enum Event {
     /// The folder chosen for decoded images.
     DecodeCacheFolder(PathBuf),
     /// Files and folders chosen to import profiles or presets from.
-    Import(crate::app::bulk_import::ImportKind, Vec<PathBuf>),
-    Imported(Box<crate::app::bulk_import::Summary>),
+    Import(crate::app::presets::bulk_import::ImportKind, Vec<PathBuf>),
+    Imported(Box<crate::app::presets::bulk_import::Summary>),
     /// A Sync Settings finished.
-    Synced(Box<crate::app::sync::SyncResult>),
+    Synced(Box<crate::app::library::sync::SyncResult>),
     Profiles {
         id: u64,
         profiles: Vec<Arc<crate::camera_profiles::CameraProfile>>,
         errors: Vec<String>,
         groups: crate::camera_profiles::Groups,
+        /// Listed again after Adobe profiles were imported, which changes what
+        /// the defaults of the Library's photos without an edit resolve to.
+        imported: bool,
     },
     PresetLoad(PathBuf),
     /// Point Color's dropper sample for the photo loaded as `id`, taken with
@@ -184,6 +211,20 @@ pub(crate) enum Event {
         analysed: Box<Recipe>,
         result: Result<Vec<[f32; 9]>, String>,
     },
+    /// Camera Look (fitted) for the photo loaded as `id`, fitted while its profile
+    /// was `profile`, or why none was.
+    CameraLook {
+        id: u64,
+        generation: u64,
+        profile: Option<Arc<crate::camera_profiles::CameraProfile>>,
+        result: Result<Box<crate::camera_profiles::CameraProfile>, String>,
+    },
+    /// The embedded JPEG of the photo loaded as `id`, or why there is none.
+    CameraThumbnail {
+        id: u64,
+        generation: u64,
+        result: Result<crate::camera_look::CameraPreview, String>,
+    },
     /// The Crop panel's Auto straighten angle for the photo loaded as `id`, analysed
     /// from `analysed`; None when the photo has nothing to level by.
     Straighten {
@@ -195,7 +236,7 @@ pub(crate) enum Event {
     /// The setup assistant's scan for cameras, profiles and presets.
     OnboardingScanned {
         generation: u64,
-        found: Box<crate::app::onboarding::Found>,
+        found: Box<crate::app::catalog::onboarding::Found>,
     },
     XmpLibrary {
         scan: u64,
@@ -212,10 +253,13 @@ pub(crate) enum Event {
         image: image::RgbImage,
     },
     /// A stored Standard preview, read for a load or a neighbour.
-    StandIn(Box<crate::app::stand_in::StandIn>),
+    StandIn(Box<crate::app::develop::stand_in::StandIn>),
     Ready {
         id: u64,
         full: Arc<CameraImage>,
+        /// The file as it was before `full` was decoded from it (`None` for a photo
+        /// opened ahead of time): what AI Denoise's result must be made from.
+        file: Option<crate::storage::Identity>,
         status: String,
     },
     Rendered {
@@ -336,6 +380,8 @@ pub(crate) struct RenderJob {
     /// Also return the shown pixels, for the white balance selector's loupe.
     pub samples: bool,
     pub overlay: Overlay,
+    /// The photo's AI Denoise source when the recipe renders it, as the job started.
+    pub ai: Option<crate::develop::AiSource>,
     /// Presented textures the viewport draws until this job's preview arrives.
     pub drawn: Vec<egui::TextureId>,
 }
@@ -356,5 +402,5 @@ pub(crate) use loader::Loader;
 pub(in crate::app) use reference::{ReferenceImage, ReferenceJob, Resolution, reference_loader};
 pub(crate) use renderer::Renderer;
 #[cfg(test)]
-pub(super) use renderer::holding;
-pub(super) use renderer::{RenderBackend, renderer_with_backend};
+pub(in crate::app) use renderer::holding;
+pub(in crate::app) use renderer::{RenderBackend, renderer_with_backend};

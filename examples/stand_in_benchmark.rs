@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use rawmakase::catalog::preview_cache::{PreviewCache, PreviewKind, Stamp};
 use rawmakase::model::recipe::Recipe;
 use rawmakase::{camera_data, develop};
+use rawmakase_cancel::Cancel;
 use std::{path::Path, sync::atomic::AtomicBool, time::Instant};
 
 /// The Fit of a 1600-pixel viewport, as in `preview_benchmark`.
@@ -46,11 +47,14 @@ fn main() -> Result<()> {
         && std::env::var_os("FULL").is_none_or(|v| v.is_empty());
     let t = Instant::now();
     let decoded = if half {
-        raw.develop(camera_data::Decode::Half, &cancel)?
+        raw.develop(camera_data::Decode::Half, Cancel::new(&cancel))?
     } else {
-        raw.develop(camera_data::Decode::full(Default::default()), &cancel)?
+        raw.develop(
+            camera_data::Decode::full(Default::default()),
+            Cancel::new(&cancel),
+        )?
     };
-    let out = develop::render_cancellable(&decoded, &recipe.checked()?, STANDARD, &cancel)?;
+    let out = develop::render(&decoded, &recipe.checked()?, STANDARD, Cancel::new(&cancel))?;
     let standard =
         image::RgbImage::from_raw(out.width, out.height, out.rgb8()).context("Preview size")?;
     let dir = tempfile::tempdir()?;
@@ -88,10 +92,12 @@ fn main() -> Result<()> {
 
     // The first live Fit: from the decode cache, and from a decode.
     let t = Instant::now();
-    let full = rawmakase::photo::open(path)?
-        .develop(camera_data::Decode::full(Default::default()), &cancel)?;
+    let full = rawmakase::photo::open(path)?.develop(
+        camera_data::Decode::full(Default::default()),
+        Cancel::new(&cancel),
+    )?;
     let decode = ms(t);
-    let recovered = develop::quality::recover_highlights(&full);
+    let recovered = develop::quality::recover_highlights(&full, Cancel::NEVER)?;
     let _ = full.recovered.set(std::sync::Arc::new(recovered));
     let cached = {
         let decode_cache =
@@ -114,8 +120,10 @@ fn main() -> Result<()> {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 pool.install(|| {
                     let raw = rawmakase::photo::open(&path).unwrap();
-                    let im = raw.develop(camera_data::Decode::Half, &stop).ok()?;
-                    develop::render_cancellable(&im, &recipe.checked().ok()?, STANDARD, &stop).ok()
+                    let im = raw
+                        .develop(camera_data::Decode::Half, Cancel::new(&stop))
+                        .ok()?;
+                    develop::render(&im, &recipe.checked().ok()?, STANDARD, Cancel::new(&stop)).ok()
                 });
             }
         })
@@ -124,7 +132,7 @@ fn main() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
     let t = Instant::now();
-    let fit = gpu.render(&image, &recipe, FIT, None, &cancel)?;
+    let fit = gpu.render(&image, &recipe, FIT, None, Cancel::new(&cancel))?;
     let first_fit = ms(t);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(busy) = busy {

@@ -1,8 +1,12 @@
 //! What an edit is, as values the renderer, the catalog and file formats share.
+pub mod ai_denoise;
+pub mod camera_raw;
 pub mod edit;
 pub mod effects;
+pub mod hdr;
 pub mod image_frame;
 pub mod masks;
+pub mod measures;
 pub mod operators;
 pub mod panels;
 pub mod params;

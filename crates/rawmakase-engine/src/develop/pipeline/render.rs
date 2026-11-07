@@ -1,21 +1,43 @@
 //! The render entry points, from a whole photo to a region, and the samples the panels read.
 use super::*;
+use rawmakase_cancel::Cancel;
 
 /// Shared full/preview renderer. Geometry is sampled in rows; no full-sized intermediate color image.
-pub fn render(im: &CameraImage, r: &ValidRecipe, max_edge: u32) -> Result<Rendered> {
-    crate::develop::quality::render(im, r, max_edge, None)
-}
-/// [`render`], stopping with an error once `cancel` is set.
-pub fn render_cancellable(
+/// Stops with an error once `cancel` is set.
+pub fn render(
     im: &CameraImage,
     r: &ValidRecipe,
     max_edge: u32,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Rendered> {
-    crate::develop::quality::render_cancellable(im, r, max_edge, None, cancel)
+    crate::develop::quality::render(im, r, max_edge, None, cancel)
+}
+/// [`render`](fn@render) of a photo with AI Denoise: `ai` is its source, resolved by
+/// the caller (`None` renders without AI Denoise whatever the recipe says, as a preview
+/// does before a result is ready; exports must not pass `None` for a recipe that has it).
+pub fn render_with_ai(
+    im: &CameraImage,
+    r: &ValidRecipe,
+    ai: Option<&crate::develop::AiSource>,
+    max_edge: u32,
+    cancel: Cancel<'_>,
+) -> Result<Rendered> {
+    crate::develop::quality::render_with_ai(im, r, ai, max_edge, cancel)
+}
+/// [`render_with_ai`] for an export in `space`, on the CPU: the colour stage ends in
+/// `space` and every finishing stage works on its values.
+pub fn render_export(
+    im: &CameraImage,
+    r: &ValidRecipe,
+    ai: Option<&crate::develop::AiSource>,
+    max_edge: u32,
+    space: crate::color::OutputSpace,
+    cancel: Cancel<'_>,
+) -> Result<crate::develop::ExportImage> {
+    crate::develop::quality::render_export(im, r, ai, max_edge, space, cancel)
 }
 pub fn render_region(im: &CameraImage, r: &ValidRecipe, region: [u32; 4]) -> Result<Rendered> {
-    crate::develop::quality::render(im, r, 0, Some(region))
+    crate::develop::quality::render(im, r, 0, Some(region), Cancel::NEVER)
 }
 /// Unsharpened render of `region` of the output described by `g`, and the mask weights
 /// the finishing stages need. A `spread` above zero averages each sample over a
@@ -24,15 +46,25 @@ pub fn render_region(im: &CameraImage, r: &ValidRecipe, region: [u32; 4]) -> Res
 /// With a `cache`, the geometry, lens-warp and noise-reduction samples are kept, so a
 /// following render that only changes color and tone reruns the per-pixel stage alone.
 /// A `backend` with a GPU runs that stage there when the port covers the recipe.
+///
+/// The pixels are encoded in `space`. Only sRGB renders may have `stages`: the GPU
+/// and its caches are the preview's, and an export in another space never reaches
+/// them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_base(
     toned: &Toned,
     r: &Recipe,
     g: &Geometry,
     region: [u32; 4],
     spread: f32,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
     stages: Option<&mut crate::develop::preview_renderer::Stages>,
+    space: crate::color::OutputSpace,
 ) -> Result<(Rendered, Option<Arc<MaskWeights>>)> {
+    ensure!(
+        space == crate::color::OutputSpace::Srgb || stages.is_none(),
+        "Only sRGB renders run on the GPU"
+    );
     let mut base = r.clone();
     base.sharpening = 0.;
     let im = toned.source();
@@ -43,7 +75,7 @@ pub(crate) fn render_base(
     let Some(stages) = stages else {
         if !masked {
             return Ok((
-                render_region_inner(im, &base, g, region, spread, cancel)?,
+                render_region_inner(im, &base, g, region, spread, cancel, space)?,
                 None,
             ));
         }
@@ -60,7 +92,7 @@ pub(crate) fn render_base(
             cancel,
         )?;
         let samples = detail(toned, &base, samples, weights.as_deref(), None, cancel)?;
-        let out = develop_samples(im, &base, &samples, cancel, weights.as_deref())?;
+        let out = develop_samples_in(im, &base, &samples, cancel, weights.as_deref(), space)?;
         return Ok((out, weights));
     };
     base.validate()?;
@@ -109,7 +141,7 @@ pub(crate) fn render_display(
     region: [u32; 4],
     spread: f32,
     finish: &crate::develop::gpu::Finish,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
     stages: &mut crate::develop::preview_renderer::Stages,
 ) -> Result<Option<crate::develop::gpu::Frame>> {
     let Some(display) = stages.display else {
@@ -172,7 +204,7 @@ pub(crate) fn mask_weights(
     spread: f32,
     samples: Option<&Arc<Samples>>,
     stages: Option<&mut crate::develop::preview_renderer::Stages>,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Option<Arc<MaskWeights>>> {
     use crate::develop::masks::{Selection, Weigher};
     if !r
@@ -213,7 +245,8 @@ pub(crate) fn mask_weights(
         let mut plain = r.clone();
         plain.masks.clear();
         // Range masks select from the photo as it renders, never as Visualize Range
-        // grays it.
+        // grays it, and always in sRGB, whatever space an export is in: a mask
+        // selects the same pixels in every space.
         crate::model::point_color::without_visualization(&mut plain.point_colors);
         let im = toned.source();
         let gpu = stages.as_deref_mut().and_then(|s| {
@@ -227,10 +260,7 @@ pub(crate) fn mask_weights(
     } else {
         None
     };
-    ensure!(
-        !cancel.load(std::sync::atomic::Ordering::Relaxed),
-        "Render superseded"
-    );
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     let weights = Arc::new(weigher.weights(&toned.image, r, g, region, global.as_ref()));
     if let Some(s) = stages {
         s.cache.masks.insert(key, weights.clone(), weights.bytes());
@@ -247,7 +277,7 @@ pub(super) fn detail(
     samples: Arc<Samples>,
     weights: Option<&MaskWeights>,
     cache: Option<&mut crate::develop::stage_cache::StageCache>,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Arc<Samples>> {
     let Some(weights) = weights.filter(|w| w.uses(&[slot::TEXTURE])) else {
         return Ok(samples);
@@ -291,13 +321,13 @@ impl Samples {
         self.pixels.len() * 20
     }
 }
-fn sample_region(
+pub(crate) fn sample_region(
     im: Source,
     r: &Recipe,
     g: &Geometry,
     region: [u32; 4],
     spread: f32,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Samples> {
     let [x0, y0, w, h] = region;
     ensure!(
@@ -311,7 +341,7 @@ fn sample_region(
     let (pixels, positions) = (0..w as usize * h as usize)
         .into_par_iter()
         .map(|i| {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            if cancel.is_cancelled() {
                 return ([0.; 3], [f32::NAN; 2]);
             }
             let x = x0 + i as u32 % w;
@@ -324,15 +354,12 @@ fn sample_region(
                 return ([1.; 3], [f32::NAN; 2]);
             }
             match &warp {
-                Some(w) => (w.sample(im, sx, sy, r, spread), w.map.forward(sx, sy)),
-                None => (footprint_sample(im, sx, sy, r, spread), [sx, sy]),
+                Some(w) => (w.sample(im, sx, sy, spread), w.map.forward(sx, sy)),
+                None => (footprint_sample(im, sx, sy, spread), [sx, sy]),
             }
         })
         .unzip();
-    ensure!(
-        !cancel.load(std::sync::atomic::Ordering::Relaxed),
-        "Render superseded"
-    );
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     Ok(Samples {
         width: w,
         height: h,
@@ -346,10 +373,28 @@ pub(crate) fn develop_samples(
     im: Source,
     r: &Recipe,
     samples: &Samples,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
     weights: Option<&MaskWeights>,
 ) -> Result<Rendered> {
-    develop_samples_to(im, r, samples, cancel, weights, PixelOutput::Display)
+    develop_samples_in(
+        im,
+        r,
+        samples,
+        cancel,
+        weights,
+        crate::color::OutputSpace::Srgb,
+    )
+}
+/// [`develop_samples`] encoded in `space`.
+pub(crate) fn develop_samples_in(
+    im: Source,
+    r: &Recipe,
+    samples: &Samples,
+    cancel: Cancel<'_>,
+    weights: Option<&MaskWeights>,
+    space: crate::color::OutputSpace,
+) -> Result<Rendered> {
+    develop_samples_to(im, r, samples, cancel, weights, PixelOutput::Display, space)
 }
 /// `region` of the output as a dropper samples it at the stage `output` names,
 /// through the same sampling, lens correction, retouching and masks as the render.
@@ -359,30 +404,69 @@ pub(crate) fn stage_samples(
     g: &Geometry,
     region: [u32; 4],
     output: PixelOutput,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Rendered> {
     let im = toned.source();
     let samples = Arc::new(sample_region(im, r, g, region, 0., cancel)?);
     let weights = mask_weights(toned, r, g, region, 0., Some(&samples), None, cancel)?;
     let samples = detail(toned, r, samples, weights.as_deref(), None, cancel)?;
-    develop_samples_to(im, r, &samples, cancel, weights.as_deref(), output)
+    develop_samples_to(
+        im,
+        r,
+        &samples,
+        cancel,
+        weights.as_deref(),
+        output,
+        crate::color::OutputSpace::Srgb,
+    )
 }
+/// The camera's own samples of `region`, before highlight reconstruction, noise
+/// reduction and retouching, through the same geometry, lens correction and
+/// default crop as the render, times the recipe's white balance (`Recipe::wb`):
+/// white-balanced camera RGB before any profile, matrix or exposure. A pixel
+/// outside the photo is NaN.
+pub(crate) fn camera_samples(
+    im: &CameraImage,
+    r: &Recipe,
+    g: &Geometry,
+    region: [u32; 4],
+    cancel: Cancel<'_>,
+) -> Result<Rendered> {
+    let samples = sample_region(Source::new(im), r, g, region, 0., cancel)?;
+    let pixels = samples
+        .pixels
+        .iter()
+        .zip(&samples.positions)
+        .map(|(p, pos)| match pos[0].is_nan() {
+            true => [f32::NAN; 3],
+            false => std::array::from_fn(|c| p[c] * r.wb[c]),
+        })
+        .collect();
+    Ok(Rendered {
+        width: samples.width,
+        height: samples.height,
+        pixels,
+    })
+}
+#[allow(clippy::too_many_arguments)]
 fn develop_samples_to(
     im: Source,
     r: &Recipe,
     samples: &Samples,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
     weights: Option<&MaskWeights>,
     output: PixelOutput,
+    space: crate::color::OutputSpace,
 ) -> Result<Rendered> {
     let camera = camera_stage(&im.metadata, r);
     let local_tone = weights.is_some_and(|w| w.uses(&[slot::SHADOWS, slot::HIGHLIGHTS]));
     let mut lut = CurveSet::for_image(im, r, camera, local_tone);
     lut.output = output;
+    lut.space = space;
     let math = weights.map(|_| LocalMath::new(&im.metadata, r));
     let mut pixels = vec![[0.; 3]; samples.pixels.len()];
     pixels.par_iter_mut().enumerate().for_each(|(i, out)| {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return;
         }
         let pos = samples.positions[i];
@@ -397,10 +481,7 @@ fn develop_samples_to(
             process_pixel(samples.pixels[i], r, &lut, camera, pos, local)
         };
     });
-    ensure!(
-        !cancel.load(std::sync::atomic::Ordering::Relaxed),
-        "Render superseded"
-    );
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     Ok(Rendered {
         width: samples.width,
         height: samples.height,
@@ -408,18 +489,20 @@ fn develop_samples_to(
     })
 }
 /// One sample per output pixel of `region`, without the stage cache: the per-pixel
-/// stage over the lens-warped or noise-reduced samples.
+/// stage over the lens-warped or noise-reduced samples, encoded in `space`.
 pub(super) fn render_region_inner(
     im: Source,
     r: &Recipe,
     g: &Geometry,
     region: [u32; 4],
     spread: f32,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
+    space: crate::color::OutputSpace,
 ) -> Result<Rendered> {
     r.validate()?;
     let camera = camera_stage(&im.metadata, r);
-    let lut = CurveSet::for_image(im, r, camera, false);
+    let mut lut = CurveSet::for_image(im, r, camera, false);
+    lut.space = space;
     let [x0, y0, w, h] = region;
     ensure!(
         w > 0
@@ -439,13 +522,13 @@ pub(super) fn render_region_inner(
             return [1.; 3];
         }
         let (p, pos) = match &warp {
-            Some(w) => (w.sample(im, sx, sy, r, spread), w.map.forward(sx, sy)),
-            None => (footprint_sample(im, sx, sy, r, spread), [sx, sy]),
+            Some(w) => (w.sample(im, sx, sy, spread), w.map.forward(sx, sy)),
+            None => (footprint_sample(im, sx, sy, spread), [sx, sy]),
         };
         process_pixel(p, r, &lut, camera, pos, None)
     };
     pixels.par_iter_mut().enumerate().for_each(|(i, p)| {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return;
         }
         let x = x0 + i as u32 % w;
@@ -469,10 +552,7 @@ pub(super) fn render_region_inner(
             }
         }
     });
-    ensure!(
-        !cancel.load(std::sync::atomic::Ordering::Relaxed),
-        "Render superseded"
-    );
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     Ok(Rendered {
         width: w,
         height: h,
@@ -501,6 +581,7 @@ mod sampling_tests {
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         };
         im.metadata.width = im.width;
         im.metadata.height = im.height;
@@ -535,7 +616,7 @@ mod sampling_tests {
             &g,
             [0, 0, g.width, g.height],
             0.,
-            &std::sync::atomic::AtomicBool::new(false),
+            Cancel::NEVER,
         )
         .unwrap();
         for (p, pos) in samples.pixels.iter().zip(&samples.positions) {
@@ -560,9 +641,9 @@ mod sampling_tests {
         r.shadows = 0.5;
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let expected = crate::develop::PreviewRenderer::default()
-            .render(&im, &r, 0, None, &cancel)
+            .render(&im, &r, 0, None, Cancel::new(&cancel))
             .unwrap();
-        let actual = render(&im, &r.checked().unwrap(), 0).unwrap();
+        let actual = render(&im, &r.checked().unwrap(), 0, Cancel::NEVER).unwrap();
         let max = actual
             .pixels
             .iter()

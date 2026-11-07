@@ -16,7 +16,6 @@ use super::{Catalog, EditChange, HistoryUpdate, PhotoId};
 use crate::storage::Identity;
 use crate::{export_settings::ExportOptions, model::recipe::Recipe};
 use anyhow::{Result, ensure};
-use std::path::Path;
 
 /// A change to one photo's edit, checked and ready to write. Only
 /// [`Catalog::check_edit`] and [`CheckedNew`] make one, so nothing
@@ -61,8 +60,8 @@ impl CheckedNew {
 
 impl Catalog {
     /// Checks `change` before it is written: the recipe and export options
-    /// are valid, the photo's file can be identified, and the edit it
-    /// replaces was saved for that same file.
+    /// are valid, the photo's file is still the one the edit was made for,
+    /// and the edit it replaces was saved for that same file.
     pub(super) fn check_edit<'a>(&self, change: &EditChange<'_, 'a>) -> Result<CheckedChange<'a>> {
         let e = match change {
             EditChange::Clear { id } => {
@@ -73,7 +72,15 @@ impl Catalog {
             }
             EditChange::Save(e) => e,
         };
-        let save = self.checked(e.path, e.recipe, e.export, e.history)?;
+        let now = Identity::read(e.path)?;
+        ensure!(
+            now.same_photo(e.source),
+            "{} changed since its edit was made; edit not saved",
+            e.path.display()
+        );
+        // Stored for the file as it is, so a new modification time alone
+        // (issue #870) is taken up by the next save.
+        let save = self.checked(&now, e.recipe, e.export, e.history)?;
         // Refuse replacing an edit after the underlying source changed.
         let _ = self.load_edit(e.id, e.path)?;
         Ok(CheckedChange {
@@ -82,31 +89,31 @@ impl Catalog {
         })
     }
     /// Checks the edit of a photo not yet in the catalog, as `check_edit`
-    /// checks a save.
+    /// checks a save, for the file `identity` names: the one the edit was
+    /// read for, not the file as it is by the time this runs.
     pub(super) fn check_new_edit(
         &self,
-        path: &Path,
+        identity: &Identity,
         recipe: &Recipe,
         export: &ExportOptions,
     ) -> Result<CheckedNew> {
         Ok(CheckedNew(self.checked(
-            path,
+            identity,
             recipe,
             export,
             HistoryUpdate::Keep,
         )?))
     }
-    /// A valid edit for `path`, as its rows store it.
+    /// A valid edit for the file `identity` names, as its rows store it.
     fn checked<'a>(
         &self,
-        path: &Path,
+        identity: &Identity,
         recipe: &Recipe,
         export: &ExportOptions,
         history: HistoryUpdate<'a>,
     ) -> Result<Checked<'a>> {
         recipe.validate()?;
         export.validate()?;
-        let identity = Identity::read(path)?;
         let (saved, local) = recipe.split_local();
         let history_ids = match history {
             HistoryUpdate::Replace(h) => h.mask_asset_ids(),
@@ -116,7 +123,7 @@ impl Catalog {
         Ok(Checked {
             recipe: serde_json::to_string(&saved)?,
             export: serde_json::to_string(export)?,
-            identity: serde_json::to_string(&identity)?,
+            identity: serde_json::to_string(identity)?,
             local: (!local.is_empty())
                 .then(|| serde_json::to_string(&local))
                 .transpose()?,
@@ -236,10 +243,10 @@ pub(super) enum Refresh {
 }
 
 /// Gives the saved edit of `photo`, whose file was found moved, the identity
-/// of the file found (`now`), only when that edit was saved for exactly the
-/// version `was` names (mtime included) and the file found was verified to
-/// have that version's content. An edit saved for another version stays
-/// bound to it.
+/// of the file found (`now`), only when that edit was saved for the photo
+/// `was` names ([`Identity::same_photo`]) and the file found was verified to
+/// have that version's content. An edit saved for another photo stays bound
+/// to it.
 pub(super) fn refresh_identity(
     w: &mut Write<'_>,
     photo: PhotoId,
@@ -251,7 +258,7 @@ pub(super) fn refresh_identity(
     let Some(Some(saved)) = saved else {
         return Ok(Refresh::NoEdit);
     };
-    if serde_json::from_str::<Identity>(&saved).ok().as_ref() != Some(was) {
+    if !serde_json::from_str::<Identity>(&saved).is_ok_and(|saved| saved.same_photo(was)) {
         return Ok(Refresh::Protected);
     }
     w.execute(

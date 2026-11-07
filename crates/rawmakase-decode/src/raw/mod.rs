@@ -3,11 +3,10 @@
 //! camera-space pixels and the embedded preview. The values they produce are
 //! [`crate::camera_data`]'s.
 use anyhow::{Result, ensure};
+use rawmakase_cancel::Cancel;
 use rayon::prelude::*;
-use std::{
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::path::Path;
+pub(crate) mod lens;
 mod own;
 mod priority;
 use crate::camera_data::{
@@ -246,6 +245,11 @@ pub(crate) struct Header {
     pub make: String,
     pub model: String,
     pub normalized: [String; 2],
+    /// The make and model as the file writes them (`RawInfo::file_make`), which
+    /// Lensfun's camera entries use.
+    pub file_names: [String; 2],
+    /// The crop mode's crop factor over the sensor's (`RawInfo::sensor_crop`).
+    pub sensor_crop: Option<f32>,
     pub width: u32,
     pub height: u32,
     pub raw_width: u32,
@@ -275,8 +279,11 @@ pub(crate) struct Header {
     pub presets: [[f32; 3]; 4],
     pub matrix: [[f32; 3]; 3],
     pub cam_xyz: [[f32; 3]; 3],
+    pub matrix_source: rawmakase_model::camera_data::MatrixSource,
+    pub camera_look: Option<String>,
     pub lens: String,
     pub lens_id: u32,
+    pub lens_info: Option<[f32; 4]>,
     pub dng_version: u32,
     /// Black and white known on opening; see `Metadata::levels`.
     pub levels: Option<[u32; 3]>,
@@ -305,6 +312,9 @@ impl Raw {
         };
         let ([crop_left, crop_top, crop_width, crop_height], camera_crop) = crops(&h);
         let mut metadata = Metadata {
+            exif_make: h.file_names[0].clone(),
+            exif_model: h.file_names[1].clone(),
+            sensor_crop: h.sensor_crop,
             width: h.width,
             height: h.height,
             raw_width: h.raw_width,
@@ -337,16 +347,21 @@ impl Raw {
             },
             matrix: h.matrix,
             cam_xyz: h.cam_xyz,
+            matrix_source: h.matrix_source,
+            camera_look: h.camera_look,
+            embedded_profile_status: Default::default(),
             lens: None,
             lens_stand_in: None,
             lens_model: h.lens.trim().to_string(),
             lens_id: h.lens_id,
+            lens_info: h.lens_info,
             adobe_names,
             baseline_exposure: None,
             dng_neutral_calibration: None,
             dng_analog_balance: (h.analog_balance != [1.; 3]).then_some(h.analog_balance),
             dng_matrix_profile_signature: None,
             source: Source::Raw,
+            hdr_source: None,
             lens_profiles: Default::default(),
             lateral_ca: Default::default(),
             embedded_dcp: None,
@@ -363,6 +378,11 @@ impl Raw {
             facts,
         })
     }
+    /// The colour space the camera's maker notes give its JPEGs (Nikon's and
+    /// Olympus's ColorSpace), for a preview whose EXIF does not say it.
+    pub fn maker_preview_space(&self) -> Option<MakerPreviewSpace> {
+        self.own.preview_space()
+    }
     /// The embedded JPEG preview, as stored.
     pub fn thumbnail(&mut self) -> Result<Vec<u8>> {
         self.own.thumbnail()
@@ -377,10 +397,57 @@ impl Raw {
     pub(crate) fn sensor(&self) -> Result<Sensor> {
         self.own.sensor()
     }
-    pub fn develop(self, decode: Decode, cancel: &AtomicBool) -> Result<CameraImage> {
+    /// The visible mosaic in AI Denoise's model domain ([`crate::ai::denoise::PackedBayer`]),
+    /// or why this file cannot have it ([`crate::ai::denoise::Unsupported`]). An X-Trans
+    /// mosaic is demosaiced as development does it, its white balance taken off, and
+    /// sampled again as an RGGB mosaic of the same size
+    /// (docs/rendering-quality.md#ai-denoise).
+    pub fn packed_bayer(self, cancel: Cancel<'_>) -> Result<crate::ai::denoise::PackedBayer> {
+        let red = match self.own.bayer_red() {
+            Ok(red) => red,
+            Err(own::XTRANS) => return self.packed_xtrans(cancel),
+            Err(why) => {
+                return Err(anyhow::Error::new(crate::ai::denoise::Unsupported(why)));
+            }
+        };
+        let cfa = self
+            .own
+            .cfa(cancel)?
+            .ok_or_else(|| anyhow::anyhow!("Sensor data RAWmakase cannot develop"))?;
+        ensure!(!cancel.is_cancelled(), "Development cancelled");
+        Ok(crate::ai::denoise::PackedBayer::pack(
+            cfa.width as usize,
+            cfa.height as usize,
+            &cfa.data,
+            red,
+        ))
+    }
+    /// An X-Trans photo's [`Self::packed_bayer`].
+    fn packed_xtrans(self, cancel: Cancel<'_>) -> Result<crate::ai::denoise::PackedBayer> {
+        let wb = self.metadata.wb;
+        let image = self.develop(Decode::Full(Default::default()), cancel)?;
+        let (w, h) = (image.width as usize, image.height as usize);
+        let data: Vec<f32> = image
+            .pixels
+            .par_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (x, y) = (i % w, i / w);
+                let c = match (y % 2, x % 2) {
+                    (0, 0) => 0,
+                    (1, 1) => 2,
+                    _ => 1,
+                };
+                p[c] / wb[c].max(f32::MIN_POSITIVE)
+            })
+            .collect();
+        ensure!(!cancel.is_cancelled(), "Development cancelled");
+        Ok(crate::ai::denoise::PackedBayer::pack(w, h, &data, [0, 0]))
+    }
+    pub fn develop(self, decode: Decode, cancel: Cancel<'_>) -> Result<CameraImage> {
         // Small RAWs develop at full size in either mode, as they always have.
         if let Some((width, height, pixels)) = self.own.rgb(self.metadata.wb, cancel)? {
-            ensure!(!cancel.load(Ordering::Relaxed), "Development cancelled");
+            ensure!(!cancel.is_cancelled(), "Development cancelled");
             return Ok(CameraImage {
                 recovered: Default::default(),
                 width,
@@ -392,6 +459,7 @@ impl Raw {
                 // integers, so nothing saturates.
                 scale_factor: 1.,
                 scale_clipped: 0,
+                hdr: Default::default(),
             });
         }
         let cfa = self.own.cfa(cancel)?;
@@ -404,7 +472,7 @@ impl Raw {
         &self,
         cfa: Option<Cfa>,
         half: bool,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Option<CameraImage>> {
         let Some(Cfa {
             width: w,
@@ -415,7 +483,7 @@ impl Raw {
         else {
             return Ok(None);
         };
-        ensure!(!cancel.load(Ordering::Relaxed), "Development cancelled");
+        ensure!(!cancel.is_cancelled(), "Development cancelled");
         let wb = self.metadata.wb;
         let (width, height) = (w as usize, h as usize);
         let clipped = data
@@ -444,7 +512,7 @@ impl Raw {
         } else {
             (w, h, crate::demosaic::demosaic(&cfa))
         };
-        ensure!(!cancel.load(Ordering::Relaxed), "Development cancelled");
+        ensure!(!cancel.is_cancelled(), "Development cancelled");
         Ok(Some(CameraImage {
             recovered: Default::default(),
             width: w,
@@ -454,6 +522,7 @@ impl Raw {
             fast: half,
             scale_factor: 1.,
             scale_clipped: clipped,
+            hdr: Default::default(),
         }))
     }
 }
@@ -623,6 +692,17 @@ pub fn thumbnail(raw: &mut Raw) -> anyhow::Result<image::RgbImage> {
     let bytes = raw.thumbnail()?;
     preview_image(bytes, raw.metadata.flip)
 }
+/// A camera JPEG's colour space as its maker notes give it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MakerPreviewSpace {
+    Srgb,
+    AdobeRgb,
+}
+/// Whether an embedded preview's `bytes` (`Raw::thumbnail`'s) are JPEG XL, which
+/// Lightroom writes into DNGs, rather than a camera's JPEG.
+pub fn is_jpeg_xl(bytes: &[u8]) -> bool {
+    rawmakase_raw::is_jpeg_xl(bytes, 0)
+}
 /// The embedded preview for a thumbnail `edge` pixels on its long side,
 /// upright as [`thumbnail`]'s: from the smallest preview that reaches `edge`
 /// (see [`Raw::thumbnail_reaching`]), so a full-size JPEG is decoded only
@@ -630,6 +710,17 @@ pub fn thumbnail(raw: &mut Raw) -> anyhow::Result<image::RgbImage> {
 pub fn thumbnail_reaching(raw: &mut Raw, edge: u32) -> anyhow::Result<image::RgbImage> {
     let bytes = raw.thumbnail_reaching(edge)?;
     preview_image(bytes, raw.metadata.flip)
+}
+/// [`thumbnail_reaching`]'s thumbnail of the RAW at `path`, read without its
+/// sensor data (see [`rawmakase_raw::preview_from_file`]). An error when the
+/// file can't be read that way; the caller then opens it whole.
+pub fn thumbnail_reaching_from_file(path: &Path, edge: u32) -> anyhow::Result<image::RgbImage> {
+    // Unbuffered: each piece is read whole, and a buffer would read past it.
+    let mut file = std::fs::File::open(path)?;
+    let partial = rawmakase_raw::preview_from_file(&mut file, edge).ok_or_else(|| {
+        anyhow::anyhow!("No embedded preview found without reading the whole file")
+    })?;
+    preview_image(partial.preview, partial.info.flip)
 }
 /// The most pixels a JPEG XL preview may claim: a 100-megapixel camera's.
 /// Its header is read before any pixel, so a hostile one is refused before
@@ -678,6 +769,7 @@ fn preview_image(bytes: Vec<u8>, flip: i32) -> anyhow::Result<image::RgbImage> {
 
 #[cfg(test)]
 mod tests {
+    use rawmakase_cancel::Cancel;
     /// A JPEG XL preview (Lightroom's DNGs embed one, of 1024 pixels, beside
     /// a 256-pixel JPEG) decodes, turned by the RAW's orientation:
     /// `rawmakase-raw`'s 8 × 4 lossless test codestream, whose pixel (x, y)
@@ -953,8 +1045,8 @@ mod tests {
         dir(
             &mut f,
             &[
-                (0x10f, 2, make.len() as u32, make.clone()),
-                (0x110, 2, model.len() as u32, model.clone()),
+                (0x10f, 2, make.len() as u32, make),
+                (0x110, 2, model.len() as u32, model),
                 (0x14a, 4, 1, long(sub as u32)),
             ],
         );
@@ -984,7 +1076,7 @@ mod tests {
     #[test]
     fn nikon_high_efficiency_raws_are_decoded_on_every_body() {
         use crate::camera_data::{Decode, Demosaic};
-        use std::sync::atomic::AtomicBool;
+
         // Zeros after it, inside this small file's raw data.
         let stream = [
             rawmakase_raw::nikon_high_efficiency_test_support::blank_codestream(64, 64),
@@ -1003,7 +1095,7 @@ mod tests {
             for decode in [Decode::Half, Decode::Full(Demosaic::Rawmakase)] {
                 let raw = super::Raw::open_file(&path).unwrap();
                 let image = raw
-                    .develop(decode, &AtomicBool::new(false))
+                    .develop(decode, Cancel::NEVER)
                     .unwrap_or_else(|e| panic!("{model}, {decode:?}: {e}"));
                 // The blank codestream is one value throughout.
                 let first = image.pixels[0];
@@ -1019,7 +1111,7 @@ mod tests {
     #[test]
     fn broken_nikon_high_efficiency_raws_are_errors() {
         use crate::camera_data::{Decode, Demosaic};
-        use std::sync::atomic::AtomicBool;
+
         // JPEG XS's start of codestream and capabilities marker, then noise.
         const JPEG_XS: [u8; 4] = [0xff, 0x10, 0xff, 0x50];
         for model in ["NIKON Z5_2", "NIKON Z 8"] {
@@ -1033,7 +1125,7 @@ mod tests {
                     assert!(error.to_string().contains("JPEG XS"), "{error}");
                 }
                 let error = raw
-                    .develop(decode, &AtomicBool::new(false))
+                    .develop(decode, Cancel::NEVER)
                     .err()
                     .unwrap_or_else(|| panic!("{model} developed with {decode:?}"));
                 assert!(
@@ -1044,6 +1136,6 @@ mod tests {
         }
         let (_dir, path) = nef("NIKON Z5_2", &[0; 4]);
         let raw = super::Raw::open_file(&path).unwrap();
-        assert!(raw.develop(Decode::Half, &AtomicBool::new(false)).is_ok());
+        assert!(raw.develop(Decode::Half, Cancel::NEVER).is_ok());
     }
 }

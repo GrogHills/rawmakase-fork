@@ -106,6 +106,22 @@ pub struct Recipe {
     pub grading: [[f32; 3]; 3],
     pub noise_luma: f32,
     pub noise_chroma: f32,
+    /// AI Denoise (Detail). Omitted when off at the default Amount, so releases that
+    /// predate it read the recipe; any other value needs the saved format that knows it
+    /// (`saved_format::schema_for`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::model::ai_denoise::AiDenoise::is_default"
+    )]
+    pub ai_denoise: crate::model::ai_denoise::AiDenoise,
+    /// High Dynamic Range editing. Omitted when off with every value at its default,
+    /// so releases that predate it read the recipe; an active HDR edit needs the saved
+    /// format that knows it (`saved_format::schema_for`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::model::hdr::HdrSettings::is_default"
+    )]
+    pub hdr: crate::model::hdr::HdrSettings,
     pub sharpening: f32,
     pub crop: [f32; 4],
     pub straighten: f32,
@@ -222,6 +238,8 @@ impl Default for Recipe {
             grading: [[0.; 3]; 3],
             noise_luma: 0.,
             noise_chroma: 0.,
+            ai_denoise: Default::default(),
+            hdr: Default::default(),
             sharpening: 0.35,
             crop: [0., 0., 1., 1.],
             straighten: 0.,
@@ -385,6 +403,19 @@ impl Recipe {
             ..Self::default()
         }
     }
+    /// What a rendered photo without a saved edit starts from: [`Self::for_rendered`],
+    /// and for an HDR file an HDR edit at a limit its own light renders within
+    /// (docs/records/hdr-stage4-design.md). Saved edits, Lightroom's among them, read
+    /// on `for_rendered`'s settings, where a missing HDR field means HDR off, as it
+    /// did before HDR files opened.
+    pub fn for_new_rendered(m: &Metadata) -> Self {
+        let mut recipe = Self::for_rendered(m);
+        if let Some(source) = m.hdr_source {
+            recipe.hdr.enabled = true;
+            recipe.hdr.limit = crate::model::hdr::limit_containing(source.peak);
+        }
+        recipe
+    }
     /// Lightroom's Adobe Default: the settings a photo starts from.
     pub fn with_profiles(
         m: &Metadata,
@@ -413,7 +444,9 @@ impl Recipe {
             ProfilePreference::Camera => camera_matching_profile(m, profiles),
         };
         // As in Lightroom: Adobe Color, else Adobe Standard. Without those, a DNG
-        // keeps the profile it embeds, and any other file gets RAWmakase Color.
+        // keeps the profile it embeds, and any other file gets RAWmakase Color, or
+        // the Camera Look fitted as the default of a photo without colour data (only
+        // that photo's list has one).
         if let Some(profile) = own
             .or_else(|| find("Adobe Color"))
             .or_else(|| find("Adobe Standard"))
@@ -422,6 +455,13 @@ impl Recipe {
                     .profile
                     .is_none()
                     .then(|| find(crate::camera_profiles::open::COLOR))
+                    .flatten()
+            })
+            .or_else(|| {
+                recipe
+                    .profile
+                    .is_none()
+                    .then(|| find(crate::camera_profiles::fitted::LOOK))
                     .flatten()
             })
         {
@@ -435,6 +475,12 @@ impl Recipe {
     }
     pub fn validate(&self) -> Result<()> {
         self.effects.validate()?;
+        ensure!(
+            self.lens_profile_choice
+                .lensfun()
+                .is_none_or(|l| l.validate()),
+            "Invalid Lensfun lens profile"
+        );
         ensure!(
             (0.5..=3.).contains(&self.sharpening_radius)
                 && (0. ..=1.).contains(&self.sharpening_detail)
@@ -498,6 +544,9 @@ impl Recipe {
                 .all(|v| (0. ..=1.).contains(v)),
             "Invalid detail adjustment"
         );
+        ensure!(self.ai_denoise.is_valid(), "Invalid AI Denoise Amount");
+        self.hdr.validate()?;
+        self.hdr.check_renderable()?;
         ensure!(
             self.crop.iter().all(|v| (0. ..=1.).contains(v))
                 && self.crop[2] - self.crop[0] >= 0.01
@@ -592,8 +641,26 @@ impl Recipe {
         }
         self.lens_profile_choice.resolve(&m.lens_profiles, m)
     }
-    /// Why Enable Profile Corrections cannot render with the Adobe profile it should
-    /// here, and what renders instead, when it is on.
+    /// Whether the edit renders in HDR or uses an HDR camera profile: it is saved in
+    /// a format releases before HDR refuse (`saved_format::schema_for`, the catalog's
+    /// version 6). Values kept while HDR is off do not count.
+    pub fn uses_hdr(&self) -> bool {
+        self.hdr.is_active() || self.profile.as_ref().is_some_and(|p| p.is_hdr())
+    }
+    /// Whether the edit names a Lensfun lens, in use or not, resolved or not: it is
+    /// saved in a format releases before Lensfun refuse (`saved_format::schema_for`,
+    /// the catalog's version 4).
+    pub fn uses_lensfun(&self) -> bool {
+        self.lens_profile_choice.lensfun().is_some()
+    }
+    /// The Lensfun lens Enable Profile Corrections uses, when the edit chose one.
+    pub fn lensfun_in_use(&self) -> Option<&crate::lens::lensfun::LensfunChoice> {
+        self.lens_profile
+            .then(|| self.lens_profile_choice.lensfun())
+            .flatten()
+    }
+    /// Why Enable Profile Corrections cannot render with the profile it should here,
+    /// and what renders instead, when it is on.
     pub fn missing_lens_profile(&self, m: &Metadata) -> Option<String> {
         // A Lens Corrections panel switched off renders no lens correction at all.
         let panel = self
@@ -602,14 +669,24 @@ impl Recipe {
         if panel == crate::model::panels::PanelState::Off || !self.lens_profile {
             return None;
         }
+        // A Lensfun lens renders from the calibration the edit copied, as far as it
+        // covers this photo; never from an Adobe profile.
+        if let Some(lensfun) = self.lensfun_in_use() {
+            let applied = lensfun.apply(m);
+            if applied.notes.is_empty() {
+                return None;
+            }
+            let why = applied.notes.join("; it ");
+            let profile = format!("Lensfun profile \"{}\" {why}", lensfun.name());
+            return Some(match (&applied.correction, self.builtin_correction(m)) {
+                (Some(_), _) => profile,
+                (None, Some(builtin)) => format!("{profile}; using {}", builtin.source),
+                (None, None) => format!("{profile}; no lens correction"),
+            });
+        }
         let resolved = self.lens_profile_in_use(m);
         // The profile the RAW carries renders as its built-in correction.
-        if let Some(id) = self
-            .lens_profile_choice
-            .id
-            .as_ref()
-            .filter(|id| id.embedded)
-        {
+        if let Some(id) = self.lens_profile_choice.adobe().filter(|id| id.embedded) {
             return self.builtin_correction(m).is_none().then(|| {
                 format!(
                     "Lens profile \"{}\" comes with the camera, but this file has none; no lens correction",
@@ -636,6 +713,23 @@ impl Recipe {
     }
     /// Color noise reduction at its defaults: Lightroom's Amount 25 for raw files
     /// (Detail and Smoothness 50).
+    /// AI Denoise's switch, as Lightroom's Denoise switch edits: switched on, manual
+    /// Luminance and Color noise reduction go to 0 (Camera Raw 18.7 writes them so; the
+    /// AI result has no noise left for them); switched off, Color's defaults come back
+    /// while it is still at the 0 switching on left (Camera Raw restores them). Amount is
+    /// kept either way.
+    pub fn switch_ai_denoise(&mut self, on: bool) {
+        if self.ai_denoise.enabled == on {
+            return;
+        }
+        self.ai_denoise.enabled = on;
+        if on {
+            self.noise_luma = 0.;
+            self.noise_chroma = 0.;
+        } else if self.noise_chroma == 0. {
+            self.set_color_noise_defaults();
+        }
+    }
     pub fn set_color_noise_defaults(&mut self) {
         let d = crate::model::effects::Effects::default();
         self.noise_chroma = 0.25;
@@ -676,7 +770,11 @@ impl Recipe {
     /// distortion).
     pub fn lens_amounts(&self, m: &Metadata) -> [f32; 2] {
         let amounts = [self.lens_distortion, self.lens_vignetting];
-        if self.lens_profile_in_use(m).used.is_some() {
+        if self.lens_profile_in_use(m).used.is_some()
+            || self
+                .lensfun_in_use()
+                .is_some_and(|l| l.apply(m).correction.is_some())
+        {
             return amounts;
         }
         if !self.lens_profile {
@@ -700,21 +798,46 @@ impl Recipe {
             _ => [1., 1.],
         }
     }
-    /// The lens correction to apply: the Adobe profile in use, else the built-in
-    /// correction if enabled and present in the file.
+    /// The lens correction to apply: the Lensfun lens the edit chose or the Adobe
+    /// profile in use, else the built-in correction if enabled and present in the
+    /// file. A Lensfun lens renders from the edit's own copy of its calibration; when
+    /// it can't correct this photo (not resolved, or not covering it), the built-in
+    /// correction renders, never an Adobe profile.
     pub fn lens_correction<'a>(
         &self,
         m: &'a Metadata,
-    ) -> Option<&'a crate::optics::LensCorrection> {
+    ) -> Option<std::borrow::Cow<'a, crate::optics::LensCorrection>> {
+        use std::borrow::Cow;
+        if let Some(lensfun) = self.lensfun_in_use() {
+            return lensfun
+                .apply(m)
+                .correction
+                .map(Cow::Owned)
+                .or_else(|| self.builtin_correction(m).map(Cow::Borrowed));
+        }
         self.lens_profile_in_use(m)
             .used
             .and_then(|c| c.correction(m))
             .or_else(|| self.builtin_correction(m))
+            .map(Cow::Borrowed)
     }
-    /// Recipe as rendered: switched-off panels bypassed, profile-internal adjustments
-    /// and the default profile. A monochrome photo renders without white balance
-    /// gains, whatever an edit from another photo or a preset gave it.
+    /// Recipe as rendered in SDR: switched-off panels bypassed, profile-internal
+    /// adjustments and the default profile. A monochrome photo renders without white
+    /// balance gains, whatever an edit from another photo or a preset gave it.
+    ///
+    /// An HDR edit renders here as its SDR rendition: the edit with HDR off
+    /// (docs/records/hdr-stage1-results.md#sdr-rendition). Only
+    /// [`Self::resolved_hdr`] renders its HDR master, so no SDR caller can receive
+    /// HDR pixels.
     pub fn resolved(&self, m: &Metadata) -> std::borrow::Cow<'_, Self> {
+        let mut r = self.resolved_hdr(m);
+        if r.hdr.is_active() {
+            r.to_mut().hdr.enabled = false;
+        }
+        r
+    }
+    /// [`Self::resolved`] keeping HDR on: the recipe of an edit's HDR master.
+    pub fn resolved_hdr(&self, m: &Metadata) -> std::borrow::Cow<'_, Self> {
         let mut r = match self.as_rendered() {
             std::borrow::Cow::Borrowed(r) => r.with_profile_adjustments(),
             std::borrow::Cow::Owned(r) => {
@@ -1224,5 +1347,28 @@ mod tests {
         r.lens_builtin = false;
         r.set_profile_corrections(&m, ProfileCorrections::On);
         assert!(r.lens_correction(&m).is_none());
+    }
+
+    /// As Camera Raw 18.7 writes it: Denoise on sets manual noise reduction to 0, off
+    /// brings Color's defaults back; the Amount stays.
+    #[test]
+    fn switching_ai_denoise_follows_lightrooms_noise_reduction() {
+        let mut r = Recipe {
+            noise_luma: 0.3,
+            ..Default::default()
+        };
+        r.set_color_noise_defaults();
+        r.ai_denoise.amount = 0.7;
+        r.switch_ai_denoise(true);
+        assert!(r.ai_denoise.enabled);
+        assert_eq!((r.noise_luma, r.noise_chroma), (0., 0.));
+        r.switch_ai_denoise(false);
+        assert_eq!(r.noise_chroma, 0.25);
+        assert_eq!(r.ai_denoise.amount, 0.7);
+        // A Color amount set while on is the user's: kept when switching off.
+        r.switch_ai_denoise(true);
+        r.noise_chroma = 0.4;
+        r.switch_ai_denoise(false);
+        assert_eq!(r.noise_chroma, 0.4);
     }
 }

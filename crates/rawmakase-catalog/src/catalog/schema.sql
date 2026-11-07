@@ -149,6 +149,21 @@ CREATE TABLE IF NOT EXISTS photo_checksums (
 );
 CREATE INDEX IF NOT EXISTS photo_checksums_quick ON photo_checksums(size, quick_hash);
 
+-- Where the photo falls in its camera's sequences (see `sequences`), read
+-- from the master's file in the background: a burst id, or a frame number
+-- (0 for a single shot); a row of NULLs records a file that said nothing.
+-- Kept for the file of that size and modification time; read again when
+-- the file differs or under another `version` of the reader.
+CREATE TABLE IF NOT EXISTS photo_sequences (
+    photo INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    camera TEXT,                  -- make, model and body serial number
+    burst TEXT,
+    frame INTEGER,
+    size INTEGER NOT NULL,
+    modified_ns INTEGER NOT NULL, -- since the Unix epoch
+    version INTEGER NOT NULL
+);
+
 -- Which Add Photo Folder or Synchronize added each photo; Previous Import is
 -- the newest batch.
 CREATE TABLE IF NOT EXISTS import_batches (
@@ -159,6 +174,35 @@ CREATE TABLE IF NOT EXISTS import_batches (
 CREATE TABLE IF NOT EXISTS photo_imports (
     photo INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     batch INTEGER NOT NULL REFERENCES import_batches(id)
+);
+-- Batches added with Stack Camera Bursts on, whose bursts are not stacked
+-- yet: a row goes in the transaction that stacks them. `seconds` is the
+-- longest gap between frames a camera didn't number (continuous drive).
+CREATE TABLE IF NOT EXISTS import_burst_stacks (
+    batch INTEGER PRIMARY KEY REFERENCES import_batches(id) ON DELETE CASCADE,
+    seconds REAL NOT NULL
+);
+
+-- What a master photo was when it entered the catalog, for Import Photos'
+-- suspected duplicates and the Original filename token: its file's name then,
+-- its size and the capture time its file's EXIF gives. Written with the
+-- photo; `exif_captured` is filled in by the background read of capture times
+-- (`exif_read` 0 until read; 1 with a NULL `exif_captured` when the file has
+-- none). Kept apart from `photos.captured`, which the user and XMP may set.
+-- Photos added by releases before it have no row.
+CREATE TABLE IF NOT EXISTS photo_import_facts (
+    photo INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    original_name TEXT NOT NULL,
+    exif_captured TEXT,
+    size INTEGER,
+    exif_read INTEGER NOT NULL
+);
+
+-- Numbers the catalog hands out once, by name: `import_number`, the last
+-- Import # an Import Photos run took.
+CREATE TABLE IF NOT EXISTS catalog_counters (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
 );
 
 -- Facts about the catalog itself, by name.

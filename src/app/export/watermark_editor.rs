@@ -2,10 +2,10 @@
 //! photo with the mark on it, and the mark's style, text or image options,
 //! shadow and effects. Watermarks are kept as presets, a graphic one with
 //! its own copy of the image.
-use super::super::widgets::{modal_frame, primary_button};
 use super::Editor;
-use crate::app::design::{Tone, button, radius, size, space, text};
-use crate::app::theme;
+use crate::app::ui::design::{Tone, button, radius, size, space, text};
+use crate::app::ui::theme;
+use crate::app::ui::widgets::{modal_frame, primary_button};
 use crate::rendered::unit_to_u8;
 use crate::watermark::{self, Align, Anchor, Size, Style, Watermark};
 use eframe::egui::{self, Color32, Sense, Vec2};
@@ -245,7 +245,8 @@ impl Editor {
         {
             change(&mut previous);
             if let Err(e) = previous.save() {
-                self.status = format!("Export settings not saved: {e:#}");
+                self.messages
+                    .fail(format!("Export settings not saved: {e:#}"));
             }
         }
     }

@@ -23,6 +23,7 @@ rawmakase control action treatment:bw
 rawmakase control save
 rawmakase control preview /absolute/path/preview.jpg
 rawmakase control export /absolute/path/finished.tif
+rawmakase control export /absolute/path/wide.tif --color-space prophoto
 ```
 
 On macOS the executable is inside `RAWmakase.app/Contents/MacOS/rawmakase`.
@@ -139,6 +140,12 @@ size. Export defaults to full size. Both accept JPEG, TIFF and PNG paths and use
 existing export pipeline. They never overwrite an existing file or change saved
 Export dialog settings.
 
+`export` writes sRGB unless `color_space` is `adobe-rgb` or `prophoto`
+(`--color-space` for `rawmakase control export`), with that space's embedded
+profile. ProPhoto RGB is written only as 16-bit TIFF: with a `.jpg` or `.png` path
+the request fails with `invalid_request` before a job starts, rather than being
+written in another space or format. A preview is always sRGB.
+
 The client waits for file publication by default. For asynchronous operation:
 
 ```sh
@@ -198,7 +205,7 @@ use target guards for a sequence that must refer to the same edit.
 | `module` | `module`: `develop` or `library` | Post-action state |
 | `photo` | `step`: −1 or 1 | Selection change in Library; opened identity in Develop |
 | `save` | optional `target` | `saved: true` |
-| `preview`, `export` | absolute `path`, optional `max_edge`, optional `target` | Captured output job |
+| `preview`, `export` | absolute `path`, optional `max_edge`, optional `target`; `export` also optional `color_space`: `srgb` (the default), `adobe-rgb` or `prophoto` (TIFF only) | Captured output job |
 | `job` | `job_id` | Output status |
 | `build_previews` | optional `kind`: `standard` (the default) or `one_to_one` | `queued` and `skipped` (offline or not RAW) counts for the selection, as the thumbnail menu's Build Standard-Sized Previews; state's `building_previews` (`done`, `total`) shows progress while they build |
 | `wait` | `until`: `loaded` with `photo_id`, or `job` with `job_id`; optional `timeout_ms` (1…5000, default 1000) | State once the photo is loaded (or replaced by another, or could not be opened) or the job finished, status `applied`; or at `timeout_ms`, status `timed_out` |
@@ -239,9 +246,12 @@ If execution already started but its reply times out, `outcome_unknown` means
 inspect state before retrying, especially for relative or toggle operations.
 There are no automatic mutation retries.
 
-Commands currently execute during desktop frames. A minimized/suspended window
-may not process them; queued requests then expire safely. This is live desktop
-control, not a headless daemon. For unattended rendering without a GUI, use
+Commands execute in the desktop app's event loop, which keeps running while the
+window is behind other apps, occluded or minimized: macOS then stops drawing it,
+but requests, photo loading and saving go on. The pictures of photos opened
+meanwhile stay in memory until the window is drawn again. A suspended app (a closed laptop
+lid, say) doesn't process them; queued requests then expire safely. This is live
+desktop control, not a headless daemon. For unattended rendering without a GUI, use
 `rawmakase render` and its recipe options.
 
 ## Configuration and compatibility

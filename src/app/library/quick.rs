@@ -3,7 +3,7 @@
 //! any other, the one imported from Lightroom or made on first use, and each
 //! change is one undoable command.
 use super::{Library, Place};
-use crate::app::widgets::plural;
+use crate::app::ui::widgets::plural;
 use crate::catalog::PhotoId;
 use anyhow::Result;
 
@@ -32,13 +32,13 @@ impl Library {
     }
     pub(super) fn in_quick(&self, id: PhotoId) -> bool {
         self.quick()
-            .and_then(|q| self.session.collection_photos.get(&q))
+            .and_then(|q| self.session.collection_photos().get(&q))
             .is_some_and(|members| members.contains(&id))
     }
     /// The Quick Collection's photo count, for the Catalog panel.
     pub(super) fn quick_count(&self) -> usize {
         self.quick()
-            .and_then(|q| self.session.collection_photos.get(&q))
+            .and_then(|q| self.session.collection_photos().get(&q))
             .map_or(0, |members| members.len())
     }
     pub(super) fn showing_quick(&self) -> bool {
@@ -76,7 +76,7 @@ impl Library {
         };
         let removed: Vec<PhotoId> = self
             .session
-            .collection_photos
+            .collection_photos()
             .get(&quick)
             .map(|m| m.iter().copied().collect())
             .unwrap_or_default();
@@ -109,7 +109,8 @@ impl Library {
             (false, true) => Ok(()),
         };
         if let Err(e) = done {
-            self.message = format!("Quick Collection not changed: {e}");
+            self.messages
+                .fail(format!("Quick Collection not changed: {e}"));
         }
     }
     /// Makes a change and hands it to the undo log once it is saved.
@@ -122,7 +123,7 @@ impl Library {
     ) -> Result<()> {
         let place_before = self.place();
         self.change_collection(collection, &added, &removed)?;
-        self.message = summary.clone();
+        self.messages.note(summary.clone());
         self.collection_done.push(CollectionCommand {
             sequence: crate::edit_session::sequence(),
             collection,

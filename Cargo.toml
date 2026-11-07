@@ -1,36 +1,71 @@
 [package]
 name = "rawmakase"
-version = "0.4.8"
-edition = "2024"
-rust-version = "1.98"
+version = "0.4.12"
+edition.workspace = true
+rust-version.workspace = true
 description = "A fast, non-destructive RAW photo developer"
-license = "MIT"
+license.workspace = true
 repository = "https://github.com/pch/rawmakase"
 
 # The control protocol and its command-line client build on their own, without
 # the app's GUI, GPU or native libraries.
 [workspace]
-members = ["crates/rawmakase-catalog", "crates/rawmakase-decode", "crates/rawmakase-engine", "crates/rawmakase-export", "crates/rawmakase-inference", "crates/rawmakase-interop", "crates/rawmakase-model", "crates/rawmakase-protocol", "crates/rawmakase-raw", "crates/rawmakase-remote", "crates/rawmakase-tiff", "tools/rawmakase-ctl"]
+members = ["crates/rawmakase-cancel", "crates/rawmakase-catalog", "crates/rawmakase-decode", "crates/rawmakase-engine", "crates/rawmakase-export", "crates/rawmakase-fs", "crates/rawmakase-inference", "crates/rawmakase-interop", "crates/rawmakase-model", "crates/rawmakase-protocol", "crates/rawmakase-raw", "crates/rawmakase-remote", "crates/rawmakase-tiff", "tools/rawmakase-ctl"]
+
+# What every crate of the workspace shares. CI and `make check` read the minimum
+# Rust version from the `rust-version` line here.
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+
+# Lints beyond the defaults. CI denies warnings, so each one listed here holds
+# at zero in every crate that adopts them with `[lints] workspace = true`. More
+# join as the refactor in issue #216 clears them: struct_excessive_bools with
+# the state structs (10).
+[workspace.lints.rust]
+# An item marked `pub` is reachable from outside its crate; one that isn't says
+# `pub(crate)` or narrower (#808 step 4.13).
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+fn_params_excessive_bools = "warn"
+large_enum_variant = "warn"
+redundant_clone = "warn"
 
 [workspace.dependencies]
 # The rendered formats the app reads and writes (`storage::RasterFormat`): one
 # list for every crate that decodes or encodes them.
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
-
-[features]
-default = ["software-hevc"]
-# HEIC photos decoded in pure Rust (rust_h265), on every platform. A packager
-# who leaves software HEVC decoders out (for HEVC's patents) builds with
-# --no-default-features: HEIF photos are then listed, with their metadata, but
-# not shown or edited.
-software-hevc = ["rawmakase-decode/software-hevc"]
+# Dependencies more than one crate declares with the same version and features.
+# A crate that needs other features declares its own.
+anyhow = "1"
+base64 = "0.23"
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.13.0", version = "0.13.0" }
+flate2 = "1"
+getrandom = "0.4"
+libc = "0.2"
+md-5 = "0.11"
+objc2 = "0.6"
+rayon = "1.12"
+roxmltree = "0.21.1"
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+tiff = "0.11.3"
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+unicode-normalization = "0.1"
+wgpu = { version = "30", default-features = false, features = ["wgsl"] }
 
 [dependencies]
+rawmakase-cancel = { path = "crates/rawmakase-cancel", version = "0.1.0" }
 rawmakase-catalog = { path = "crates/rawmakase-catalog", version = "0.1.0" }
-# Its HEVC decoder is the software-hevc feature's to choose.
-rawmakase-decode = { path = "crates/rawmakase-decode", version = "0.1.0", default-features = false }
+rawmakase-decode = { path = "crates/rawmakase-decode", version = "0.1.0" }
 rawmakase-engine = { path = "crates/rawmakase-engine", version = "0.1.0" }
 rawmakase-export = { path = "crates/rawmakase-export", version = "0.1.0" }
+rawmakase-fs = { path = "crates/rawmakase-fs", version = "0.1.0" }
 rawmakase-inference = { path = "crates/rawmakase-inference", version = "0.1.0" }
 rawmakase-interop = { path = "crates/rawmakase-interop", version = "0.1.0" }
 rawmakase-model = { path = "crates/rawmakase-model", version = "0.1.0" }
@@ -41,84 +76,78 @@ rawmakase-ctl = { path = "tools/rawmakase-ctl", version = "0.1.0" }
 # Local MCP adapter; no HTTP server or remote authorization stack.
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-base64 = "0.23"
+base64.workspace = true
 # Verifies a downloaded or imported selection model against its pinned digest.
-sha2 = "0.11"
-getrandom = "0.4"
-anyhow = "1"
-flate2 = "1"
-roxmltree = "0.21.1"
+sha2.workspace = true
+getrandom.workspace = true
+anyhow.workspace = true
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
-# The camera table (data/cameras.toml), parsed once at startup.
-toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
-rayon = "1.12"
-bytemuck = { version = "1.25", features = ["derive"] }
-pollster = "1"
-wgpu = { version = "30", default-features = false, features = ["wgsl"] }
+serde_json.workspace = true
+rayon.workspace = true
+wgpu.workspace = true
 image.workspace = true
-tiff = "0.11.3"
-tempfile = "3"
-unicode-normalization = "0.1"
-# The GUID of ExtendedXMP in JPEG exports is an MD5.
-md-5 = "0.11"
-# Installed fonts for text watermarks are mapped, not read whole.
-memmap2 = "0.9"
-# Glyph outlines for text watermarks (also behind egui's text).
-skrifa = "0.48"
-clap = { version = "4", features = ["derive"] }
+tempfile.workspace = true
+clap.workspace = true
 eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-# eframe's windowing, to run its event loop (see app::run).
-winit = { version = "0.30", default-features = false }
+# eframe's windowing, to run its event loop (see app::run). Where a Wayland
+# compositor leaves decorations to the app (GNOME), winit draws an
+# Adwaita-style title bar instead of a bare grey frame (#754). Compositors
+# that draw their own, or none (KDE, Hyprland, Sway), are unaffected.
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
 # eframe reports a failure to open the window through log (see app::run).
 log = "0.4"
 rfd = "0.17.2"
 # The HTTP client behind fastframe-update; rustls with bundled roots needs no
 # system TLS library.
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# Lensfun's database comes as a .tar.bz2 (lensfun_install): both read in pure Rust,
+# no libbz2; tar without extended attributes, nothing is unpacked to disk by it.
+bzip2-rs = "0.1"
+tar = { version = "0.4", default-features = false }
 # Shared egui app foundation (github.com/crmne/fastframe). Not on crates.io
 # yet: pin a tag and update it deliberately.
 fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.13.0", version = "0.13.0" }
 fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.13.0", version = "0.13.0", features = ["watch"] }
-fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.13.0", version = "0.13.0" }
+fastframe-fonts.workspace = true
 fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.13.0", version = "0.13.0" }
 # The SVG loader behind the icons, at eframe's egui version.
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 fastframe-titlebar = { git = "https://github.com/crmne/fastframe", tag = "v0.13.0", version = "0.13.0" }
 fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.13.0", version = "0.13.0" }
 
-# The terminal a release build's command-line output goes to, and the
-# Desktop and Pictures export folders.
-# MIDI input adapters (src/app/automation/midi.rs). Linux would need ALSA headers.
+# MIDI input adapters (src/app/shell/automation/midi.rs). Linux would need ALSA headers.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 midir = "0.11"
 
 # Native quit handling and display color management (src/platform/).
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
+objc2.workspace = true
 # The title bar's event monitor (src/platform/titlebar.rs).
 block2 = "0.6"
 dispatch2 = "0.3"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSApplication", "NSCell", "NSEvent", "NSGraphicsContext", "NSMenu", "NSMenuItem", "NSResponder", "NSView", "NSWindow", "objc2-quartz-core"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSApplication", "NSCell", "NSEvent", "NSGraphicsContext", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSView", "NSWindow", "objc2-quartz-core"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColorSpace"] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CAMetalLayer", "objc2-core-graphics"] }
 # The Trash (src/platform/trash/macos.rs): NSFileManager's trashItemAtURL,
 # and URLForDirectory for whether a volume has one; a drive's name for the
 # Folders panel (src/platform/volume.rs): NSURLVolumeNameKey; the region's
 # decimal separator for file names (src/platform/locale.rs): NSLocale.
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "FoundationErrors", "NSError", "NSFileManager", "NSLocale", "NSPathUtilities", "NSRunLoop", "NSString", "NSURL", "NSUserDefaults"] }
+# The computer's memory (src/platform/memory.rs): NSProcessInfo.
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "FoundationErrors", "NSError", "NSFileManager", "NSLocale", "NSPathUtilities", "NSProcessInfo", "NSRunLoop", "NSString", "NSURL", "NSUserDefaults"] }
 
 # The freedesktop Trash (src/platform/trash/freedesktop.rs, also built for
 # macOS's tests): the user's id, and whether a folder could be made where
-# its Trash would be. Its rename is storage::fsops's.
+# its Trash would be. Its rename is rawmakase-fs's.
+# The computer's memory on Linux (src/platform/memory.rs): sysinfo.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["fs", "process"] }
+rustix = { version = "1.1", features = ["fs", "process", "system"] }
 
 [target.'cfg(windows)'.dependencies]
 # Win32_Storage_FileSystem and Win32_System_WindowsProgramming: the drive
 # type of a volume, for whether it has a Recycle Bin (src/platform/trash/
-# windows.rs); rawmakase-model builds both already.
-windows-sys = { version = "0.61", features = ["Win32_Devices_Display", "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Registry", "Win32_System_WindowsProgramming", "Win32_UI_ColorSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# windows.rs); rawmakase-fs builds both already.
+# Win32_System_SystemInformation: the computer's memory (src/platform/memory.rs).
+windows-sys = { version = "0.61", features = ["Win32_Devices_Display", "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_WindowsProgramming", "Win32_UI_ColorSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # The Recycle Bin (src/platform/trash/windows.rs): IFileOperation and its
 # progress sink, COM interfaces windows-sys has no vtables for; the sink's
 # #[implement] names windows-core.
@@ -128,43 +157,41 @@ windows-core = "0.62"
 # The model's fixtures, for the app's tests.
 [dev-dependencies]
 rawmakase-catalog = { path = "crates/rawmakase-catalog", version = "0.1.0", features = ["test-support"] }
-rawmakase-decode = { path = "crates/rawmakase-decode", version = "0.1.0", default-features = false, features = ["test-support"] }
+rawmakase-decode = { path = "crates/rawmakase-decode", version = "0.1.0", features = ["test-support"] }
 rawmakase-engine = { path = "crates/rawmakase-engine", version = "0.1.0", features = ["test-support"] }
 rawmakase-export = { path = "crates/rawmakase-export", version = "0.1.0", features = ["test-support"] }
 rawmakase-interop = { path = "crates/rawmakase-interop", version = "0.1.0", features = ["test-support"] }
 rawmakase-model = { path = "crates/rawmakase-model", version = "0.1.0", features = ["test-support"] }
 # Tests set up and inspect catalog files directly; the app itself reaches
 # the catalog's database only through rawmakase-catalog.
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+# The sync tests write a compressed catalog edit; the private RAW fixture
+# test reads the ICC profile tag of an exported TIFF.
+flate2.workspace = true
+tiff.workspace = true
 
 # The icon and version information Windows shows for the executable.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
-# Lints beyond the defaults. CI denies warnings, so each one listed here holds
-# at zero. More join as the refactor in issue #216 clears them: unreachable_pub
-# with the narrowing of `pub` (184 today), struct_excessive_bools with the
-# state structs (10).
-[lints.clippy]
-fn_params_excessive_bools = "warn"
-large_enum_variant = "warn"
-redundant_clone = "warn"
+[lints]
+workspace = true
 
 # crmne's egui and winit forks, which fastframe's apps build against: fixes
 # waiting for upstream releases (fastframe's getting started guide, "egui and
 # winit forks"), among them file drops on Wayland. Move egui and winit
 # together, to the revisions that guide lists.
 [patch.crates-io]
-ecolor = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-eframe = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-egui = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-egui-wgpu = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-egui-winit = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-egui_extras = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-egui_glow = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-emath = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-epaint = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
-epaint_default_fonts = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+ecolor = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+eframe = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+egui = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+egui-wgpu = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+egui-winit = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+egui_extras = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+egui_glow = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+emath = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+epaint = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
+epaint_default_fonts = { git = "https://github.com/pch/egui", rev = "25a61b8d60e71b40b896a1e1ace3c9254e59d7d4" }
 winit = { git = "https://github.com/crmne/winit", rev = "ed7caa9023f10b397f5b6ec8284a840cbd8a6f65" }
 
 [profile.release]

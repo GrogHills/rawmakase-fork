@@ -1,7 +1,7 @@
 //! The journal of file operations: the `file_operations` and
 //! `file_operation_members` rows, written and read only here. Each disk step
 //! is journalled before the next one starts, so whatever a crash leaves is
-//! decided by [`super::recover`] from the journal and the disk, never
+//! decided by [`super::recover`](fn@super::recover) from the journal and the disk, never
 //! guessed.
 use super::super::PhotoId;
 use super::super::db::{Reads, Write, sql};
@@ -10,8 +10,8 @@ use super::folder::FolderState;
 use super::preconditions::Preconditions;
 use super::tree::TreeState;
 use super::tree_trash::TrashTreeState;
+use crate::fsops::{ContentHash, FileId};
 use crate::storage::Identity;
-use crate::storage::fsops::{ContentHash, FileId};
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
@@ -172,7 +172,7 @@ pub(super) struct CopyRecord {
 impl Member {
     /// Where the member is once its step is done: its destination, or where
     /// the Trash put it.
-    pub fn after(&self) -> Option<&Path> {
+    pub(super) fn after(&self) -> Option<&Path> {
         self.destination.as_deref().or(self.receipt.as_deref())
     }
 }
@@ -205,12 +205,12 @@ pub(super) struct Item {
 
 impl Item {
     /// Whether it copies its files to another volume.
-    pub fn copies(&self) -> bool {
+    pub(super) fn copies(&self) -> bool {
         self.members.iter().any(|m| m.copy.is_some())
     }
     /// The catalog photos it concerns: none for a folder it makes, those
     /// in the subtree of one it renames.
-    pub fn photos(&self) -> &[PhotoId] {
+    pub(super) fn photos(&self) -> &[PhotoId] {
         match &self.subject {
             Subject::Photos(pre) => &pre.rows,
             Subject::Folder(_) => &[],

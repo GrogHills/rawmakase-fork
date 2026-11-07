@@ -4,14 +4,17 @@
 //! development reads.
 use super::{Cfa, Header, Sensor};
 use anyhow::{Result, ensure};
+use rawmakase_cancel::Cancel;
 use rawmakase_raw::RawInfo;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A developed image: width, height and pixels.
 pub(super) type Developed = (u32, u32, Vec<[f32; 3]>);
 
+/// [`Own::bayer_red`]'s answer for an X-Trans mosaic, which AI Denoise takes another way
+/// (`Raw::packed_bayer`).
+pub(super) const XTRANS: &str = "X-Trans";
 pub(super) struct Own {
     bytes: Arc<[u8]>,
     info: RawInfo,
@@ -24,13 +27,20 @@ impl Own {
         let header = header(&info);
         Ok((Self { bytes, info }, header))
     }
+    /// The colour space the maker notes give the camera's JPEGs.
+    pub(super) fn preview_space(&self) -> Option<super::MakerPreviewSpace> {
+        self.info.preview_space.map(|s| match s {
+            rawmakase_raw::PreviewSpace::Srgb => super::MakerPreviewSpace::Srgb,
+            rawmakase_raw::PreviewSpace::AdobeRgb => super::MakerPreviewSpace::AdobeRgb,
+        })
+    }
     pub(super) fn thumbnail(&self) -> Result<Vec<u8>> {
         Ok(rawmakase_raw::preview(&self.info, &self.bytes)?.to_vec())
     }
     pub(super) fn thumbnail_reaching(&self, edge: u32) -> Result<Vec<u8>> {
         Ok(rawmakase_raw::preview_reaching(&self.info, &self.bytes, edge)?.to_vec())
     }
-    fn decode(&self, cancel: &AtomicBool) -> Result<rawmakase_raw::Sensor> {
+    fn decode(&self, cancel: Cancel<'_>) -> Result<rawmakase_raw::Sensor> {
         let s = rawmakase_raw::decode(&self.info, &self.bytes, cancel)?;
         let [left, top, w, h] = s.area;
         ensure!(
@@ -48,7 +58,7 @@ impl Own {
     /// The sensor data as fingerprints describe it.
     pub(super) fn sensor(&self) -> Result<Sensor> {
         use sha2::Digest;
-        let s = self.decode(&AtomicBool::new(false))?;
+        let s = self.decode(Cancel::NEVER)?;
         let channels = s.channels as usize;
         let [left, top, w, h] = s.area.map(|v| v as usize);
         let pitch = s.width as usize * channels;
@@ -83,7 +93,7 @@ impl Own {
     /// balanced by `wb` unless the camera stored it balanced. A monochrome
     /// DNG's one sample is every channel's, not white balanced. `None` for a
     /// mosaic.
-    pub(super) fn rgb(&self, wb: [f32; 3], cancel: &AtomicBool) -> Result<Option<Developed>> {
+    pub(super) fn rgb(&self, wb: [f32; 3], cancel: Cancel<'_>) -> Result<Option<Developed>> {
         if self.info.cfa.is_some() {
             return Ok(None);
         }
@@ -96,7 +106,12 @@ impl Own {
             );
             let [_, _, w, h] = s.area;
             let grey = visible(&s, |_, _| 0);
-            return Ok(Some((w, h, grey.into_iter().map(|v| [v; 3]).collect())));
+            // Nothing interpolates a monochrome sample, so it is clipped here.
+            return Ok(Some((
+                w,
+                h,
+                grey.into_iter().map(|v| [v.max(0.); 3]).collect(),
+            )));
         }
         ensure!(
             s.channels >= 3,
@@ -113,9 +128,51 @@ impl Own {
         let pixels = super::develop_rgb(&rows, s.channels as usize, s.black, s.white, wb);
         Ok(Some((w as u32, h as u32, pixels)))
     }
+    /// Where red sits in the visible mosaic's 2 × 2 period (`[x, y]`), when AI Denoise's
+    /// model can take it: a Bayer mosaic of red, two greens and blue, not turned. The
+    /// reason otherwise, for the user.
+    pub(super) fn bayer_red(&self) -> Result<[usize; 2], &'static str> {
+        if self.info.monochrome {
+            return Err("AI Denoise needs a colour sensor; this one is monochrome.");
+        }
+        let Some(cfa) = &self.info.cfa else {
+            return Err(
+                "AI Denoise works on the camera's mosaic; this file stores demosaiced RGB.",
+            );
+        };
+        if cfa.is_xtrans() {
+            return Err(XTRANS);
+        }
+        if self.info.super_ccd.is_some() {
+            return Err("AI Denoise does not support Super CCD sensors.");
+        }
+        let colour = |y: usize, x: usize| match cfa.color(y, x) {
+            3 => 1,
+            c => c,
+        };
+        let bayer = (0..cfa.rows.max(2))
+            .all(|y| (0..cfa.cols.max(2)).all(|x| colour(y, x) == colour(y % 2, x % 2)));
+        let count = |c: u8| {
+            (0..2)
+                .flat_map(|y| (0..2).map(move |x| (y, x)))
+                .filter(|&(y, x)| colour(y, x) == c)
+                .count()
+        };
+        if !bayer || count(0) != 1 || count(1) != 2 || count(2) != 1 {
+            return Err("AI Denoise supports Bayer sensors only; this mosaic is not one.");
+        }
+        let (y, x) = (0..2)
+            .flat_map(|y| (0..2).map(move |x| (y, x)))
+            .find(|&(y, x)| colour(y, x) == 0)
+            .unwrap_or_default();
+        if colour(1 - y, 1 - x) != 2 {
+            return Err("AI Denoise supports Bayer sensors only; this mosaic is not one.");
+        }
+        Ok([x, y])
+    }
     /// The visible mosaic as development reads it: (raw − black) / (white −
     /// black), not white balanced; `None` when the file is not a mosaic.
-    pub(super) fn cfa(&self, cancel: &AtomicBool) -> Result<Option<Cfa>> {
+    pub(super) fn cfa(&self, cancel: Cancel<'_>) -> Result<Option<Cfa>> {
         let Some(cfa) = self.info.cfa.clone() else {
             return Ok(None);
         };
@@ -146,7 +203,8 @@ impl Own {
 }
 
 /// The visible area of one-sample sensor data `s` as development reads it:
-/// (raw − black) / (white − black), at least 0, each sample's black that of
+/// (raw − black) / (white − black), negative below black (noise is clipped only
+/// after demosaicing, where interpolated samples carry less of it), each sample's black that of
 /// channel `channel(y, x)` plus its position's in the black pattern.
 fn visible(s: &rawmakase_raw::Sensor, channel: impl Fn(usize, usize) -> usize) -> Vec<f32> {
     let [left, top, w, h] = s.area.map(|v| v as usize);
@@ -168,7 +226,7 @@ fn visible(s: &rawmakase_raw::Sensor, channel: impl Fn(usize, usize) -> usize) -
         for (x, (dst, &v)) in data[y * w..(y + 1) * w].iter_mut().zip(src).enumerate() {
             let mut black = s.black[channel(y, x)] as f32;
             black += pattern_black(y, x) as f32;
-            *dst = ((f32::from(v) - black) / (white - black).max(1.)).max(0.);
+            *dst = (f32::from(v) - black) / (white - black).max(1.);
         }
     }
     data
@@ -184,9 +242,9 @@ fn turned(
     cfa: &rawmakase_raw::Cfa,
     data: &[f32],
     [w, h]: [usize; 2],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Cfa> {
-    ensure!(!cancel.load(Ordering::Relaxed), "Development cancelled");
+    ensure!(!cancel.is_cancelled(), "Development cancelled");
     // Super CCD sensors are near square: the longer stored side at most
     // four times the shorter (the dataset's widest is three), so the turned
     // image is at most 2.25 times the stored area. Anything else is not a
@@ -209,7 +267,7 @@ fn turned(
     let mut period = [None; 4];
     for y in 0..h {
         if y % 256 == 0 {
-            ensure!(!cancel.load(Ordering::Relaxed), "Development cancelled");
+            ensure!(!cancel.is_cancelled(), "Development cancelled");
         }
         for x in 0..w {
             if let Some([tx, ty]) = turn.position(y as u32, x as u32) {
@@ -278,6 +336,8 @@ fn header(i: &RawInfo) -> Header {
         make: i.make.clone(),
         model: i.model.clone(),
         normalized: [i.normalized_make.clone(), i.normalized_model.clone()],
+        file_names: [i.file_make.clone(), i.file_model.clone()],
+        sensor_crop: i.sensor_crop,
         // A Super CCD's image is its stored rows turned by 45°.
         width: i.super_ccd.map_or(i.width, |s| s.size()[0]),
         height: i.super_ccd.map_or(i.height, |s| s.size()[1]),
@@ -304,8 +364,11 @@ fn header(i: &RawInfo) -> Header {
         presets,
         matrix: i.rgb_cam,
         cam_xyz: i.cam_xyz,
+        matrix_source: matrix_source(i.matrix_source),
+        camera_look: i.camera_look.clone(),
         lens: i.lens.clone(),
         lens_id: i.lens_id,
+        lens_info: i.lens_info,
         dng_version: i.dng_version,
         levels: i.levels,
         analog_balance: i.analog_balance,
@@ -313,8 +376,24 @@ fn header(i: &RawInfo) -> Header {
     }
 }
 
+/// The decoders' matrix provenance as the model names it.
+fn matrix_source(s: rawmakase_raw::MatrixSource) -> rawmakase_model::camera_data::MatrixSource {
+    use rawmakase_model::camera_data::MatrixSource as M;
+    use rawmakase_raw::MatrixSource as R;
+    match s {
+        R::Absent => M::Absent,
+        R::AdobeDng => M::AdobeDng,
+        R::CompatObserved => M::CompatObserved,
+        R::File => M::File,
+        R::FileTungstenOnly => M::FileTungstenOnly,
+        R::MakerNote => M::MakerNote,
+        R::Neutral => M::Neutral,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use rawmakase_cancel::Cancel;
     use std::sync::atomic::AtomicBool;
 
     /// A tall Super CCD's 2 × 4 stored samples develop as a 4 × 3 diamond:
@@ -331,7 +410,7 @@ mod tests {
             colors: vec![0, 2, 1, 3, 2, 0, 3, 1],
         };
         let data: Vec<f32> = (1..=8).map(|v| v as f32 / 10.).collect();
-        let out = super::turned(turn, &cfa, &data, [2, 4], &AtomicBool::new(false)).unwrap();
+        let out = super::turned(turn, &cfa, &data, [2, 4], Cancel::NEVER).unwrap();
         assert_eq!([out.width, out.height], [4, 3]);
         // Row 0 runs up and right from (0, 1); row 1 one column on.
         let at = |x: usize, y: usize| out.data[y * 4 + x];
@@ -345,7 +424,7 @@ mod tests {
         period.sort();
         assert_eq!(period, [0, 1, 1, 2]);
         let cancelled = AtomicBool::new(true);
-        assert!(super::turned(turn, &cfa, &data, [2, 4], &cancelled).is_err());
+        assert!(super::turned(turn, &cfa, &data, [2, 4], Cancel::new(&cancelled)).is_err());
     }
 
     /// A RAF of the older layout: header, the records, then `data`.
@@ -470,7 +549,7 @@ mod tests {
         assert!(raw.metadata.xtrans);
         let wb = raw.metadata.wb;
         let own = &raw.own;
-        let mut cfa = own.cfa(&AtomicBool::new(false)).unwrap().unwrap();
+        let mut cfa = own.cfa(Cancel::NEVER).unwrap().unwrap();
         let n = crate::demosaic::PATTERN;
         for (i, v) in cfa.data.iter_mut().enumerate() {
             let (x, y) = (i % w as usize, i / w as usize);
@@ -485,11 +564,11 @@ mod tests {
         });
         let cancel = AtomicBool::new(false);
         let full = open()
-            .develop(Decode::Full(Demosaic::Rawmakase), &cancel)
+            .develop(Decode::Full(Demosaic::Rawmakase), Cancel::new(&cancel))
             .unwrap();
         assert_eq!([full.width, full.height], [w, h]);
         assert!(full.pixels == expected, "the full size is not X-Trans's");
-        let half = open().develop(Decode::Half, &cancel).unwrap();
+        let half = open().develop(Decode::Half, Cancel::new(&cancel)).unwrap();
         assert_eq!([half.width, half.height], [w / 2, h / 2]);
         for (k, got) in half.pixels.iter().enumerate() {
             let (i, j) = (k % (w as usize / 2), k / (w as usize / 2));
@@ -525,7 +604,7 @@ mod tests {
         assert_eq!([raw.metadata.width, raw.metadata.height], [32770, 32769]);
         let developed = raw.develop(
             crate::camera_data::Decode::Full(crate::camera_data::Demosaic::Rawmakase),
-            &AtomicBool::new(false),
+            Cancel::NEVER,
         );
         let error = format!("{:#}", developed.err().unwrap());
         assert!(error.contains("impossible shape"), "{error}");

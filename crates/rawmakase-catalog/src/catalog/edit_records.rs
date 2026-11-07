@@ -162,6 +162,7 @@ mod tests {
         c.save_edit(
             a.0,
             &a.1,
+            &crate::storage::Identity::read(&a.1)?,
             &saved,
             &export,
             super::super::HistoryUpdate::Keep,
@@ -198,6 +199,133 @@ mod tests {
         Ok(())
     }
 
+    /// A source chosen once ([`crate::edits::Start`]) and resolved later gives what
+    /// [`resolve`] gives; the sources only previews and Develop use keep their own
+    /// rules.
+    #[test]
+    fn a_captured_start_resolves_as_resolve_does() -> Result<()> {
+        use crate::edits::Start;
+        use std::sync::Arc;
+        let (_d, mut c, photos) = catalog()?;
+        let metadata = chart_metadata();
+        let (profiles, _) = crate::camera_profiles::installed(&metadata);
+        let defaults = Arc::new(crate::raw_defaults::brighter_defaults());
+        let (a, b, unedited) = (&photos[0], &photos[1], &photos[2]);
+        let mut saved = Recipe::with_profiles(&metadata, &profiles);
+        saved.exposure = 0.4;
+        c.save_edit(
+            a.0,
+            &a.1,
+            &crate::storage::Identity::read(&a.1)?,
+            &saved,
+            &ExportOptions::default(),
+            super::super::HistoryUpdate::Keep,
+        )?;
+        set_lightroom(&c, b.0, "s = { Exposure2012 = 0.25 }")?;
+        set_lightroom(&c, unedited.0, "")?;
+        for (photo, origin) in [
+            (a, Origin::Saved),
+            (b, Origin::Lightroom),
+            (unedited, Origin::Defaults),
+        ] {
+            let record = c.edit_record(photo.0)?;
+            let start = Start::capture(&record, &photo.1, defaults.clone())?;
+            let later = start.resolve(&metadata, &profiles)?;
+            let now = resolve(&record, &photo.1, &metadata, &profiles, &defaults)?;
+            assert_eq!(
+                (
+                    later.origin,
+                    &later.recipe,
+                    later.export.quality,
+                    &later.warnings
+                ),
+                (origin, &now.recipe, now.export.quality, &now.warnings)
+            );
+        }
+        // An unreadable Lightroom edit is an error either way; only `resolve` says
+        // whose it is.
+        set_lightroom(&c, b.0, "not Lightroom")?;
+        let record = c.edit_record(b.0)?;
+        let later = Start::capture(&record, &b.1, defaults.clone())?
+            .resolve(&metadata, &profiles)
+            .unwrap_err();
+        let now = resolve(&record, &b.1, &metadata, &profiles, &defaults).unwrap_err();
+        assert!(!format!("{later:#}").contains("Its Lightroom edit can't be read"));
+        assert!(format!("{now:#}").starts_with("Its Lightroom edit can't be read"));
+        // A preview's recipe is read as it is, not validated, and Adobe Default
+        // ignores the defaults.
+        let mut out_of_bounds = saved.clone();
+        out_of_bounds.exposure = 99.;
+        assert!(out_of_bounds.validate().is_err());
+        let json = serde_json::to_string(&out_of_bounds)?;
+        assert_eq!(
+            Start::RecipeJson(json)
+                .resolve(&metadata, &profiles)?
+                .recipe,
+            out_of_bounds
+        );
+        let adobe = Start::AdobeDefault.resolve(&metadata, &profiles)?;
+        assert_eq!(
+            (adobe.origin, adobe.recipe),
+            (
+                Origin::Defaults,
+                Recipe::with_profiles(&metadata, &profiles)
+            )
+        );
+        Ok(())
+    }
+
+    /// Issue #870: a file whose modification time alone changed, as a cloud
+    /// mount or `touch` can leave it, keeps its edit and takes saves; one whose
+    /// bytes changed stays protected.
+    #[test]
+    fn a_new_modification_time_alone_keeps_the_edit_and_its_saves() -> Result<()> {
+        use crate::storage::Identity;
+        let (_d, mut c, photos) = catalog()?;
+        let (id, path) = &photos[0];
+        let opened = Identity::read(path)?;
+        let mut edit = Recipe {
+            exposure: 0.1,
+            ..Default::default()
+        };
+        let save = |c: &mut Catalog, source: &Identity, edit: &Recipe| {
+            c.save_edit(
+                *id,
+                path,
+                source,
+                edit,
+                &ExportOptions::default(),
+                super::super::HistoryUpdate::Keep,
+            )
+        };
+        save(&mut c, &opened, &edit)?;
+
+        let file = std::fs::File::options().write(true).open(path)?;
+        let modified = file.metadata()?.modified()?;
+        file.set_modified(modified + std::time::Duration::from_secs(2))?;
+        drop(file);
+        let touched = Identity::read(path)?;
+        assert_ne!(touched, opened);
+        assert_eq!(c.load_edit(*id, path)?.unwrap().recipe, edit);
+        // The editor still holds the identity read when the photo was opened.
+        edit.exposure = 0.2;
+        save(&mut c, &opened, &edit)?;
+        assert_eq!(c.load_edit(*id, path)?.unwrap().recipe, edit);
+        // The saved edit now names the file as it is.
+        let stored: Identity = serde_json::from_str(&c.edit_record(*id)?.identity.expect("saved"))?;
+        assert_eq!(stored, touched);
+
+        // Same size, other bytes: another photo, never given this edit.
+        let mut bytes = std::fs::read(path)?;
+        bytes[16] ^= 0xff;
+        std::fs::write(path, bytes)?;
+        let error = format!("{:#}", c.load_edit(*id, path).unwrap_err());
+        assert!(error.contains("protected"), "{error}");
+        assert!(save(&mut c, &opened, &edit).is_err());
+        assert!(save(&mut c, &Identity::read(path)?, &edit).is_err());
+        Ok(())
+    }
+
     #[test]
     fn an_edit_that_cant_be_used_is_an_error_never_the_defaults() -> Result<()> {
         let (_d, mut c, photos) = catalog()?;
@@ -215,6 +343,7 @@ mod tests {
         c.save_edit(
             changed.0,
             &changed.1,
+            &crate::storage::Identity::read(&changed.1)?,
             &edit,
             &ExportOptions::default(),
             super::super::HistoryUpdate::Keep,
@@ -229,6 +358,7 @@ mod tests {
         c.save_edit(
             unreadable.0,
             &unreadable.1,
+            &crate::storage::Identity::read(&unreadable.1)?,
             &edit,
             &ExportOptions::default(),
             super::super::HistoryUpdate::Keep,

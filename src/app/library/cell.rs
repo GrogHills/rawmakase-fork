@@ -1,5 +1,5 @@
-use crate::app::design::{Tone, radius, text};
-use crate::app::theme;
+use crate::app::ui::design::{Tone, radius, text};
+use crate::app::ui::theme;
 use crate::catalog::Photo;
 use eframe::egui::{self, Color32, Vec2};
 
@@ -77,7 +77,7 @@ pub(super) fn photo_cell(
         stacks,
     } = shown;
     let stack = photo.stack.filter(|_| stacks);
-    use crate::app::photo_metadata::label_color;
+    use crate::app::library::photo_metadata::label_color;
     use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind};
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, style.height(width)), Sense::hover());
     let extras = style != Style::Plain;
@@ -279,7 +279,7 @@ fn footer_badges(
     photo: &Photo,
     badges: Badges,
 ) {
-    use crate::app::photo_metadata::flag_icon;
+    use crate::app::library::photo_metadata::flag_icon;
     use egui::{Align2, FontId, Pos2, Rect};
     let Badges {
         quick,
@@ -421,7 +421,7 @@ pub(in crate::app) enum PhotoAction {
     CopyPath,
     /// Find on Disk…: pick the file of an offline photo.
     FindOnDisk,
-    Edit(crate::app::photo_metadata::Edit),
+    Edit(crate::app::library::photo_metadata::Edit),
     Copy(super::CopyAction),
     /// Read Metadata from Files.
     ReadMetadata,
@@ -433,6 +433,8 @@ pub(in crate::app) enum PhotoAction {
     Rename,
     /// Move to Folder…: the photo's files to another catalog folder.
     MoveToFolder,
+    /// Export as Catalog…: the photos into a new catalog of their own.
+    ExportCatalog,
     /// Library › Previews: Build Standard-Sized Previews.
     BuildPreviews(crate::catalog::preview_cache::PreviewKind),
     /// Library › Previews: Discard 1:1 Previews, or Standard and 1:1.
@@ -480,7 +482,7 @@ fn stacking_menu(
     module: super::Module,
 ) -> Option<super::StackAction> {
     use super::StackAction as A;
-    use crate::app::widgets::{menu_item, menu_separator};
+    use crate::app::ui::widgets::{menu_item, menu_separator};
     let stacked = photo.stack.is_some();
     let (top, last) = photo
         .stack
@@ -538,17 +540,17 @@ pub(in crate::app) fn photo_menu(
     module: super::Module,
     stacks: bool,
 ) -> Option<PhotoAction> {
-    use crate::app::photo_metadata::{Edit, LABELS};
-    use crate::app::widgets::{menu_item, menu_separator, submenu_style};
+    use crate::app::library::photo_metadata::{Edit, LABELS};
+    use crate::app::ui::widgets::{menu_item, menu_separator, submenu_style};
     let mut action = None;
     // Why Develop can't open the photo reads its file: once each time the menu opens.
     let key = response.id.with(("develop-refusal", photo.id, available));
-    if crate::app::widgets::context_clicked(response) {
+    if crate::app::ui::widgets::context_clicked(response) {
         response
             .ctx
             .data_mut(|d| d.remove::<Option<super::Refusal>>(key));
     }
-    crate::app::widgets::context_menu(response, |ui| {
+    crate::app::ui::widgets::context_menu(response, |ui| {
         ui.set_width(210.);
         ui.spacing_mut().item_spacing.y = 0.;
         let refusal = ui.ctx().data_mut(|d| {
@@ -638,6 +640,10 @@ pub(in crate::app) fn photo_menu(
             action = Some(PhotoAction::MoveToFolder);
             ui.close();
         }
+        if menu_item(ui, "Export as Catalog…", "", true, false) {
+            action = Some(PhotoAction::ExportCatalog);
+            ui.close();
+        }
         if menu_item(ui, "Remove from Catalog…", REMOVE_SHORTCUT, true, false) {
             action = Some(PhotoAction::Remove);
             ui.close();
@@ -724,7 +730,9 @@ pub(in crate::app) fn photo_menu(
                     action = Some(PhotoAction::Edit(Edit::Label(label.into())));
                     ui.close();
                 }
-                if let Some(color) = crate::app::photo_metadata::label_color(&palette, label) {
+                if let Some(color) =
+                    crate::app::library::photo_metadata::label_color(&palette, label)
+                {
                     let chip = egui::Rect::from_center_size(
                         before + Vec2::new(ui.available_width() - 60., 12.),
                         Vec2::splat(9.),

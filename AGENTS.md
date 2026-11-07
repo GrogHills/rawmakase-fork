@@ -33,6 +33,19 @@ capabilities before falling back to GitHub connectors or browser automation.
 - Handle save failures before navigation or termination becomes irreversible.
   A pending save is not a successful save.
 
+## Comments
+
+- Keep what the code can't say: reasons, contracts, units, colour spaces,
+  `SAFETY` notes and measured Camera Raw facts.
+- Delete comments that only restate a name or a type.
+- Rewrite terse, clause-packed comments as plain, full sentences, but only in
+  files you are already changing for other work; don't open a file just to
+  reword its comments.
+- Prefer intra-doc links (``[`Recipe::validate`]``) to plain backticked names,
+  so a rename shows up as a broken link when the docs are built.
+- There is no target for how many comments a file has, and no blanket removal:
+  judge each comment on what it tells the reader.
+
 ## Tests
 
 - Before running dataset rendering or Camera Raw parity checks, read
@@ -146,14 +159,23 @@ capabilities before falling back to GitHub connectors or browser automation.
 
 ## Before every push
 
-Run the checks CI runs (`.github/workflows/ci.yml`) and push only when they
-pass. Use the current stable Rust, as CI does; newer clippy releases add lints.
+Run `make check` and push only when it passes. It runs every check CI runs
+(`.github/workflows/ci.yml`) that can run on this machine: dependency and crate
+closure checks, the Python calibration tests, formatting, clippy, every
+crate's tests and the MSRV build. The Makefile lists what only CI covers (the
+other platforms, the Arch package, Postgres). Use the current stable Rust, as
+CI does; newer clippy releases add lints. Where rustup's `cargo +toolchain`
+proxy doesn't work, set `MSRV_BIN` to the MSRV toolchain's `bin` folder.
 
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-```
+`make check` needs a lot of disk: `target/` grows past 17 GB (debug info, the
+MSRV build beside the stable one, and Cargo's incremental caches). On a machine
+with a fixed disk allowance, such as a cloud session, it often fails partway
+with "No space left on device". That is the disk, not the code. Free space with
+`rm -rf target/debug/incremental target/release/incremental` (derived data;
+deleting works on a full disk), then run it again as
+`CARGO_INCREMENTAL=0 make check`, which leaves those caches out and still builds
+and tests the same code. Start with `CARGO_INCREMENTAL=0` on such machines.
+Delete all of `target/` only if that is not enough: everything then rebuilds.
 
 A `v*` tag builds and publishes a release, so the same applies before tagging.
 

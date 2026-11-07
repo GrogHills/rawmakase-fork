@@ -1,9 +1,9 @@
 //! The Library's right panel: Quick Develop and the selected photo's metadata.
 use super::rows::{ROW, caption_at, paint_truncated, value_at};
 use super::{Action, Library};
-use crate::app::design::{Tone, space};
-use crate::app::theme;
-use crate::app::widgets::section;
+use crate::app::ui::design::{Tone, space};
+use crate::app::ui::theme;
+use crate::app::ui::widgets::section;
 use crate::catalog::{Photo, PhotoId};
 use crate::metadata::PhotoInfo;
 use eframe::egui::{self, Vec2};
@@ -25,7 +25,7 @@ impl Library {
             .id_salt("library-info")
             .auto_shrink(false)
             .show(ui, |ui| {
-                section(ui, "Quick Develop", false, |ui| {
+                section(ui, "Quick Develop", |ui| {
                     let refusal = photo.as_ref().and_then(|p| self.shown_refusal(p));
                     let open = ui
                         .add_enabled(
@@ -63,7 +63,7 @@ impl Library {
                     quick(ui);
                     ui.add_space(space::XS);
                 });
-                section(ui, "Metadata", false, |ui| {
+                section(ui, "Metadata", |ui| {
                     match &photo {
                         Some(p) => {
                             // In Loupe and Compare, as for their keys, only the
@@ -92,7 +92,9 @@ impl Library {
                         Some(p) => match self.copy_names.row(ui, p, &mut self.session) {
                             Ok(true) => self.filter(),
                             Ok(false) => {}
-                            Err(e) => self.message = format!("Copy name could not be saved: {e}"),
+                            Err(e) => self
+                                .messages
+                                .fail(format!("Copy name could not be saved: {e}")),
                         },
                         None => {
                             metadata_row(ui, "Copy Name", "");
@@ -126,7 +128,7 @@ impl Library {
                         }
                     }
                 });
-                section(ui, "Keywording", false, |ui| {
+                section(ui, "Keywording", |ui| {
                     self.keyword_fields(ui);
                 });
             });
@@ -141,7 +143,8 @@ impl Library {
         whole_selection: bool,
     ) -> bool {
         if let Some(photo) = self.photo(id).cloned()
-            && let Some(edit) = crate::app::photo_metadata::controls(ui, &photo, &self.labels())
+            && let Some(edit) =
+                crate::app::library::photo_metadata::controls(ui, &photo, &self.labels())
         {
             let ids = if whole_selection && self.selection.selected.contains(&id) {
                 self.selected_ids()
@@ -156,7 +159,8 @@ impl Library {
                 self.edit_photos(&ids, edit, false).map(|_| ())
             };
             if let Err(e) = done {
-                self.message = format!("Metadata could not be saved: {e}");
+                self.messages
+                    .fail(format!("Metadata could not be saved: {e}"));
             }
             return true;
         }

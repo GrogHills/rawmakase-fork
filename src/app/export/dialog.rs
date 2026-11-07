@@ -1,10 +1,11 @@
 //! Lightroom's Export dialog, and the question it asks when the file exists.
-use super::super::widgets::{confirm_modal, form_row, modal_frame, pretty_path, primary_button};
 use super::{Editor, Status};
-use crate::app::design::{Tone, button, radius, size, space, text};
-use crate::app::naming::menu::Choice;
-use crate::app::naming::presets::Preset;
-use crate::app::theme;
+use crate::app::export::naming::menu::Choice;
+use crate::app::export::naming::presets::Preset;
+use crate::app::ui::design::{Tone, button, radius, size, space, text};
+use crate::app::ui::theme;
+use crate::app::ui::widgets::{confirm_modal, form_row, modal_frame, pretty_path, primary_button};
+use crate::color::OutputSpace;
 use crate::export_settings::{AfterExport, Destination, Existing, Format, Include, NameContext};
 use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
 use std::{path::Path, sync::atomic::Ordering};
@@ -40,7 +41,6 @@ impl Editor {
         self.watermark_editor(ctx);
         self.name_editor_window(ctx);
         self.export_waiting(ctx);
-        self.export_report(ctx);
     }
 
     fn export_dialog(&mut self, ctx: &egui::Context) {
@@ -113,7 +113,7 @@ impl Editor {
                         .join(", ");
                     let line = format!(
                         "{} won't be exported: {reasons}",
-                        crate::app::widgets::plural(left_out.len(), "photo", "photos")
+                        crate::app::ui::widgets::plural(left_out.len(), "photo", "photos")
                     );
                     let at = egui::Rect::from_min_size(
                         rect.left_top() + Vec2::new(200., 16.),
@@ -208,7 +208,10 @@ impl Editor {
             // Return too waits for the names' files.
             Some(true) if reading => {}
             Some(true) if self.exports.draft.target(&source).is_none() => {
-                self.status = "Choose a folder to export to".into();
+                self.messages.warn("Choose a folder to export to");
+            }
+            Some(true) if let Err(e) = self.exports.draft.check_output() => {
+                self.messages.warn(e.to_string());
             }
             Some(true) => {
                 self.exports.dialog = false;
@@ -279,19 +282,23 @@ impl Editor {
         let naming = s.naming();
         let custom = s.custom_tokens().map(str::to_string);
         let mut edit_names = false;
-        form_row(ui, "Rename To", |ui| match crate::app::naming::menu::combo(
+        form_row(
             ui,
-            "export-naming",
-            220.,
-            naming,
-            custom.as_deref(),
-            &self.exports.saved,
-        ) {
-            Some(Choice::Preset(n)) => s.choose_naming(n),
-            Some(Choice::Tokens(tokens)) => s.choose_tokens(&tokens),
-            Some(Choice::Edit) => edit_names = true,
-            None => {}
-        });
+            "Rename To",
+            |ui| match crate::app::export::naming::menu::combo(
+                ui,
+                "export-naming",
+                220.,
+                naming,
+                custom.as_deref(),
+                &self.exports.saved,
+            ) {
+                Some(Choice::Preset(n)) => s.choose_naming(n),
+                Some(Choice::Tokens(tokens)) => s.choose_tokens(&tokens),
+                Some(Choice::Edit) => edit_names = true,
+                None => {}
+            },
+        );
         let template = s.name_template();
         form_row(ui, "Custom Text", |ui| {
             ui.add_enabled(
@@ -374,18 +381,70 @@ impl Editor {
                 ui.add(egui::Slider::new(&mut s.quality, 1..=100));
             }),
             Format::Tiff => form_row(ui, "Bit Depth", |ui| {
-                ui.label(
-                    egui::RichText::new("16 bits/component, uncompressed")
-                        .color(palette.tone(Tone::TEXT)),
-                );
+                let linear = s
+                    .hdr
+                    .is_some_and(|h| h.transfer == crate::color::hdr_output::HdrTransfer::Linear);
+                let depth = if linear {
+                    "32-bit float for HDR edits, 16 bits/component otherwise"
+                } else {
+                    "16 bits/component, uncompressed"
+                };
+                ui.label(egui::RichText::new(depth).color(palette.tone(Tone::TEXT)));
             }),
             Format::Png => form_row(ui, "Bit Depth", |ui| {
                 ui.label(egui::RichText::new("8 bits/component").color(palette.tone(Tone::TEXT)));
             }),
+            Format::Jxl => form_row(ui, "Compression", |ui| {
+                ui.label(
+                    egui::RichText::new("Lossless; 8 bits/component, 16 for HDR")
+                        .color(palette.tone(Tone::TEXT)),
+                );
+            }),
         }
         form_row(ui, "Color Space", |ui| {
-            ui.label(egui::RichText::new("sRGB").color(palette.tone(Tone::TEXT)));
+            let later = s.later_color_space().is_some();
+            let shown = if later {
+                "Not available in this version"
+            } else {
+                s.color_space.label()
+            };
+            egui::ComboBox::from_id_salt("export-color-space")
+                .width(220.)
+                .selected_text(shown)
+                .show_ui(ui, |ui| {
+                    for space in OutputSpace::ALL {
+                        let supported = s.format.supports(space);
+                        let item = ui
+                            .add_enabled(
+                                supported.is_ok(),
+                                egui::Button::selectable(
+                                    !later && s.color_space == space,
+                                    space.label(),
+                                ),
+                            )
+                            .on_disabled_hover_text(
+                                supported.err().map(|e| e.to_string()).unwrap_or_default(),
+                            );
+                        if item.clicked() {
+                            s.choose_color_space(space);
+                        }
+                    }
+                });
         });
+        if s.format.holds_hdr() {
+            hdr_rows(ui, s);
+        }
+        // Why the choice can't be exported as it is: ProPhoto RGB in JPEG or PNG,
+        // or a space from a later release.
+        if let Err(e) = s.check_output() {
+            form_row(ui, "", |ui| {
+                ui.label(
+                    egui::RichText::new(e.to_string())
+                        .size(text::LABEL)
+                        .color(Color32::from_rgb(230, 170, 100)),
+                );
+            });
+        }
 
         section(ui, "Image Sizing");
         form_row(ui, "", |ui| {
@@ -589,7 +648,7 @@ impl Editor {
         };
         match choice {
             Some(answer) => self.plan_export(pending, Some(answer)),
-            None => self.status = "Export cancelled".into(),
+            None => self.messages.note("Export cancelled"),
         }
     }
 }
@@ -608,4 +667,96 @@ fn section(ui: &mut egui::Ui, title: &str) {
         egui::FontId::proportional(text::BODY),
         palette.tone(Tone::STRONG),
     );
+}
+
+/// HDR export, for a TIFF: off (SDR, in the colour space above), or the edit's HDR
+/// master in a gamut and transfer. Edits with HDR off are refused when exported
+/// (`export::job::prepare`), so the choice is the user's to make per export.
+fn hdr_rows(ui: &mut egui::Ui, s: &mut crate::export_settings::ExportSettings) {
+    use crate::color::hdr_output::{HdrGamut, HdrOutput, HdrTransfer};
+    // A JPEG holds a gain map over its sRGB base, TIFF and JPEG XL HDR pixels.
+    let jpeg = s.format == Format::Jpeg;
+    form_row(ui, "HDR", |ui| {
+        let mut on = s.hdr.is_some();
+        let (label, tip) = if jpeg {
+            (
+                "Export HDR edits with a gain map",
+                "Writes the SDR rendition with an ISO 21496-1 gain map to the HDR master: \
+                 HDR displays show the master, others the SDR rendition. \
+                 Watermarks are not supported in HDR yet.",
+            )
+        } else {
+            (
+                "Export HDR edits in HDR",
+                "Writes the HDR master of edits with High Dynamic Range on. \
+                 Graphics white is 203 cd/m². Watermarks are not supported in HDR yet.",
+            )
+        };
+        if ui.checkbox(&mut on, label).on_hover_text(tip).changed() {
+            s.choose_hdr(on.then(|| {
+                if jpeg {
+                    HdrOutput {
+                        gamut: HdrGamut::Rec709,
+                        gain_map: true,
+                        ..Default::default()
+                    }
+                } else {
+                    HdrOutput::default()
+                }
+            }));
+        }
+    });
+    let Some(mut output) = s.hdr else {
+        return;
+    };
+    if jpeg {
+        // The gain map's base is sRGB; nothing else to choose.
+        if !output.gain_map || output.gamut != HdrGamut::Rec709 {
+            output.gain_map = true;
+            output.gamut = HdrGamut::Rec709;
+            s.choose_hdr(Some(output));
+        }
+        return;
+    }
+    if s.format == Format::Jxl {
+        form_row(ui, "", |ui| {
+            ui.checkbox(&mut output.gain_map, "As a gain map over the SDR rendition")
+                .on_hover_text(
+                    "An SDR JPEG XL that HDR displays show as the HDR master (ISO 21496-1), \
+                     in place of HDR pixels",
+                );
+        });
+    } else {
+        output.gain_map = false;
+    }
+    if output.gain_map {
+        output.gamut = HdrGamut::Rec709;
+        if s.hdr != Some(output) {
+            s.choose_hdr(Some(output));
+        }
+        return;
+    }
+    form_row(ui, "HDR Gamut", |ui| {
+        egui::ComboBox::from_id_salt("export-hdr-gamut")
+            .width(220.)
+            .selected_text(output.gamut.label())
+            .show_ui(ui, |ui| {
+                for gamut in HdrGamut::ALL {
+                    ui.selectable_value(&mut output.gamut, gamut, gamut.label());
+                }
+            });
+    });
+    form_row(ui, "HDR Encoding", |ui| {
+        egui::ComboBox::from_id_salt("export-hdr-transfer")
+            .width(220.)
+            .selected_text(output.transfer.label())
+            .show_ui(ui, |ui| {
+                for transfer in HdrTransfer::ALL {
+                    ui.selectable_value(&mut output.transfer, transfer, transfer.label());
+                }
+            });
+    });
+    if s.hdr != Some(output) {
+        s.choose_hdr(Some(output));
+    }
 }

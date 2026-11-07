@@ -5,10 +5,8 @@ use super::sampling;
 use super::{Processor, develop::DeviceSamples};
 use crate::{camera_data::CameraImage, develop::stage_cache::SampleKey};
 use anyhow::{Result, ensure};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use rawmakase_cancel::Cancel;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 /// Device samples kept, as the stage cache keeps CPU samples.
@@ -216,7 +214,7 @@ impl Processor {
         mut params: Vec<f32>,
         (width, height): (u32, u32),
         key: SampleKey,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Arc<DeviceSamples>> {
         ensure!(self.fits_resident(image), "Photo exceeds GPU buffer limits");
         let n = width as u64 * height as u64;
@@ -263,13 +261,33 @@ impl Processor {
             ],
         );
         dispatch(&mut encoder, pipeline, &[&group], (gx, gy));
-        ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
+        ensure!(!cancel.is_cancelled(), "Render superseded");
         super::submit(&self.queue, encoder);
         let samples = Arc::new(samples);
         let resident = self.resident();
         resident.samples.insert(0, (key, samples.clone()));
         resident.samples.truncate(SAMPLES);
         Ok(samples)
+    }
+    /// Lets go of `image` and its buffer if the resident path keeps it (current or
+    /// parked): an image about to be replaced (an AI Denoise blend at another Amount)
+    /// need not stay alive while its successor is made.
+    pub(crate) fn forget_resident(&mut self, image: &Arc<CameraImage>) {
+        if let Some(r) = &mut self.resident {
+            if r.photo
+                .as_ref()
+                .is_some_and(|(kept, _)| Arc::ptr_eq(kept, image))
+            {
+                r.photo = None;
+                r.samples.clear();
+            }
+            if r.parked
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(&p.photo.0, image))
+            {
+                r.parked = None;
+            }
+        }
     }
     /// Drops everything kept on the device for the resident path.
     pub(super) fn release_resident(&mut self) {

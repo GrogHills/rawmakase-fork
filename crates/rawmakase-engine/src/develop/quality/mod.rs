@@ -13,18 +13,15 @@ use crate::{
     model::{recipe::Recipe, valid::ValidRecipe},
 };
 use anyhow::{Result, ensure};
+use rawmakase_cancel::Cancel;
 use rayon::prelude::*;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
-fn check_cancel(cancel: &AtomicBool) -> Result<()> {
-    ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
+fn check_cancel(cancel: Cancel<'_>) -> Result<()> {
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     Ok(())
 }
 
-use crate::color::luminance;
 pub fn fit_edge(width: u32, height: u32, viewport: [u32; 2]) -> u32 {
     let scale = (viewport[0].max(1) as f64 / width as f64)
         .min(viewport[1].max(1) as f64 / height as f64)
@@ -57,14 +54,32 @@ impl Output {
     }
 }
 pub fn resize(image: Rendered, max_edge: u32) -> Rendered {
+    let mut out = resize_unbounded(image, max_edge);
+    for p in &mut out.pixels {
+        *p = p.map(|v| v.clamp(0., 1.));
+    }
+    out
+}
+/// [`resize`] without clipping at 1: for an HDR master's encoded values, which its
+/// caller bounds. `image`'s resize clips float samples to 0–1, so values above 1 are
+/// scaled into that range first, with room for Lanczos's overshoot, and back after;
+/// values at most 1 (every SDR render's) are resized as they are.
+pub(crate) fn resize_unbounded(image: Rendered, max_edge: u32) -> Rendered {
     if max_edge == 0 || image.width.max(image.height) <= max_edge {
         return image;
     }
     let (w, h) = output_size(image.width, image.height, max_edge);
+    let top = image.pixels.iter().flatten().copied().fold(0f32, f32::max);
+    let scale = if top > 1. { 2. * top } else { 1. };
     let buffer = image::Rgb32FImage::from_raw(
         image.width,
         image.height,
-        image.pixels.into_iter().flatten().collect(),
+        image
+            .pixels
+            .into_iter()
+            .flatten()
+            .map(|v| if scale == 1. { v } else { v / scale })
+            .collect(),
     )
     .unwrap();
     let buffer = image::imageops::resize(&buffer, w, h, image::imageops::FilterType::Lanczos3);
@@ -76,33 +91,44 @@ pub fn resize(image: Rendered, max_edge: u32) -> Rendered {
             .as_chunks::<3>()
             .0
             .iter()
-            .map(|p| [p[0].clamp(0., 1.), p[1].clamp(0., 1.), p[2].clamp(0., 1.)])
+            .map(|p| {
+                if scale == 1. {
+                    [p[0], p[1], p[2]]
+                } else {
+                    [p[0] * scale, p[1] * scale, p[2] * scale]
+                }
+            })
             .collect(),
     }
 }
 
 mod detail;
+mod hdr;
 mod highlights;
 mod local;
+mod prepare;
 mod render;
 mod samples;
 pub(crate) use detail::*;
+pub use hdr::render_hdr;
 pub use highlights::*;
 pub(crate) use local::*;
+pub(crate) use prepare::{Resolved, resolve};
 pub use render::*;
 pub use samples::*;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     #[test]
     fn cancelled_highlight_recovery_keeps_nothing() {
         let cancel = AtomicBool::new(true);
         let image = fixture();
-        assert!(recover_highlights_cancellable(&image, &cancel).is_err());
+        assert!(recover_highlights(&image, Cancel::new(&cancel)).is_err());
         assert!(image.recovered.get().is_none());
     }
-    fn fixture() -> CameraImage {
+    pub(super) fn fixture() -> CameraImage {
         CameraImage {
             width: 96,
             height: 80,
@@ -122,6 +148,7 @@ mod tests {
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
             recovered: Default::default(),
         }
     }
@@ -139,8 +166,8 @@ mod tests {
         let saved = serde_json::to_vec(&r)?;
         let restored: Recipe = serde_json::from_slice(&saved)?;
         assert_eq!(r, restored);
-        let full = render(&im, &r.checked()?, 0, None)?;
-        let tile = render(&im, &r.checked()?, 0, Some([30, 25, 40, 40]))?;
+        let full = render(&im, &r.checked()?, 0, None, Cancel::NEVER)?;
+        let tile = render(&im, &r.checked()?, 0, Some([30, 25, 40, 40]), Cancel::NEVER)?;
         for y in 0..40 {
             for x in 0..40 {
                 let a = tile.pixels[y * 40 + x];
@@ -150,10 +177,13 @@ mod tests {
                 }
             }
         }
-        assert_eq!(full.pixels, render(&im, &r.checked()?, 0, None)?.pixels);
+        assert_eq!(
+            full.pixels,
+            render(&im, &r.checked()?, 0, None, Cancel::NEVER)?.pixels
+        );
         assert_ne!(
             full.pixels,
-            render(&im, &Recipe::default().checked()?, 0, None)?.pixels
+            render(&im, &Recipe::default().checked()?, 0, None, Cancel::NEVER)?.pixels
         );
         Ok(())
     }
@@ -175,9 +205,9 @@ mod tests {
         // Negative Dehaze from its tables, positive from the photo's haze.
         for dehaze in [-0.3, 0.6] {
             r.effects.dehaze = dehaze;
-            let full = render(&im, &r.checked()?, 0, None)?;
+            let full = render(&im, &r.checked()?, 0, None, Cancel::NEVER)?;
             for [x, y, w, h] in [[0, 0, 20, 30], [30, 25, 40, 40], [80, 60, 16, 20]] {
-                let tile = render(&im, &r.checked()?, 0, Some([x, y, w, h]))?;
+                let tile = render(&im, &r.checked()?, 0, Some([x, y, w, h]), Cancel::NEVER)?;
                 for yy in 0..h {
                     for xx in 0..w {
                         let a = tile.pixels[(yy * w + xx) as usize];
@@ -198,128 +228,22 @@ mod tests {
             sharpening: 0.8,
             ..Default::default()
         };
-        let full = render(&im, &r.checked()?, 0, None)?;
+        let full = render(&im, &r.checked()?, 0, None, Cancel::NEVER)?;
         let expected = resize(full, 48);
-        let fit = render(&im, &r.checked()?, 48, None)?;
+        let fit = render(&im, &r.checked()?, 48, None, Cancel::NEVER)?;
         assert_eq!(fit.pixels, expected.pixels);
         Ok(())
-    }
-    #[test]
-    fn partial_highlight_uses_neighbor_ratios_and_full_clip_is_neutral() {
-        let mut im = fixture();
-        im.pixels.fill([0.8, 0.4, 0.2]);
-        let i = 40 * 96 + 40;
-        im.pixels[i] = [1., 0.6, 0.3];
-        let recovered = recover_highlights(&im);
-        assert!((recovered.pixels[i][0] - 1.2).abs() < 1e-5);
-        assert_eq!(recovered.pixels[i][1], 0.6);
-        im.pixels.fill([1., 1., 1.]);
-        assert!(recover_highlights(&im).pixels.iter().all(|p| *p == [1.; 3]));
-    }
-    #[test]
-    fn recovery_never_darkens_a_clipped_channel() {
-        // Neighbours whose ratio puts red at 0.5, under a red the sensor clipped at
-        // 1: the light was at least that bright, so red keeps 1.
-        let mut im = fixture();
-        im.pixels.fill([0.5, 0.4, 0.2]);
-        let i = 40 * 96 + 40;
-        im.pixels[i] = [1., 0.4, 0.2];
-        assert_eq!(recover_highlights(&im).pixels[i], [1., 0.4, 0.2]);
-        // The same where no neighbour is unclipped (the neutral fallback, 0.3).
-        for y in 30..51 {
-            for x in 30..51 {
-                im.pixels[y * 96 + x] = [1., 0.4, 0.2];
-            }
-        }
-        im.pixels
-            .iter_mut()
-            .filter(|p| p[0] < 1.)
-            .for_each(|p| *p = [0.05; 3]);
-        assert_eq!(recover_highlights(&im).pixels[i], [1., 0.4, 0.2]);
-    }
-    #[test]
-    fn the_floor_fades_as_a_second_channel_clips() {
-        // Red clipped over neighbours that put it at 0.5; green rises through the
-        // clip threshold. The floor goes with green's own blend: no jump at 0.97,
-        // and none left once green is clipped too.
-        let red = |g: f32| {
-            let mut im = fixture();
-            im.pixels.fill([0.5, 0.969, 0.4]);
-            let i = 40 * 96 + 40;
-            im.pixels[i] = [1., g, 0.4];
-            recover_highlights(&im).pixels[i][0]
-        };
-        assert_eq!(red(0.96), 1.);
-        assert!((red(0.96999) - red(0.97001)).abs() < 1e-3);
-        assert!((red(0.985) - 0.75).abs() < 0.01, "{}", red(0.985));
-        assert!((red(1.) - 0.5).abs() < 1e-3);
-    }
-    #[test]
-    fn wide_partial_highlight_keeps_the_surviving_channels_colour() {
-        let mut im = fixture();
-        im.pixels.fill([0.8, 0.4, 0.2]);
-        for y in 30..51 {
-            for x in 30..51 {
-                im.pixels[y * 96 + x] = [1., 0.6, 0.3];
-            }
-        }
-        let recovered = recover_highlights(&im);
-        for x in 30..51 {
-            let p = recovered.pixels[40 * 96 + x];
-            assert!((p[0] - 1.2).abs() < 1e-4, "x {x}: {p:?}");
-            assert_eq!(p[1..], [0.6, 0.3]);
-        }
-        assert_eq!(recovered.pixels[0], im.pixels[0]);
-    }
-    #[test]
-    fn wide_highlight_with_only_red_remaining_uses_white_balanced_ratios() {
-        let mut im = fixture();
-        im.metadata.wb = [2., 1., 1.5];
-        im.pixels.fill([0.6, 0.8, 1.35]);
-        for y in 30..51 {
-            for x in 30..51 {
-                // 1.5× the surrounding colour, with green and blue sensor-clipped.
-                im.pixels[y * 96 + x] = [0.9, 1., 1.5];
-            }
-        }
-        let recovered = recover_highlights(&im);
-        for x in 30..51 {
-            let p = recovered.pixels[40 * 96 + x];
-            assert_eq!(p[0], 0.9);
-            assert!((p[1] - 1.2).abs() < 1e-4, "x {x}: {p:?}");
-            assert!((p[2] - 2.025).abs() < 1e-4, "x {x}: {p:?}");
-        }
-    }
-    #[test]
-    fn wide_highlight_does_not_borrow_colour_across_a_dark_gap() {
-        let mut im = fixture();
-        im.pixels.fill([0.05; 3]);
-        for y in 20..51 {
-            for x in 5..21 {
-                im.pixels[y * 96 + x] = [0.8, 0.4, 0.2];
-            }
-            for x in 50..71 {
-                im.pixels[y * 96 + x] = [1., 0.6, 0.3];
-            }
-        }
-        let recovered = recover_highlights(&im);
-        // The clipped object's colour is unknown. The separate red object must
-        // not cause its missing channel to be extrapolated to 1.2; it keeps what
-        // the sensor recorded.
-        let p = recovered.pixels[35 * 96 + 60];
-        assert_eq!(p[0], 1., "{p:?}");
-        assert_eq!(p[1..], [0.6, 0.3]);
     }
     #[test]
     fn cancellation_does_not_publish_partial_frame() {
         let im = fixture();
         assert!(
-            render_cancellable(
+            render(
                 &im,
                 &Recipe::default().checked().unwrap(),
                 0,
                 None,
-                &std::sync::atomic::AtomicBool::new(true)
+                Cancel::new(&std::sync::atomic::AtomicBool::new(true))
             )
             .is_err()
         );
@@ -333,7 +257,7 @@ mod tests {
                 .map(|i| [if i % 32 < 16 { 0.3 } else { 0.6 }; 3])
                 .collect(),
         };
-        sharpen(&mut im, &Recipe::default());
+        sharpen(&mut im, &Recipe::default(), None, Cancel::NEVER).unwrap();
         assert!(im.pixels[15][0] < 0.3);
         assert!(im.pixels[16][0] > 0.6);
         assert!(im.pixels.iter().all(|p| p[0] == p[1] && p[1] == p[2]));
@@ -351,7 +275,7 @@ mod tests {
             pixels: vec![[0.4, 0.3, 0.2]; 400],
         };
         let before = im.pixels.clone();
-        sharpen(&mut im, &Recipe::default());
+        sharpen(&mut im, &Recipe::default(), None, Cancel::NEVER).unwrap();
         for (a, b) in im.pixels.iter().zip(before) {
             for c in 0..3 {
                 assert!((a[c] - b[c]).abs() < 1e-6);

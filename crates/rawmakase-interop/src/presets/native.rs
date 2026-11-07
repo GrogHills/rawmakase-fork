@@ -2,7 +2,7 @@
 use crate::{
     camera_data::Metadata,
     model::recipe::Recipe,
-    model::saved_format::{SCHEMA, migrate_recipe},
+    model::saved_format::{migrate_recipe, schema_for},
     storage::atomic_json,
 };
 use anyhow::Result;
@@ -48,8 +48,8 @@ pub fn save_preset(path: &Path, r: &Recipe, m: &Metadata) -> Result<()> {
     atomic_json(
         path,
         &Preset {
-            schema: SCHEMA,
-            pipeline: SCHEMA,
+            schema: schema_for(&recipe),
+            pipeline: schema_for(&recipe),
             recipe,
             masks: local.masks,
             rendered: m.is_rendered(),
@@ -86,6 +86,20 @@ pub fn load_preset(path: &Path) -> Result<LoadedPreset> {
 /// replace the photo's only when it has any, as in Lightroom. Between a RAW and a
 /// rendered file the photo keeps its white balance and profile, as with Copy and Sync.
 pub fn applied_to(preset: LoadedPreset, photo: &Recipe, m: &Metadata) -> Recipe {
+    applied_to_with_lensfun(
+        preset,
+        photo,
+        m,
+        &crate::lens::lensfun::installed::Handle::Installed,
+    )
+}
+/// [`applied_to`], with a Lensfun lens taken to this photo's camera against `lensfun`.
+pub(crate) fn applied_to_with_lensfun(
+    preset: LoadedPreset,
+    photo: &Recipe,
+    m: &Metadata,
+    lensfun: &crate::lens::lensfun::installed::Handle,
+) -> Recipe {
     use crate::model::panels::Panel;
     let LoadedPreset {
         recipe: mut preset,
@@ -102,12 +116,39 @@ pub fn applied_to(preset: LoadedPreset, photo: &Recipe, m: &Metadata) -> Recipe 
     if rendered != m.is_rendered() {
         preset.keep_white_balance_and_profile(photo);
     }
+    // A Lensfun lens takes this photo's camera.
+    preset.lens_profile_choice.for_photo(m, lensfun);
     preset
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A native preset's Lensfun lens takes the photo's camera it is applied to.
+    #[test]
+    fn a_preset_s_lensfun_lens_takes_the_photo_s_camera() {
+        use crate::lens::lensfun::fixture;
+        let mut r = Recipe::default();
+        r.lens_profile_choice.choose_lensfun(fixture::choice());
+        let m = fixture::other_camera();
+        let applied = applied_to_with_lensfun(
+            LoadedPreset {
+                recipe: r,
+                rendered: false,
+            },
+            &Recipe::default(),
+            &m,
+            &fixture::installed(-0.02, 1_793_180_205),
+        );
+        let camera = applied
+            .lens_profile_choice
+            .lensfun()
+            .unwrap()
+            .camera
+            .clone()
+            .unwrap();
+        assert_eq!(camera.model, "Canon EOS 6D");
+    }
     use crate::model::panels::{Panel, PanelState};
     use crate::model::red_eye::RedEyeOp;
     #[test]
@@ -224,6 +265,31 @@ mod tests {
         assert!(!reads(&saved, BEFORE_ONE_ENGINE));
         assert_eq!(load_preset(&path).unwrap().recipe.exposure, 0.5);
     }
+    /// HDR values kept while HDR is off save in the version earlier releases read and
+    /// load back; a preset with HDR on saves in the HDR schema and loads back.
+    #[test]
+    fn a_preset_keeps_hdr_values_and_saves_hdr_on_in_its_schema() {
+        use crate::model::saved_format::{AI_DENOISE_SCHEMA, HDR_SCHEMA, reads};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.json");
+        let mut r = Recipe::default();
+        r.hdr.limit = 6.;
+        r.hdr.sdr.whites = -0.25;
+        save_preset(&path, &r, &Metadata::default()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(reads(&saved, AI_DENOISE_SCHEMA));
+        assert_eq!(load_preset(&path).unwrap().recipe.hdr, r.hdr);
+
+        // HDR on saves as the HDR schema, which earlier releases refuse, and loads back.
+        r.hdr.enabled = true;
+        save_preset(&path, &r, &Metadata::default()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!reads(&saved, AI_DENOISE_SCHEMA));
+        assert!(reads(&saved, HDR_SCHEMA));
+        assert_eq!(load_preset(&path).unwrap().recipe.hdr, r.hdr);
+    }
     /// A preset an earlier release saved loses the settings that chose its engine
     /// and operators, and keeps its sliders and a newer release's setting.
     #[test]
@@ -296,8 +362,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p.json");
         let value = serde_json::json!({
-            "schema": SCHEMA,
-            "pipeline": SCHEMA,
+            "schema": crate::model::saved_format::SCHEMA,
+            "pipeline": crate::model::saved_format::SCHEMA,
             "recipe": recipe,
         });
         std::fs::write(&path, value.to_string()).unwrap();

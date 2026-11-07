@@ -2,14 +2,15 @@
 //! stage cache stay on the device while only the recipe changes; parameters and tables
 //! are uploaded per render. The result is read back for the CPU finishing steps.
 use super::Processor;
-use crate::develop::pipeline::{Samples, pixel_params::PixelParams};
+use crate::develop::pipeline::{
+    Samples,
+    pixel_params::{PixelParams, slot},
+};
 use crate::rendered::Rendered;
 use anyhow::{Context, Result, ensure};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
+use rawmakase_cancel::Cancel;
+use std::ops::Range;
+use std::sync::{Arc, mpsc};
 use wgpu::util::DeviceExt;
 
 /// Invocations per workgroup, as declared in `develop.wgsl`.
@@ -52,19 +53,19 @@ impl Variant {
     }
     /// What a pass with `params` needs.
     fn of(params: &PixelParams) -> Self {
-        let set = |name: &str| params.get(name)[0] != 0.;
-        let at = |name: &str| params.get(name)[0] >= 0.;
+        let set = |at: Range<usize>| params.get(at)[0] != 0.;
+        let at = |at: Range<usize>| params.get(at)[0] >= 0.;
         let masks = !params.weights.is_empty();
         Self {
             masks,
-            color: at("MIXER")
-                || at("POINT")
-                || (at("RGB") && params.get("RGB")[5] != 0.)
-                || at("GRADE")
-                || set("ADJUST"),
-            local: set("LOCAL"),
+            color: at(slot::MIXER)
+                || at(slot::POINT)
+                || (at(slot::RGB) && params.get(slot::RGB)[5] != 0.)
+                || at(slot::GRADE)
+                || set(slot::ADJUST),
+            local: set(slot::LOCAL),
             // A mask's Dehaze adds to the recipe's.
-            dehaze: set("DEHAZE") || masks,
+            dehaze: set(slot::DEHAZE) || masks,
         }
     }
 }
@@ -475,7 +476,7 @@ impl Processor {
         &mut self,
         samples: &Arc<Samples>,
         params: &PixelParams,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Rendered> {
         self.check_develop(Input::Cpu(samples), params, cancel)?;
         self.scoped(|gpu| gpu.develop_inner(samples, params, cancel))
@@ -485,9 +486,9 @@ impl Processor {
         &self,
         input: Input,
         params: &PixelParams,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<()> {
-        ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
+        ensure!(!cancel.is_cancelled(), "Render superseded");
         let (w, h) = input.size();
         ensure!(w as u64 * h as u64 > 0, "Empty develop region");
         ensure!(
@@ -531,11 +532,11 @@ impl Processor {
         &mut self,
         samples: &Arc<Samples>,
         params: &PixelParams,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Rendered> {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.record_develop(Input::Cpu(samples), params, &mut encoder);
-        ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
+        ensure!(!cancel.is_cancelled(), "Render superseded");
         let device = &self.device;
         let n = samples.pixels.len() as u64;
         let uploaded = &self.developer.as_ref().unwrap().samples[0];
@@ -556,7 +557,7 @@ impl Processor {
         }
         rx.recv_timeout(std::time::Duration::from_secs(1))
             .context("GPU readback timed out")??;
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             uploaded.staging.unmap();
             anyhow::bail!("Render superseded");
         }
@@ -575,7 +576,8 @@ impl Processor {
 #[cfg(test)]
 mod tests {
     use super::{Keep, Variant};
-    use crate::develop::pipeline::pixel_params::PixelParams;
+    use crate::develop::pipeline::pixel_params::{PixelParams, slot};
+    use std::ops::Range;
 
     /// A render reads the kept camera colour only after a submitted pass wrote it for
     /// the same recipe; a pass recorded but never submitted (a cancelled render) leaves
@@ -595,13 +597,13 @@ mod tests {
     #[test]
     fn each_stage_selects_its_variant() {
         let off = [
-            ("MIXER", &[-1.][..]),
-            ("POINT", &[-1., 0.]),
-            ("RGB", &[-1., 0., 0., 0., 0., 1.]),
-            ("GRADE", &[-1., 0.]),
-            ("ADJUST", &[0.]),
+            (slot::MIXER, &[-1.][..]),
+            (slot::POINT, &[-1., 0.]),
+            (slot::RGB, &[-1., 0., 0., 0., 0., 1.]),
+            (slot::GRADE, &[-1., 0.]),
+            (slot::ADJUST, &[0.]),
         ];
-        let variant = |on: &[(&str, &[f32])], masks: bool| {
+        let variant = |on: &[(Range<usize>, &[f32])], masks: bool| {
             let mut values = off.to_vec();
             values.extend_from_slice(on);
             let mut p = PixelParams::with(&values);
@@ -613,18 +615,22 @@ mod tests {
         let none = variant(&[], false);
         assert!(!none.color && !none.local && !none.dehaze && !none.masks);
         // A look's RGB table at zero amount changes nothing.
-        assert!(!variant(&[("RGB", &[0., 0., 0., 0., 0., 0.])], false).color);
+        assert!(!variant(&[(slot::RGB, &[0., 0., 0., 0., 0., 0.])], false).color);
         for on in [
-            ("MIXER", &[0.][..]),
-            ("POINT", &[0., 0.]),
-            ("RGB", &[0., 0., 0., 0., 0., 1.]),
-            ("GRADE", &[0., 0.]),
-            ("ADJUST", &[1.]),
+            (slot::MIXER, &[0.][..]),
+            (slot::POINT, &[0., 0.]),
+            (slot::RGB, &[0., 0., 0., 0., 0., 1.]),
+            (slot::GRADE, &[0., 0.]),
+            (slot::ADJUST, &[1.]),
         ] {
-            assert!(variant(&[on], false).color, "{}", on.0);
+            assert!(
+                variant(std::slice::from_ref(&on), false).color,
+                "{:?}",
+                on.0
+            );
         }
-        assert!(variant(&[("LOCAL", &[1.])], false).local);
-        assert!(variant(&[("DEHAZE", &[0.3, 0.])], false).dehaze);
+        assert!(variant(&[(slot::LOCAL, &[1.])], false).local);
+        assert!(variant(&[(slot::DEHAZE, &[0.3, 0.])], false).dehaze);
         let masked = variant(&[], true);
         assert!(masked.masks && masked.dehaze);
     }

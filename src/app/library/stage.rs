@@ -4,9 +4,9 @@
 use super::Library;
 use super::previews::EditSource;
 use super::screen::Shown;
-use crate::app::design::{Tone, inset, radius, text};
-use crate::app::photo_metadata::{flag_icon, label_color};
-use crate::app::theme;
+use crate::app::library::photo_metadata::{flag_icon, label_color};
+use crate::app::ui::design::{Tone, inset, radius, text};
+use crate::app::ui::theme;
 use crate::catalog::{Photo, PhotoId};
 use eframe::egui::{self, Color32, Rect, Vec2};
 use std::collections::HashMap;
@@ -103,7 +103,7 @@ impl Library {
             return (stand_in, None);
         }
         let stamp = self.edit_stamp(ctx, photo.id);
-        let (catalog, defaults) = (&self.session.catalog, &self.defaults);
+        let (catalog, defaults) = (self.session.catalog(), &self.defaults);
         let edit = || {
             super::edit_source(catalog, photo.id)
                 .or_else(|| Some(EditSource::Defaults(defaults.clone())))
@@ -111,7 +111,8 @@ impl Library {
         match self.screen.get(photo, edge, stamp, edit) {
             Shown::Ready(texture) => (Some(texture.clone()), None),
             Shown::Loading => (stand_in, Some("Loading…".into())),
-            Shown::Failed(error) => (stand_in, Some(format!("Preview unavailable: {error}"))),
+            // Said in the top bar (`poll_previews`); the grid's preview stays.
+            Shown::Failed => (stand_in, None),
         }
     }
     /// The photo's edit stamp (see `Catalog::edit_stamp`), read again at
@@ -123,7 +124,7 @@ impl Library {
         match stamps.get(&id) {
             Some((stamp, read)) if now - read < STAMP_AGE => *stamp,
             _ => {
-                let stamp = self.session.catalog.edit_stamp(id).unwrap_or_default();
+                let stamp = self.session.catalog().edit_stamp(id).unwrap_or_default();
                 stamps.retain(|_, (_, read)| now - *read < STAMP_AGE);
                 stamps.insert(id, (stamp, now));
                 stamp

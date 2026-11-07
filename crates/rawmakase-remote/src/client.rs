@@ -6,6 +6,7 @@
 //! speaking another protocol is a [`ClientError`], and the local session keeps
 //! working.
 
+use rawmakase_cancel::Cancel;
 use rawmakase_inference::{Coverage, Prompt, RgbImage};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -22,7 +23,10 @@ use crate::protocol::{
 /// an error the app can show, not a drawer that waits forever.
 #[derive(Debug, Clone)]
 pub struct RemoteOptions {
+    /// How long connecting to each address the endpoint resolves to may take (it
+    /// tries the first `CONNECT_ATTEMPTS` in turn): 5 s by default.
     pub connect_timeout: Duration,
+    /// How long the worker may take to answer one request: 180 s by default.
     pub request_timeout: Duration,
 }
 
@@ -43,16 +47,20 @@ pub struct RemoteAnalysis {
     pub key: String,
     /// The photo's people and animals, all zero where there are none.
     pub subject: Coverage,
-    /// The photo's sky, all zero where there is none.
-    pub sky: Coverage,
 }
 
 /// What a `ping` learned about a worker: the models it loaded and the
 /// provider they are running on, as the runtime registered them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
+    /// The selection model, as its id, `@`, and the first 16 hex digits of its
+    /// weights' SHA-256.
     pub model: String,
+    /// The panoptic model's id, which finds people and animals.
     pub panoptic: String,
+    /// The sky model, empty when the worker has none.
+    pub sky: String,
+    /// The execution provider the models run on, as the runtime names it.
     pub provider: String,
 }
 
@@ -98,6 +106,7 @@ impl RemoteSession {
         Self::with_options(endpoint, RemoteOptions::default())
     }
 
+    /// Talks to the worker at `endpoint` (`host:port`), within `options`' bounds.
     pub fn with_options(endpoint: impl Into<String>, options: RemoteOptions) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -120,14 +129,16 @@ impl RemoteSession {
     /// Asks the worker what it is. Also the cheapest way to find out it cannot
     /// be reached, before asking it to run a model.
     pub fn ping(&self) -> Result<ServerInfo, ClientError> {
-        match self.call(Op::Ping, &AtomicBool::new(false))? {
+        match self.call(Op::Ping, Cancel::NEVER)? {
             Reply::Ping {
                 model,
                 panoptic,
+                sky,
                 provider,
             } => Ok(ServerInfo {
                 model,
                 panoptic,
+                sky,
                 provider,
             }),
             _ => Err(self.mismatched()),
@@ -141,17 +152,9 @@ impl RemoteSession {
     pub fn analyze(
         &self,
         photo: &RgbImage,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<RemoteAnalysis, ClientError> {
-        let (width, height) = (u32::try_from(photo.width), u32::try_from(photo.height));
-        let (width, height) = match (width, height) {
-            (Ok(w), Ok(h)) => (w, h),
-            _ => return Err(self.too_large()),
-        };
-        if photo.data.len() > MAX_IMAGE_BYTES {
-            return Err(self.too_large());
-        }
-        let pixels = photo.data.clone();
+        let (width, height, pixels) = self.wire_photo(photo)?;
         match self.call(
             Op::Analyze {
                 width,
@@ -160,13 +163,41 @@ impl RemoteSession {
             },
             cancel,
         )? {
-            Reply::Analyze { key, subject, sky } => Ok(RemoteAnalysis {
+            Reply::Analyze { key, subject } => Ok(RemoteAnalysis {
                 key,
                 subject: self.coverage(subject)?,
-                sky: self.coverage(sky)?,
             }),
             _ => Err(self.mismatched()),
         }
+    }
+
+    /// The photo's sky, all zero where there is none. Nothing is kept on the worker.
+    pub fn sky(&self, photo: &RgbImage, cancel: Cancel<'_>) -> Result<Coverage, ClientError> {
+        let (width, height, pixels) = self.wire_photo(photo)?;
+        match self.call(
+            Op::Sky {
+                width,
+                height,
+                pixels,
+            },
+            cancel,
+        )? {
+            Reply::Sky { coverage } => self.coverage(coverage),
+            _ => Err(self.mismatched()),
+        }
+    }
+
+    /// `photo` as a request carries it, or why it cannot.
+    fn wire_photo(&self, photo: &RgbImage) -> Result<(u32, u32, Vec<u8>), ClientError> {
+        let (width, height) = (u32::try_from(photo.width), u32::try_from(photo.height));
+        let (width, height) = match (width, height) {
+            (Ok(w), Ok(h)) => (w, h),
+            _ => return Err(self.too_large()),
+        };
+        if photo.data.len() > MAX_IMAGE_BYTES {
+            return Err(self.too_large());
+        }
+        Ok((width, height, photo.data.clone()))
     }
 
     /// The mask for `prompt` on a photo analysed before.
@@ -174,7 +205,7 @@ impl RemoteSession {
         &self,
         analysis: &RemoteAnalysis,
         prompt: &Prompt,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Coverage, ClientError> {
         match self.call(
             Op::Segment {
@@ -190,7 +221,7 @@ impl RemoteSession {
 
     /// Sends one request and waits, bounded, for its answer, while a watcher
     /// forwards the cancel flag to the worker on a connection of its own.
-    fn call(&self, op: Op, cancel: &AtomicBool) -> Result<Reply, ClientError> {
+    fn call(&self, op: Op, cancel: Cancel<'_>) -> Result<Reply, ClientError> {
         let id = format!(
             "{:016x}{:x}",
             self.nonce,
@@ -217,13 +248,13 @@ impl RemoteSession {
             let _ = watcher.join();
             result
         });
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(ClientError::Cancelled);
         }
         result
     }
 
-    fn ask(&self, payload: &[u8], id: &str, cancel: &AtomicBool) -> Result<Reply, ClientError> {
+    fn ask(&self, payload: &[u8], id: &str, cancel: Cancel<'_>) -> Result<Reply, ClientError> {
         // The whole request gets one wall-clock budget, not a fresh timeout
         // per read: a worker that drips bytes never buys itself more time,
         // and a raise of the cancel flag is noticed within READ_POLL, even
@@ -260,7 +291,7 @@ impl RemoteSession {
             Ok(reply) => Ok(reply),
             Err(error) => Err(match error.code {
                 Code::Cancelled => {
-                    if cancel.load(Ordering::Relaxed) {
+                    if cancel.is_cancelled() {
                         ClientError::Cancelled
                     } else {
                         ClientError::Failed(format!(
@@ -342,11 +373,11 @@ fn write_bounded(
     stream: &mut TcpStream,
     payload: &[u8],
     deadline: std::time::Instant,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<(), ClientError> {
     let mut written = 0;
     while written < payload.len() {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(ClientError::Cancelled);
         }
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
@@ -379,14 +410,14 @@ fn write_bounded(
 fn read_bounded(
     stream: &mut TcpStream,
     deadline: std::time::Instant,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Option<Vec<u8>>, ClientError> {
     // The length prefix, one byte at a time if that is what the network
     // hands over; the first read also tells a clean end from a hang-up.
     let mut prefix = [0u8; 4];
     let mut seen = 0;
     while seen < prefix.len() {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(ClientError::Cancelled);
         }
         let Some(n) = read_within(stream, &mut prefix[seen..], deadline)? else {
@@ -408,7 +439,7 @@ fn read_bounded(
     let mut frame = vec![0u8; len];
     let mut filled = 0;
     while filled < frame.len() {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(ClientError::Cancelled);
         }
         match read_within(stream, &mut frame[filled..], deadline)? {
@@ -489,14 +520,14 @@ fn timed_out() -> ClientError {
 fn watch_for_cancel(
     endpoint: String,
     target: String,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
     done: Arc<AtomicBool>,
     connect_timeout: Duration,
 ) {
-    while !done.load(Ordering::Acquire) && !cancel.load(Ordering::Relaxed) {
+    while !done.load(Ordering::Acquire) && !cancel.is_cancelled() {
         std::thread::sleep(Duration::from_millis(15));
     }
-    if !cancel.load(Ordering::Relaxed) {
+    if !cancel.is_cancelled() {
         return;
     }
     let request = Request {

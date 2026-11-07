@@ -1,5 +1,6 @@
 //! The render entry points: the resident GPU render, a level of the preview, and full-resolution output.
 use super::*;
+use rawmakase_cancel::Cancel;
 
 /// The GPU path for everything before the per-pixel stage, with the photo (or pyramid
 /// level) `source` kept on the device: the region's samples are made there, then
@@ -16,7 +17,7 @@ fn render_resident(
     region: [u32; 4],
     spread: f32,
     finish: &develop::gpu::Finish,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
     stages: &mut Stages,
 ) -> Result<Option<develop::gpu::Frame>> {
     let Some(display) = stages.display else {
@@ -132,21 +133,19 @@ fn render_resident(
 /// full-resolution render resized to `size` at a fraction of the cost. `full` is the
 /// full-resolution image the level was reduced from; `region` is a rectangle of the
 /// `size` output.
+///
+/// `r` is the recipe resolved for the photo ([`Resolved::recipe`]); the level's own
+/// geometry, footprint and keys are its.
 pub(crate) fn render_level(
     level: &Arc<CameraImage>,
     full: &Retouched,
-    r: &ValidRecipe,
+    r: &Recipe,
     size: (u32, u32),
     region: [u32; 4],
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
     stages: &mut Stages,
 ) -> Result<Output> {
     check_cancel(cancel)?;
-    let effective = r.resolved(&level.metadata);
-    let r = effective.as_ref();
-    if let Some(p) = &r.profile {
-        p.ensure_camera(&level.metadata)?;
-    }
     let level_scale =
         level.width.max(level.height) as f32 / full.image.width.max(full.image.height) as f32;
     let mut g = Geometry::new(level, r, 0);
@@ -212,6 +211,7 @@ pub(crate) fn render_level(
     if let Some(frame) = frame {
         return Ok(Output::Frame(Box::new(frame)));
     }
+    let srgb = crate::color::OutputSpace::Srgb;
     let (mut out, weights) = develop::render_base(
         &toned,
         &tonal_recipe,
@@ -220,15 +220,17 @@ pub(crate) fn render_level(
         spread,
         cancel,
         Some(stages),
+        srgb,
     )?;
-    sharpen_with_radius(&mut out, r, sigma, weights.as_deref(), cancel)?;
-    local_noise(&mut out, weights.as_deref());
+    sharpen_with_radius(&mut out, r, sigma, weights.as_deref(), srgb, cancel)?;
+    local_noise(&mut out, weights.as_deref(), srgb);
     crate::develop::effects::spatial_finish_scaled(
         &mut out,
         r,
         [left, top],
         [size.0, size.1],
         scale,
+        srgb,
     );
     check_cancel(cancel)?;
     Ok(Output::Pixels(crop(out, [x - left, y - top, w, h])))
@@ -254,46 +256,82 @@ pub fn render(
     r: &ValidRecipe,
     max_edge: u32,
     region: Option<[u32; 4]>,
+    cancel: Cancel<'_>,
 ) -> Result<Rendered> {
-    render_cancellable(
+    let srgb = crate::color::OutputSpace::Srgb;
+    render_preview(
         im,
-        r,
+        &resolve(im, r),
+        None,
         max_edge,
         region,
-        &std::sync::atomic::AtomicBool::new(false),
+        srgb,
+        cancel,
+        None,
     )
+    .map(Output::pixels)
 }
-pub fn render_cancellable(
+/// [`render`](fn@render) of a photo whose AI Denoise source is `ai`.
+pub fn render_with_ai(
     im: &CameraImage,
     r: &ValidRecipe,
+    ai: Option<&crate::develop::AiSource>,
     max_edge: u32,
-    region: Option<[u32; 4]>,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<Rendered> {
-    render_preview(im, r, max_edge, region, cancel, None).map(Output::pixels)
+    let srgb = crate::color::OutputSpace::Srgb;
+    render_preview(im, &resolve(im, r), ai, max_edge, None, srgb, cancel, None).map(Output::pixels)
 }
+/// [`render_with_ai`] for an export in `space`: on the CPU, with no stage cache or GPU.
+/// Point Color's Visualize Range, a preview's view that grays encoded sRGB, is never
+/// exported.
+pub fn render_export(
+    im: &CameraImage,
+    r: &ValidRecipe,
+    ai: Option<&crate::develop::AiSource>,
+    max_edge: u32,
+    space: crate::color::OutputSpace,
+    cancel: Cancel<'_>,
+) -> Result<crate::develop::ExportImage> {
+    use crate::model::point_color::{SwatchView, without_visualization};
+    let (stripped, checked);
+    let r = if r.point_colors.iter().any(|p| p.view != SwatchView::Adjust) {
+        let mut recipe = (**r).clone();
+        without_visualization(&mut recipe.point_colors);
+        stripped = recipe;
+        checked = stripped.checked()?;
+        &checked
+    } else {
+        r
+    };
+    let out = render_preview(im, &resolve(im, r), ai, max_edge, None, space, cancel, None)?;
+    Ok(crate::develop::ExportImage::rendered_in(
+        out.pixels(),
+        space,
+    ))
+}
+/// `im` rendered with `resolved` (from [`resolve`] of `im`): the whole photo within
+/// `max_edge`, or `region` at 100%, encoded in `space`. Only an sRGB render may have
+/// `stages`, the preview's GPU and caches.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_preview(
     im: &CameraImage,
-    r: &ValidRecipe,
+    resolved: &Resolved,
+    ai: Option<&crate::develop::AiSource>,
     max_edge: u32,
     region: Option<[u32; 4]>,
-    cancel: &std::sync::atomic::AtomicBool,
+    space: crate::color::OutputSpace,
+    cancel: Cancel<'_>,
     mut stages: Option<&mut Stages>,
 ) -> Result<Output> {
     ensure!(
-        !cancel.load(std::sync::atomic::Ordering::Relaxed),
-        "Render superseded"
+        space == crate::color::OutputSpace::Srgb || stages.is_none(),
+        "Only sRGB renders run on the GPU"
     );
-    let effective = r.resolved(&im.metadata);
-    let r = effective.as_ref();
-    if let Some(p) = &r.profile {
-        p.ensure_camera(&im.metadata)?;
-    }
-    if r.lens_ca {
-        crate::lens::auto_ca::prime(im);
-    }
-    let source = retouched(im, r, cancel, stages.as_mut().map(|s| &mut *s.retouch))?;
-    let g = Geometry::new(&source.image, r, 0);
+    ensure!(!cancel.is_cancelled(), "Render superseded");
+    let source = resolved.source(im, ai, cancel, stages.as_mut().map(|s| &mut *s.retouch))?;
+    let r = resolved.recipe.as_ref();
+    let g = resolved.geometry;
     let [x, y, w, h] = region.unwrap_or([0, 0, g.width, g.height]);
     ensure!(
         w > 0
@@ -312,10 +350,7 @@ pub(crate) fn render_preview(
     let right = (x + w + halo).min(g.width);
     let bottom = (y + h + halo).min(g.height);
     // Highlight recovery is prepared once per decoded image by the caller; see CameraImage.
-    ensure!(
-        !cancel.load(std::sync::atomic::Ordering::Relaxed),
-        "Render superseded"
-    );
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     let base = [left, top, right - left, bottom - top];
     // A display shows the render unresized; a Fit smaller than the photo comes from
     // the pyramid instead (`PreviewRenderer::render_fit`).
@@ -384,6 +419,7 @@ pub(crate) fn render_preview(
         0.,
         cancel,
         stages.as_deref_mut(),
+        space,
     )?;
     let local_finish = weights
         .as_ref()
@@ -402,19 +438,21 @@ pub(crate) fn render_preview(
         out = finished;
         gpu_sharpened = true;
     }
-    ensure!(
-        !cancel.load(std::sync::atomic::Ordering::Relaxed),
-        "Render superseded"
-    );
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     if !gpu_sharpened {
-        sharpen_cancellable(&mut out, r, weights.as_deref(), cancel)?;
-        local_noise(&mut out, weights.as_deref());
+        let sigma = Sharpener::new(r).sigma;
+        sharpen_with_radius(&mut out, r, sigma, weights.as_deref(), space, cancel)?;
+        local_noise(&mut out, weights.as_deref(), space);
     }
-    crate::develop::effects::spatial_finish(&mut out, r, [left, top], [g.width, g.height]);
-    ensure!(
-        !cancel.load(std::sync::atomic::Ordering::Relaxed),
-        "Render superseded"
+    crate::develop::effects::spatial_finish_scaled(
+        &mut out,
+        r,
+        [left, top],
+        [g.width, g.height],
+        1.,
+        space,
     );
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     if region.is_some() {
         Ok(Output::Pixels(crop(out, [x - left, y - top, w, h])))
     } else {
@@ -429,10 +467,7 @@ pub(crate) fn render_preview(
             if let Some(finished) = finished {
                 return Ok(Output::Pixels(finished));
             }
-            ensure!(
-                !cancel.load(std::sync::atomic::Ordering::Relaxed),
-                "Render superseded"
-            );
+            ensure!(!cancel.is_cancelled(), "Render superseded");
         }
         Ok(Output::Pixels(resize(out, max_edge)))
     }

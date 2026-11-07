@@ -13,10 +13,11 @@
 //! compressed where it is strong and weighted, and the sum scaled by a strength that
 //! Texture sets. Fitted to the gratings within 0.04 RMS (×gain) and to the edges'
 //! halos within 2.4% of the edge's step.
+use super::laplacian::Plane;
 use crate::camera_data::CameraImage;
 use anyhow::{Result, ensure};
+use rawmakase_cancel::Cancel;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The Texture this recipe renders with the measured operator.
 pub(crate) fn measured(r: &crate::model::recipe::Recipe) -> f32 {
@@ -53,7 +54,7 @@ const DETAIL_STEP: f32 = 1. / 8192.;
 impl TextureDetail {
     /// The detail of `im`, an image `scale` times the full-resolution photo's size;
     /// stops with an error when `cancel` is set.
-    pub(crate) fn of(im: &CameraImage, scale: f32, cancel: &AtomicBool) -> Result<Self> {
+    pub(crate) fn of(im: &CameraImage, scale: f32, cancel: Cancel<'_>) -> Result<Self> {
         // The image's size against the full-resolution photo's, also for a half-size
         // draft decode, which renders at scale 1.
         let full = im.metadata.width.max(im.metadata.height);
@@ -117,7 +118,7 @@ impl TextureDetail {
 /// The compressed, weighted detail of `plane` as pyramid level `level` and coarser,
 /// expanded to its size. Only the level's plane, its blurred copy and the result are
 /// full size at once.
-fn detail(plane: &Plane, level: usize, cancel: &AtomicBool) -> Result<Plane> {
+fn detail(plane: &Plane, level: usize, cancel: Cancel<'_>) -> Result<Plane> {
     if level >= LEVELS || plane.w < 4 || plane.h < 4 {
         return Ok(Plane {
             w: plane.w,
@@ -125,12 +126,12 @@ fn detail(plane: &Plane, level: usize, cancel: &AtomicBool) -> Result<Plane> {
             data: vec![0.; plane.w * plane.h],
         });
     }
-    ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
-    let coarse = plane.down();
-    let mut out = detail(&coarse, level + 1, cancel)?.up(plane.w, plane.h);
-    let blurred = coarse.up(plane.w, plane.h);
+    ensure!(!cancel.is_cancelled(), "Render superseded");
+    let coarse = plane.down(Cancel::NEVER);
+    let mut out = detail(&coarse, level + 1, cancel)?.up(plane.w, plane.h, Cancel::NEVER);
+    let blurred = coarse.up(plane.w, plane.h, Cancel::NEVER);
     drop(coarse);
-    ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
+    ensure!(!cancel.is_cancelled(), "Render superseded");
     let (w, t) = (WEIGHTS[level], THRESHOLDS[level]);
     out.data
         .par_iter_mut()
@@ -143,82 +144,10 @@ fn detail(plane: &Plane, level: usize, cancel: &AtomicBool) -> Result<Plane> {
     Ok(out)
 }
 
-/// One channel at one pyramid level.
-struct Plane {
-    w: usize,
-    h: usize,
-    data: Vec<f32>,
-}
-/// The 5-tap binomial filter, and its expanding weights for even and odd samples.
-const TAPS: [f32; 5] = [1. / 16., 4. / 16., 6. / 16., 4. / 16., 1. / 16.];
-const EVEN: [f32; 3] = [TAPS[0] * 2., TAPS[2] * 2., TAPS[4] * 2.];
-const ODD: f32 = TAPS[1] * 2.;
-fn mirror(v: isize, n: usize) -> usize {
-    let n = n as isize;
-    let v = v.abs();
-    (if v >= n { 2 * n - 2 - v } else { v }).clamp(0, n - 1) as usize
-}
-impl Plane {
-    /// Blurred and halved.
-    fn down(&self) -> Self {
-        let (w, h) = (self.w.div_ceil(2), self.h.div_ceil(2));
-        let mut wide = vec![0.; w * self.h];
-        wide.par_chunks_mut(w)
-            .zip(self.data.par_chunks(self.w))
-            .for_each(|(out, row)| {
-                for (x, o) in out.iter_mut().enumerate() {
-                    *o = (0..5)
-                        .map(|k| row[mirror(2 * x as isize + k - 2, self.w)] * TAPS[k as usize])
-                        .sum();
-                }
-            });
-        let mut data = vec![0.; w * h];
-        data.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
-            let rows: [&[f32]; 5] = std::array::from_fn(|k| {
-                let r = mirror(2 * y as isize + k as isize - 2, self.h);
-                &wide[r * w..(r + 1) * w]
-            });
-            for (x, o) in out.iter_mut().enumerate() {
-                *o = (0..5).map(|k| rows[k][x] * TAPS[k]).sum();
-            }
-        });
-        Plane { w, h, data }
-    }
-    /// Doubled to `w` × `h` and blurred, as a Laplacian pyramid expands a level.
-    fn up(&self, w: usize, h: usize) -> Self {
-        let expand = |i: usize, at: &dyn Fn(isize) -> f32| -> f32 {
-            let c = (i / 2) as isize;
-            if i.is_multiple_of(2) {
-                at(c - 1) * EVEN[0] + at(c) * EVEN[1] + at(c + 1) * EVEN[2]
-            } else {
-                (at(c) + at(c + 1)) * ODD
-            }
-        };
-        let mut wide = vec![0.; w * self.h];
-        wide.par_chunks_mut(w)
-            .zip(self.data.par_chunks(self.w))
-            .for_each(|(out, row)| {
-                for (x, o) in out.iter_mut().enumerate() {
-                    *o = expand(x, &|c| row[mirror(c, self.w)]);
-                }
-            });
-        let mut data = vec![0.; w * h];
-        data.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
-            let row = |c: isize| {
-                let r = mirror(c, self.h);
-                &wide[r * w..(r + 1) * w]
-            };
-            for (x, o) in out.iter_mut().enumerate() {
-                *o = expand(y, &|c| row(c)[x]);
-            }
-        });
-        Plane { w, h, data }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     /// The gain Texture `amount` gives a vertical sine grating of `f` cycles per pixel
     /// and `amplitude` EV, on a full-resolution image.
@@ -238,8 +167,9 @@ mod tests {
             fast: false,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         };
-        let out = TextureDetail::of(&im, 1., &AtomicBool::new(false))
+        let out = TextureDetail::of(&im, 1., Cancel::NEVER)
             .unwrap()
             .apply(&im, amount);
         let amp = |im: &CameraImage| {
@@ -295,11 +225,12 @@ mod tests {
             fast: true,
             scale_factor: 1.,
             scale_clipped: 0,
+            hdr: Default::default(),
         };
         let cancel = AtomicBool::new(false);
-        let draft = TextureDetail::of(&image(2 * w), 1., &cancel).unwrap();
-        let reduced = TextureDetail::of(&image(0), 0.5, &cancel).unwrap();
-        let full = TextureDetail::of(&image(0), 1., &cancel).unwrap();
+        let draft = TextureDetail::of(&image(2 * w), 1., Cancel::new(&cancel)).unwrap();
+        let reduced = TextureDetail::of(&image(0), 0.5, Cancel::new(&cancel)).unwrap();
+        let full = TextureDetail::of(&image(0), 1., Cancel::new(&cancel)).unwrap();
         assert_eq!(draft.channels, reduced.channels);
         assert_ne!(draft.channels, full.channels);
     }

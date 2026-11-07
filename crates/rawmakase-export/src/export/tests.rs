@@ -311,6 +311,114 @@ fn jpeg_carries_camera_exif_gps_and_xmp() -> Result<()> {
     assert!(image::open(&tif).is_ok());
     Ok(())
 }
+/// The segments of a JPEG up to its scan, each as marker and body, read by
+/// their length fields; `None` where a length does not lead to the next marker.
+fn jpeg_segments(jpeg: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let mut out = Vec::new();
+    let mut at = 2;
+    loop {
+        let marker = *jpeg.get(at + 1).filter(|_| jpeg[at] == 0xff)?;
+        if marker == 0xda {
+            return Some(out);
+        }
+        let len = u16::from_be_bytes([*jpeg.get(at + 2)?, *jpeg.get(at + 3)?]) as usize;
+        out.push((marker, jpeg.get(at + 4..at + 2 + len)?));
+        at += 2 + len;
+    }
+}
+
+#[test]
+fn camera_exif_too_large_for_a_jpeg_segment_is_cut_to_fit() -> Result<()> {
+    // A source whose EXIF directory holds more than a JPEG's 64 KB APP1
+    // segment: each value is under the 4096 bytes reading keeps, but there are
+    // twenty of them. The export used to write the segment's length modulo
+    // 65536, which leaves a JPEG whose segments can't be followed.
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("source.ARW");
+    fs::write(&source, b"source")?;
+    let image = Rendered {
+        width: 8,
+        height: 4,
+        pixels: vec![[0.5; 3]; 32],
+    };
+    let filler = "x".repeat(4000);
+    let mut exif = vec![
+        crate::exif::Field::ascii(0x9003, "2018:08:26 10:39:33"),
+        crate::exif::Field::ascii(0xa434, "FE 55mm F1.8 ZA"),
+    ];
+    exif.extend((0..20).map(|i| crate::exif::Field::ascii(0xa500 + i, &filler)));
+    let embed = Embed {
+        camera: Some(crate::exif::CameraExif {
+            main: vec![
+                crate::exif::Field::ascii(0x010f, "SONY"),
+                crate::exif::Field::ascii(0x0110, "ILCE-7M2"),
+            ],
+            exif,
+            gps: vec![crate::exif::Field::rational(0x0002, 52, 1)],
+        }),
+        ..Default::default()
+    };
+    let jpg = dir.path().join("out.jpg");
+    export_with(
+        &jpg,
+        &source,
+        &image,
+        &Metadata::default(),
+        &ExportOptions::default(),
+        &embed,
+        Replace::NoClobber,
+    )?;
+    let bytes = fs::read(&jpg)?;
+    let segments = jpeg_segments(&bytes).expect("segments that lead to the scan");
+    let exif: Vec<&[u8]> = segments
+        .iter()
+        .filter(|(marker, body)| *marker == 0xe1 && body.starts_with(b"Exif\0\0"))
+        .map(|(_, body)| *body)
+        .collect();
+    assert_eq!(exif.len(), 1);
+    assert!(image::open(&jpg).is_ok());
+    // What matters is kept: the camera, the capture time, the lens and GPS;
+    // only filler is left out.
+    let read = crate::exif::read(&jpg).expect("the export's EXIF");
+    let text = |fields: &[crate::exif::Field], tag| {
+        fields.iter().find(|f| f.tag == tag).and_then(|f| f.text())
+    };
+    assert_eq!(text(&read.main, 0x010f).as_deref(), Some("SONY"));
+    assert_eq!(text(&read.main, 0x0110).as_deref(), Some("ILCE-7M2"));
+    assert_eq!(
+        text(&read.exif, 0x9003).as_deref(),
+        Some("2018:08:26 10:39:33")
+    );
+    assert_eq!(text(&read.exif, 0xa434).as_deref(), Some("FE 55mm F1.8 ZA"));
+    assert_eq!(read.gps.len(), 1);
+    let kept = read
+        .exif
+        .iter()
+        .filter(|f| (0xa500..0xa514).contains(&f.tag))
+        .count();
+    assert!((1..20).contains(&kept), "{kept} of the 20 fillers kept");
+    // TIFF and PNG have no such limit: they keep all of it.
+    for name in ["out.tif", "out.png"] {
+        let path = dir.path().join(name);
+        export_with(
+            &path,
+            &source,
+            &image,
+            &Metadata::default(),
+            &ExportOptions::default(),
+            &embed,
+            Replace::NoClobber,
+        )?;
+        let read = crate::exif::read(&path).expect("the export's EXIF");
+        let kept = read
+            .exif
+            .iter()
+            .filter(|f| (0xa500..0xa514).contains(&f.tag))
+            .count();
+        assert_eq!(kept, 20, "{name}");
+    }
+    Ok(())
+}
 #[test]
 fn tiff_keeps_camera_text_that_is_not_plain_ascii() -> Result<()> {
     // Fujifilm writes Copyright in EXIF's two-part form (photographer, NUL,
@@ -659,7 +767,7 @@ fn export_refuses_to_destroy_a_raw_the_source_or_an_existing_file() -> Result<()
             &options,
             Replace::NoClobber
         )),
-        "Export extension must be .jpg, .jpeg, .tif, .tiff or .png"
+        "Export extension must be .jpg, .jpeg, .tif, .tiff, .png or .jxl"
     );
     assert!(!webp.exists());
     Ok(())
@@ -765,6 +873,61 @@ fn larger_xmp_moves_camera_raw_settings_to_extended_segments() -> Result<()> {
     let extended = String::from_utf8(whole)?;
     roxmltree::Document::parse(&extended)?;
     assert!(extended.contains("crs:Exposure2012=\"+0.40\""));
+    Ok(())
+}
+
+/// A fitted camera look's profile, too large for one segment even alone, moves to
+/// the extended segments and reads back whole from them.
+#[test]
+fn a_fitted_look_travels_in_extended_xmp() -> Result<()> {
+    use crate::camera_profiles::fitted;
+    let m = crate::camera_data::Metadata {
+        make: "Test".into(),
+        model: "Camera".into(),
+        cam_xyz: [[0.8, -0.2, -0.1], [-0.3, 1.1, 0.2], [-0.05, 0.15, 0.6]],
+        wb: [1.; 3],
+        daylight_wb: [1.; 3],
+        ..Default::default()
+    };
+    // Full-precision noise in every node, which zlib can't shrink.
+    let mut seed = 99u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        (seed >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let mut look = fitted::FittedLook::identity();
+    for node in look.table.iter_mut() {
+        *node = [40. * next() - 20., 0.8 + 0.4 * next(), 0.8 + 0.4 * next()];
+    }
+    let profile = fitted::with_look(&fitted::standard_base(&m).unwrap(), &look)?;
+    let mut r = Recipe::with_profiles(&m, &[]);
+    r.profile = Some(std::sync::Arc::new(profile.clone()));
+    let photo = crate::xmp::write::Photo {
+        settings: true,
+        format: "image/jpeg".into(),
+        ..Default::default()
+    };
+    let packet = crate::xmp::write::packet(&r, &m, &photo);
+    assert!(packet.len() > 65_504);
+    let segments = xmp_segments(&jpeg_with(&packet)?);
+    let mut whole = Vec::new();
+    for (h, body) in &segments {
+        if h.starts_with(b"http://ns.adobe.com/xmp/extension") {
+            let total = u32::from_be_bytes(body[32..36].try_into()?) as usize;
+            let offset = u32::from_be_bytes(body[36..40].try_into()?) as usize;
+            whole.resize(total, 0);
+            whole[offset..offset + body.len() - 40].copy_from_slice(&body[40..]);
+        }
+    }
+    let extended = String::from_utf8(whole)?;
+    assert!(extended.contains("rawmakase:FittedProfile"));
+    let back = crate::xmp::parse(std::path::Path::new("x.xmp"), &extended)?.apply(
+        &Recipe::with_profiles(&m, &[]),
+        &m,
+        &[],
+        None,
+    )?;
+    assert_eq!(back.profile.as_deref(), Some(&profile));
     Ok(())
 }
 

@@ -60,14 +60,14 @@ use super::proof::{self, Proof, Proofs};
 use super::recover::NOT_BACK;
 use super::tree::TreeMove;
 use super::{FileOpError, TrashError};
+use crate::fsops::{EntryKind, FileId, FsError, VolumeId};
 use crate::storage::Identity;
-use crate::storage::fsops::{EntryKind, FileId, FsError, VolumeId};
 use anyhow::{Context, Result};
+use rawmakase_cancel::Cancel;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What a folder item copied to another volume journals of its layout: its
 /// first `directories` members are folders (the folder itself first), the
@@ -118,10 +118,10 @@ pub(super) struct TreeCopy {
 }
 
 impl TreeCopy {
-    pub fn files(&self) -> usize {
+    pub(super) fn files(&self) -> usize {
         self.entries.iter().filter(|e| e.identity.is_some()).count()
     }
-    pub fn directories(&self) -> usize {
+    pub(super) fn directories(&self) -> usize {
         self.entries.len() - self.files()
     }
 }
@@ -399,7 +399,7 @@ pub(super) fn run(
     tree: &TreeMove,
     copy: &TreeCopy,
     busy: bool,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> Result<()> {
     // a. Checked again and journalled, in one transaction.
     let started = catalog.db.write_immediate(|w| {
@@ -498,7 +498,7 @@ fn build(
     id: journal::OperationId,
     tree: &TreeMove,
     copy: &TreeCopy,
-    cancel: &AtomicBool,
+    cancel: Cancel<'_>,
 ) -> std::result::Result<(), Failed> {
     let disk = cx.disk;
     let problem = |e: FsError| match e {
@@ -510,7 +510,7 @@ fn build(
     let mut made: HashMap<PathBuf, PathBuf> = HashMap::new();
     let mut top = None;
     for (ordinal, e) in copy.entries.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(Problem::Stopped.into());
         }
         let ordinal = ordinal as i64;

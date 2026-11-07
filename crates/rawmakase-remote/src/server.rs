@@ -6,8 +6,10 @@
 //! oversized frame is an error reply, never a model run on nonsense or an
 //! unbounded allocation.
 
+use rawmakase_cancel::Cancel;
 use rawmakase_inference::{
-    Analysis, Coverage, InferenceError, LoadOptions, Prompt, RgbImage, Session, Subject,
+    Analysis, Coverage, InferenceError, LoadOptions, Prompt, RgbImage, SKY, Session, Sky,
+    SkySession, Subject,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
@@ -36,14 +38,16 @@ pub const MAX_CACHED_BYTES: usize = 512 << 20;
 /// whole surface.
 pub trait Engine: Send {
     /// Runs the models on `photo`, or answers from the analysis it kept.
-    fn analyze(&mut self, photo: &RgbImage, cancel: &AtomicBool) -> Result<Outcome, EngineError>;
+    fn analyze(&mut self, photo: &RgbImage, cancel: Cancel<'_>) -> Result<Outcome, EngineError>;
     /// The mask for `prompt` on the analysis `key` names.
     fn segment(
         &mut self,
         key: &str,
         prompt: &Prompt,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Coverage, EngineError>;
+    /// The photo's sky, from its own model.
+    fn sky(&mut self, photo: &RgbImage, cancel: Cancel<'_>) -> Result<Coverage, EngineError>;
     /// What a `ping` says about this worker, as the runtime reported it.
     fn describe(&self) -> Info;
 }
@@ -63,15 +67,21 @@ pub enum EngineError {
 pub struct Outcome {
     /// The name the photo's clicks are asked under.
     pub key: String,
+    /// The photo's people and animals, all zero where there are none.
     pub subject: Coverage,
-    pub sky: Coverage,
 }
 
 /// What [`Engine::describe`] says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Info {
+    /// The selection model, as its id, `@`, and the first 16 hex digits of its
+    /// weights' SHA-256.
     pub model: String,
+    /// The panoptic model's id, which finds people and animals.
     pub panoptic: String,
+    /// The sky model, empty when the worker has none.
+    pub sky: String,
+    /// The execution provider the models run on, as the runtime names it.
     pub provider: String,
 }
 
@@ -79,6 +89,8 @@ pub struct Info {
 /// about lately.
 pub struct Model {
     session: Session,
+    /// The sky model, when the worker was given one.
+    sky: Option<SkySession>,
     cache: HashMap<String, Entry>,
     order: VecDeque<String>,
     bytes: usize,
@@ -87,7 +99,6 @@ pub struct Model {
 struct Entry {
     analysis: Analysis,
     subject: Coverage,
-    sky: Coverage,
 }
 
 impl Model {
@@ -97,10 +108,21 @@ impl Model {
     pub fn load(dir: &std::path::Path, options: &LoadOptions) -> Result<Self, InferenceError> {
         Ok(Self {
             session: Subject::load_with(dir, options)?,
+            sky: None,
             cache: HashMap::new(),
             order: VecDeque::new(),
             bytes: 0,
         })
+    }
+
+    /// Loads the sky model from its folder too; without it, Sky requests are refused.
+    pub fn with_sky(
+        mut self,
+        dir: &std::path::Path,
+        options: &LoadOptions,
+    ) -> Result<Self, InferenceError> {
+        self.sky = Some(Sky::load_with(dir, options)?);
+        Ok(self)
     }
 
     /// The provider the loaded sessions run on.
@@ -110,36 +132,33 @@ impl Model {
 }
 
 impl Engine for Model {
-    fn analyze(&mut self, photo: &RgbImage, cancel: &AtomicBool) -> Result<Outcome, EngineError> {
+    fn analyze(&mut self, photo: &RgbImage, cancel: Cancel<'_>) -> Result<Outcome, EngineError> {
         let key = protocol::analysis_key(photo);
         if let Some(entry) = self.cache.get(&key) {
             return Ok(Outcome {
                 key,
                 subject: entry.subject.clone(),
-                sky: entry.sky.clone(),
             });
         }
         let analysis = self.session.analyze(photo, cancel).map_err(engine_error)?;
         let subject = analysis.subject().map_err(engine_error)?;
-        let sky = analysis.sky().map_err(engine_error)?;
-        let held = analysis.bytes() + subject.data.len() + sky.data.len();
+        let held = analysis.bytes() + subject.data.len();
         self.remember(
             key.clone(),
             Entry {
                 analysis,
                 subject: subject.clone(),
-                sky: sky.clone(),
             },
             held,
         );
-        Ok(Outcome { key, subject, sky })
+        Ok(Outcome { key, subject })
     }
 
     fn segment(
         &mut self,
         key: &str,
         prompt: &Prompt,
-        cancel: &AtomicBool,
+        cancel: Cancel<'_>,
     ) -> Result<Coverage, EngineError> {
         let entry = match self.cache.get(key) {
             Some(entry) => entry,
@@ -152,11 +171,25 @@ impl Engine for Model {
             .map_err(engine_error)
     }
 
+    fn sky(&mut self, photo: &RgbImage, cancel: Cancel<'_>) -> Result<Coverage, EngineError> {
+        let Some(sky) = &mut self.sky else {
+            return Err(EngineError::Failed(InferenceError::ModelInvalid(
+                "this worker has no sky model; start it with --sky-model".into(),
+            )));
+        };
+        sky.select(photo, cancel).map_err(engine_error)
+    }
+
     fn describe(&self) -> Info {
         let spec = self.session.spec();
         Info {
             model: format!("{}@{}", spec.id, &spec.files[1].sha256[..16]),
             panoptic: rawmakase_inference::PANOPTIC.id.to_string(),
+            sky: self
+                .sky
+                .as_ref()
+                .map(|_| format!("{}@{}", SKY.id, &SKY.file.sha256[..16]))
+                .unwrap_or_default(),
             provider: self.session.provider().name().to_string(),
         }
     }
@@ -186,7 +219,7 @@ impl Model {
                 break;
             }
             if let Some(gone) = self.cache.remove(&oldest) {
-                self.bytes -= gone.analysis.bytes() + gone.subject.data.len() + gone.sky.data.len();
+                self.bytes -= gone.analysis.bytes() + gone.subject.data.len();
             }
         }
         self.bytes += held;
@@ -217,6 +250,7 @@ struct Cancels {
 }
 
 impl<E: Engine> Server<E> {
+    /// A worker answering with `engine`, with nothing running or cancelled.
     pub fn new(engine: E) -> Self {
         Self {
             engine: std::sync::Mutex::new(engine),
@@ -283,6 +317,7 @@ impl<E: Engine + 'static> Server<E> {
                         Reply::Ping {
                             model: info.model,
                             panoptic: info.panoptic,
+                            sky: info.sky,
                             provider: info.provider,
                         },
                     )?;
@@ -307,7 +342,7 @@ impl<E: Engine + 'static> Server<E> {
                         .engine
                         .lock()
                         .expect("engine lock")
-                        .analyze(&photo, &running);
+                        .analyze(&photo, Cancel::new(&running));
                     self.cancels
                         .lock()
                         .expect("cancel registry")
@@ -320,7 +355,49 @@ impl<E: Engine + 'static> Server<E> {
                             Reply::Analyze {
                                 key: outcome.key,
                                 subject: WireCoverage::of(&outcome.subject),
-                                sky: WireCoverage::of(&outcome.sky),
+                            },
+                        )?,
+                        Err(e) => {
+                            let stop = matches!(e, EngineError::Cancelled);
+                            self.engine_error(&mut stream, &request_id, &e)?;
+                            if stop {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                Op::Sky {
+                    width,
+                    height,
+                    pixels,
+                } => {
+                    let photo = match photo(width, height, pixels) {
+                        Ok(photo) => photo,
+                        Err(why) => {
+                            self.refuse(&mut stream, &request_id, Code::Invalid, why)?;
+                            return Ok(());
+                        }
+                    };
+                    if let Err(why) = self.register(&request_id, running.clone()) {
+                        self.refuse(&mut stream, &request_id, Code::Invalid, why)?;
+                        return Ok(());
+                    }
+                    let outcome = self
+                        .engine
+                        .lock()
+                        .expect("engine lock")
+                        .sky(&photo, Cancel::new(&running));
+                    self.cancels
+                        .lock()
+                        .expect("cancel registry")
+                        .running
+                        .remove(&request_id);
+                    match outcome {
+                        Ok(coverage) => self.answer(
+                            &mut stream,
+                            &request_id,
+                            Reply::Sky {
+                                coverage: WireCoverage::of(&coverage),
                             },
                         )?,
                         Err(e) => {
@@ -353,11 +430,11 @@ impl<E: Engine + 'static> Server<E> {
                         self.refuse(&mut stream, &request_id, Code::Invalid, why)?;
                         return Ok(());
                     }
-                    let coverage = self
-                        .engine
-                        .lock()
-                        .expect("engine lock")
-                        .segment(&key, &prompt, &running);
+                    let coverage = self.engine.lock().expect("engine lock").segment(
+                        &key,
+                        &prompt,
+                        Cancel::new(&running),
+                    );
                     self.cancels
                         .lock()
                         .expect("cancel registry")
