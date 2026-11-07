@@ -146,7 +146,8 @@ Export dialog settings. A photo open from its editable preview
 (`opened_from: editable_preview`) is never exported this way: `export` returns
 `not_ready` until it is opened again from its original. It can be previewed, so an
 agent can see its own offline edit: `preview` (MCP `preview_photo`) renders the
-editable preview itself with the edit, at most its 2560 pixels on the long edge,
+editable preview itself with the edit, as a JPEG only (a TIFF, PNG or JPEG XL path
+returns `invalid_request` and writes nothing), at most its 2560 pixels on the long edge,
 without AI Denoise (as Develop shows it), and with the camera's capture settings
 from the editable preview in place of the original's EXIF; it never decodes or reads
 the original, even once the original is back, until the photo is opened again

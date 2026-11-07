@@ -869,6 +869,17 @@ impl Editor {
                             "The photo is open from its editable preview; open it again from its original to export it",
                         ));
                     }
+                    // A JPEG to look at only: a TIFF or PNG of it would be an
+                    // export at the editable preview's size, which decision 5
+                    // set aside. A path no format names is refused below.
+                    if crate::export_settings::Format::from_path(&path)
+                        .is_some_and(|f| f != crate::export_settings::Format::Jpeg)
+                    {
+                        return Err(Error::new(
+                            "invalid_request",
+                            "The photo is open from its editable preview, which is previewed only as JPEG; use a .jpg path, or open it again from its original to export it",
+                        ));
+                    }
                     output::OpenedFrom::EditablePreview
                 } else {
                     output::OpenedFrom::Original

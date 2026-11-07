@@ -643,6 +643,48 @@ fn automation_previews_a_photo_open_from_its_editable_preview() {
     assert_eq!(jpeg_size(&back), preview_size);
 }
 
+/// A `preview` of a photo open from its editable preview is a JPEG only: a TIFF,
+/// PNG or JPEG XL path is refused and nothing is written, while a photo open from
+/// its original is still previewed as TIFF.
+#[test]
+fn automation_previews_an_editable_preview_only_as_jpeg() {
+    let mut fx = fixture(&["a.dng", "b.dng"]);
+    let (a, b) = (fx.id("a.dng"), fx.id("b.dng"));
+    fx.build(a, false);
+    fx.take_offline(a);
+    fx.open(a);
+    for name in ["p.tif", "p.tiff", "p.png", "p.jxl", "p.TIF"] {
+        let out = fx._dir.path().join(name);
+        let refused = fx
+            .automate(serde_json::json!({"cmd": "preview", "path": out, "max_edge": 2560}))
+            .expect_err(name);
+        assert_eq!(refused.code, "invalid_request", "{name}");
+        assert!(
+            refused.message.contains("only as JPEG"),
+            "{}",
+            refused.message
+        );
+        assert!(!out.exists(), "{name}");
+    }
+    let out = fx._dir.path().join("p.JPEG");
+    let job = {
+        let started = fx
+            .automate(serde_json::json!({"cmd": "preview", "path": out}))
+            .expect("a JPEG");
+        fx.finished(&started)
+    };
+    assert_eq!(job["status"], "completed", "{job}");
+    // A photo open from its original is previewed as TIFF as before.
+    fx.open(b);
+    assert!(!fx.e.document.opened_from_preview());
+    let tiff = fx._dir.path().join("original.tif");
+    let started = fx
+        .automate(serde_json::json!({"cmd": "preview", "path": tiff}))
+        .expect("a TIFF");
+    assert_eq!(fx.finished(&started)["status"], "completed");
+    assert!(tiff.is_file());
+}
+
 /// `export` stays refused for a photo open from its editable preview, offline or
 /// with the original back (decision 5), and writes nothing.
 #[test]

@@ -140,8 +140,9 @@ An offline photo stays un-exportable, listed as offline in the Export dialog as
 today. The EXIF stored by decision 3 keeps offline export possible later.
 Automation's `export` is refused for a photo open from its editable preview too;
 its `preview` (MCP `preview_photo`) is allowed (decided 2026-11-07), so an agent can
-see its own offline edit: a preview, at most the editable preview's size, is for
-looking at, not a file to deliver.
+see its own offline edit. A preview is for looking at, not a file to deliver, so it
+is a JPEG only, at most the editable preview's size: a TIFF or PNG of it would be
+the capped export set aside below.
 
 Set aside: exporting when the requested size fits the editable preview after crop;
 Lightroom's way, capping output at the editable preview's size, which silently
