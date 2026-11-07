@@ -908,3 +908,43 @@ fn a_syncs_undo_never_stands_in_for_an_original_that_is_there_but_cant_be_read()
     std::fs::remove_dir(fx.path(a)).unwrap();
     assert_eq!(fx.stored_exposure(a), 0.7);
 }
+
+#[test]
+fn a_syncs_undo_and_redo_reopen_the_photo_open_from_its_editable_preview() {
+    let mut fx = fixture(&["a.dng", "b.dng"]);
+    let (a, b) = (fx.id("a.dng"), fx.id("b.dng"));
+    fx.save_exposure(a, 0.2);
+    fx.save_exposure(b, 0.7);
+    let original = fx.build(a, false);
+    fx.sync(b, &[a]);
+    fx.take_offline(a);
+    fx.open(a);
+    assert!(fx.e.document.opened_from_preview());
+    assert_eq!(fx.e.document.edit.recipe().exposure, 0.7);
+    // Opened again from its editable preview, with the edit Undo wrote.
+    fx.e.undo();
+    fx.wait_loaded();
+    assert_eq!(fx.e.document.catalog_photo, Some(a));
+    assert!(fx.e.document.opened_from_preview());
+    assert_eq!(fx.e.document.edit.recipe().exposure, 0.2);
+    assert!(!fx.e.document.edit.save_state().needs_save());
+    assert_eq!(fx.stored_identity(a), original);
+    // Its editable preview gone meanwhile: Redo writes nothing and the photo
+    // stays open as it was; with the preview back, Redo works.
+    let file = catalog(&fx.e).editable_preview(a).unwrap().unwrap().path;
+    let kept = std::fs::read(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    fx.e.redo();
+    let line = fx.e.messages.line().to_owned();
+    assert!(line.starts_with("Redo failed"), "{line}");
+    assert_eq!(
+        fx.e.document.catalog_photo,
+        Some(a),
+        "nothing written, still open"
+    );
+    std::fs::write(&file, &kept).unwrap();
+    fx.e.redo();
+    fx.wait_loaded();
+    assert_eq!(fx.stored_exposure(a), 0.7);
+    assert_eq!(fx.e.document.edit.recipe().exposure, 0.7);
+}
