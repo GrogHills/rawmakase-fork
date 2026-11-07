@@ -593,7 +593,8 @@ fn preferences_shows_a_stale_preview_gone_when_its_rebuild_fails() {
 #[test]
 fn automation_builds_and_discards_the_selection() {
     use crate::app::shell::commands::{Command, Operation, Outcome as Reply};
-    let (_dir, mut e, ids) = editor(&["a.ARW", "b.ARW", "c.JPG"]);
+    let (_dir, mut e, ids) = editor(&["slow-a.ARW", "slow-b.ARW", "c.JPG"]);
+    let raws = ["slow-a.ARW", "slow-b.ARW"].map(|name| path_of(&e, id_named(&e, &ids, name)));
     let library = e.library.as_mut().unwrap();
     library.select(Some(ids[0]));
     library.select_range_to(ids[2]);
@@ -608,9 +609,23 @@ fn automation_builds_and_discards_the_selection() {
             skipped: 1
         }
     ));
+    // One builds at a time: while the first waits, neither is done.
+    let until = Instant::now() + Duration::from_secs(10);
+    while !STARTED.lock().unwrap().iter().any(|p| raws.contains(p)) {
+        assert!(Instant::now() < until, "the build never started");
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let state = serde_json::to_value(e.command_state()).unwrap();
-    assert!(state.get("building_editable_previews").is_some());
+    assert_eq!(
+        state["building_editable_previews"],
+        serde_json::json!({"done": 0, "total": 2})
+    );
+    for raw in &raws {
+        release(raw);
+    }
     settle(&mut e);
+    let state = serde_json::to_value(e.command_state()).unwrap();
+    assert!(state["building_editable_previews"].is_null());
     let reply = e
         .execute_command(Command::new(Operation::DiscardEditablePreviews), &ctx)
         .unwrap();
