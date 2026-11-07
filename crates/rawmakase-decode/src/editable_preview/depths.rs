@@ -1,19 +1,20 @@
 //! The measurement behind a smaller editable preview: version 1's curve with its
 //! codes quantized to 12 and 10 bits, against its 16. Codes are shifted down
 //! (code >> 4, >> 6), coded losslessly by the same encoder in its 16-bit mode
-//! (`zune-jpegxl` codes only 8 or 16 bits; a header naming 12 bits would differ by
-//! a few bytes), and read back to the middle of their 16-bit bucket. Nothing here
+//! (`zune-jpegxl` codes only 8 or 16 bits, so sizes are what its 16-bit path makes
+//! of the narrower codes; an encoder with a true 12-bit mode may code them otherwise), and read back to the middle of their 16-bit bucket. Nothing here
 //! changes the format: a smaller choice would be a new codec or curve code.
 //!
 //! - `precision_and_headroom`: the relative step per code at levels from 1/1000 of
 //!   white to 1000 times white, and what each level reads back as.
 //! - `banding_on_a_smooth_gradient`: a synthetic, noise-free gradient through
 //!   [`build`], rendered with strong edits; the largest step between neighbouring
-//!   output pixels and the levels a row reaches. Noise-free, so the worst case.
+//!   output pixels (any channel) and the green levels a row reaches. Noise-free, so the worst case.
 //! - `depths`: for each RAW in `RAWMAKASE_EDITABLE_PREVIEW_SAMPLES`, the file size
 //!   at each depth, encode and decode times, and CIEDE2000 between renders of the
 //!   12- and 10-bit previews and the 16-bit one (per pixel and over 16 px blocks),
-//!   for defaults and strong edits, and an HDR edit's relative difference.
+//!   for defaults and strong edits, and an HDR edit's relative luminance difference.
+//!   A photo whose HDR render is refused is reported and left out of that line.
 //!
 //! Run with `cargo test -p rawmakase-decode --release --lib
 //! editable_preview::depths -- --ignored --nocapture --test-threads=1`.
@@ -214,7 +215,7 @@ fn banding_on_a_smooth_gradient() {
     let image = preview.image();
     let codes = encode_pixels(&image.pixels);
     println!(
-        "| Edit | Depth | Largest neighbour step (16-bit output levels) | Distinct levels on a row | Max step / 16-bit's |\n| --- | --- | --- | --- | --- |"
+        "| Edit | Depth | Largest neighbour step (16-bit output levels) | Green levels on a row | Max step / 16-bit's |\n| --- | --- | --- | --- | --- |"
     );
     for (name, edit) in edits() {
         let mut r = Recipe::for_metadata(&image.metadata);
@@ -261,6 +262,10 @@ fn depths() {
         .filter(|p| rawmakase_model::storage::is_raw(p))
         .collect();
     paths.sort();
+    if paths.is_empty() {
+        eprintln!("No RAWs in RAWMAKASE_EDITABLE_PREVIEW_SAMPLES");
+        return;
+    }
     let mut sizes: [Vec<f64>; 3] = Default::default();
     let mut times: [Vec<[f64; 2]>; 3] = Default::default();
     let mut diffs: Vec<Vec<[f64; 4]>> = vec![Vec::new(); edits().len() * 2];
@@ -332,7 +337,10 @@ fn depths() {
             }
         }
         for (k, v) in variants[1..].iter().enumerate() {
-            hdr[k].push(hdr_difference(&variants[0], v, &base).unwrap());
+            match hdr_difference(&variants[0], v, &base) {
+                Ok(d) => hdr[k].push(d),
+                Err(e) => eprintln!("{name}: no HDR comparison: {e:#}"),
+            }
         }
     }
     let summary = |v: &[f64]| {
@@ -377,6 +385,9 @@ fn depths() {
         }
     }
     for (k, depth) in [12, 10].iter().enumerate() {
+        if hdr[k].is_empty() {
+            continue;
+        }
         let m = hdr[k].iter().map(|x| x[0]).sum::<f64>() / hdr[k].len() as f64;
         let p = hdr[k].iter().map(|x| x[1]).fold(0., f64::max);
         println!(
