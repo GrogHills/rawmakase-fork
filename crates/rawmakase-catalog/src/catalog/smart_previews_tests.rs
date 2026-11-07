@@ -239,7 +239,7 @@ fn a_record_is_refused_for_a_missing_file_a_bad_name_or_a_photo_gone() -> Result
         fx.a,
         &Identity {
             size: original.size + 99,
-            ..original.clone()
+            ..original
         },
     );
     assert!(
