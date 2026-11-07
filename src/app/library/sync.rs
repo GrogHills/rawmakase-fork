@@ -404,7 +404,7 @@ pub(in crate::app) fn synchronize(
         .iter()
         .map(|p| EditToSave {
             id: p.synced.id,
-            path: &p.synced.path,
+            original: crate::edits::Original::file(&p.synced.path),
             source: &p.synced.identity,
             recipe: &p.synced.after,
             export: &p.export,
@@ -739,7 +739,7 @@ pub(in crate::app) fn restore(
         .iter()
         .map(|(id, path, source, recipe, export, history)| EditToSave {
             id: *id,
-            path,
+            original: crate::edits::Original::file(path),
             source,
             recipe,
             export,
