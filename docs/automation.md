@@ -102,6 +102,10 @@ Dialog actions report that the action was applied, but require user interaction.
 `open_failed` names the photo Develop could not open (a cut-short or
 unreadable file), with the reason in `open_error`, which stays while `message`
 moves on; `open` and MCP `open_photo` stop waiting for it with that error.
+`opened_from` says what the open photo was opened from once its header is in:
+`original`, or `editable_preview` for an offline photo opened from its editable
+preview; `open` takes such a photo, and refuses an offline one without a usable
+editable preview with `not_editable`.
 Prefer the explicit `export` command for unattended output.
 
 ## Guard the target
