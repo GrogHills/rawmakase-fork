@@ -294,12 +294,17 @@ executable and every bundled library against that baseline.
 ## Test builds
 
 The Test build workflow (`.github/workflows/test-build.yml`, in this fork only)
-builds unsigned apps from any branch, tag or commit, so a change can be tried
-without compiling it. It never signs, publishes, tags or uses secrets. Run it
-from **Actions → Test build → Run workflow**, enter a branch, tag or full
-commit SHA (default `main`), and when the run finishes download from the run's
-**Artifacts**. Each download is a zip; the macOS and Linux ones hold a second
-archive to extract:
+builds unsigned apps from a branch or tag, so a change can be tried without
+compiling it. It never signs, publishes, tags or uses secrets. Run it from
+**Actions → Test build → Run workflow**, pick the branch or tag under **Use
+workflow from** (default `main`), and when the run finishes download from the
+run's **Artifacts**. The ref must contain this workflow file, so branches cut
+from `main` before it landed and upstream tags cannot be built; to build a
+particular commit, push a branch at it. There is deliberately no ref input:
+code from another ref would run with write access to `main`'s Actions cache.
+
+Each download is a zip; the macOS and Linux ones hold a second archive to
+extract:
 
 - `rawmakase-test-<sha>-macos-arm64`: a zip of `RAWmakase Test.app`, for Apple
   Silicon.
