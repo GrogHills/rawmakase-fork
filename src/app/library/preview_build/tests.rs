@@ -79,20 +79,25 @@ fn editor(names: &[&str]) -> (tempfile::TempDir, Editor, Vec<PhotoId>, PathBuf) 
 fn path_of(e: &Editor, id: PhotoId) -> PathBuf {
     e.library.as_ref().unwrap().photo(id).unwrap().path.clone()
 }
-/// Polls until every build asked for has ended.
+/// Polls until every build asked for has ended, then waits for the worker to
+/// apply the upkeep queued so far and takes the results it sent before that.
 fn settle(e: &mut Editor) {
     let until = Instant::now() + Duration::from_secs(20);
-    loop {
+    while e.preview_builds.progress().is_some_and(|p| p.running()) {
         e.poll_preview_builds();
-        if !e.preview_builds.progress().is_some_and(|p| p.running()) {
-            // The last result may still be on its way.
-            std::thread::sleep(Duration::from_millis(5));
-            e.poll_preview_builds();
-            return;
-        }
         assert!(Instant::now() < until, "builds never ended");
         std::thread::sleep(Duration::from_millis(2));
     }
+    if let Some(builder) = &e.preview_builds.builder {
+        // A worker that skipped the marker (no cache, or a panic) drops it,
+        // which ends the wait as well.
+        let reached = builder.reached().recv_timeout(Duration::from_secs(20));
+        assert!(
+            !matches!(reached, Err(mpsc::RecvTimeoutError::Timeout)),
+            "upkeep never ran"
+        );
+    }
+    e.poll_preview_builds();
 }
 fn identity_of(e: &Editor, id: PhotoId) -> String {
     let record = e
@@ -394,6 +399,129 @@ fn a_removed_copy_takes_its_requests_and_waiting_builds_along() {
             .has_intent(&catalog, again, &path, PreviewKind::Standard)
             .unwrap()
     );
+}
+
+/// The worker is held after reporting each build, before it takes the upkeep
+/// queued meanwhile, until a marker from [`Builder::reached`] is queued: the
+/// latest the worker can be while the test waits on it.
+#[test]
+fn a_late_worker_still_forgets_a_removed_copy_before_settling() {
+    let (_dir, mut e, ids, cache) = editor(&["slow-late.ARW"]);
+    let master = ids[0];
+    let copy = e
+        .library
+        .as_mut()
+        .unwrap()
+        .create_virtual_copy(master)
+        .unwrap()
+        .value;
+    let catalog = e
+        .library
+        .as_ref()
+        .unwrap()
+        .session
+        .catalog()
+        .location()
+        .clone();
+    let open = Arc::new(AtomicBool::new(false));
+    let gate = open.clone();
+    let builder = Builder::start(cache.clone(), test_render, move || {
+        let until = Instant::now() + Duration::from_secs(20);
+        while !gate.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let shared = builder.shared.clone();
+    e.preview_builds.builder = Some(builder);
+    e.preview_builds.catalog = Some(catalog.clone());
+    let opener = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            let marked = shared
+                .state
+                .lock()
+                .unwrap()
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Reached(_)));
+            if marked {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        open.store(true, Ordering::Release);
+    });
+    let path = path_of(&e, master);
+    e.build_previews(&[master, copy], PreviewKind::Standard)
+        .unwrap();
+    wait_started(&path);
+    e.remove_virtual_copy(copy);
+    release(&path);
+    settle(&mut e);
+    let cache = PreviewCache::open(&cache).unwrap();
+    assert!(
+        cache
+            .has_intent(&catalog, master, &path, PreviewKind::Standard)
+            .unwrap()
+    );
+    assert!(
+        !cache
+            .has_intent(&catalog, copy, &path, PreviewKind::Standard)
+            .unwrap()
+    );
+    opener.join().unwrap();
+}
+
+#[test]
+fn a_copy_removed_while_it_builds_stops_and_a_new_copy_starts_clean() {
+    let (_dir, mut e, ids, cache) = editor(&["slow-gone.ARW"]);
+    let copy = e
+        .library
+        .as_mut()
+        .unwrap()
+        .create_virtual_copy(ids[0])
+        .unwrap()
+        .value;
+    let catalog = e
+        .library
+        .as_ref()
+        .unwrap()
+        .session
+        .catalog()
+        .location()
+        .clone();
+    let path = path_of(&e, copy);
+    let identity = identity_of(&e, copy);
+    e.build_previews(&[copy], PreviewKind::Standard).unwrap();
+    wait_started(&path);
+    // Never released: only the removal ends this build.
+    e.remove_virtual_copy(copy);
+    settle(&mut e);
+    let again = e
+        .library
+        .as_mut()
+        .unwrap()
+        .create_virtual_copy(ids[0])
+        .unwrap()
+        .value;
+    let cache = PreviewCache::open(&cache).unwrap();
+    assert!(
+        !cache
+            .sized_fresh(
+                &path,
+                &identity,
+                PreviewKind::Standard,
+                DEFAULT_STANDARD_SIZE
+            )
+            .unwrap()
+    );
+    for id in [copy, again] {
+        assert!(
+            !cache
+                .has_intent(&catalog, id, &path, PreviewKind::Standard)
+                .unwrap()
+        );
+    }
 }
 
 #[test]

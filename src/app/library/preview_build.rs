@@ -292,6 +292,10 @@ enum Op {
     /// Edits saved: each photo with previews asked for (built, waiting or being
     /// built) is built again, unless its preview is still fresh.
     Refresh(Vec<Item>),
+    /// Signals once the worker reaches it: every upkeep queued before it has
+    /// been applied, and every build reported before it has been sent.
+    #[cfg(test)]
+    Reached(mpsc::Sender<()>),
 }
 
 #[derive(Default)]
@@ -464,6 +468,15 @@ impl Builder {
         }
     }
 
+    /// Queues a marker; the receiver hears from it once the worker has applied
+    /// the upkeep queued before it.
+    #[cfg(test)]
+    fn reached(&self) -> Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        self.maintain(Op::Reached(tx));
+        rx
+    }
+
     pub(in crate::app) fn progress(&self) -> Progress {
         self.shared
             .state
@@ -634,6 +647,11 @@ fn maintain(cache: &mut PreviewCache, op: Op) {
         Op::Clear(kind) => cache.clear(kind),
         Op::Expire(kind, unused) => cache.expire(kind, unused).map(|_| ()),
         Op::Refresh(_) => Ok(()),
+        #[cfg(test)]
+        Op::Reached(reached) => {
+            let _ = reached.send(());
+            Ok(())
+        }
     };
 }
 
@@ -917,8 +935,6 @@ impl Editor {
         ));
     }
 
-    /// A photo leaving the catalog takes its requests along, so a later photo
-    /// given its id starts without any.
     /// Photos whose file was found moved: their queued builds of the old
     /// file are dropped, and their requests follow the file.
     pub(in crate::app) fn move_preview_intents(
@@ -938,6 +954,8 @@ impl Editor {
         }
         builder.maintain(Op::MoveIntent(catalog.clone(), moved.to_vec()));
     }
+    /// A photo leaving the catalog takes its requests and builds along, so a
+    /// later photo given its id starts without any.
     pub(in crate::app) fn forget_preview_intent(&mut self, id: PhotoId) {
         let Some(library) = &self.library else {
             return;
@@ -946,6 +964,11 @@ impl Editor {
         let ctx = self.context.clone();
         let builder = self.preview_builds.builder(&ctx);
         builder.drop_waiting(Some(&[id]), &PreviewKind::ALL);
+        // A build under way would store a preview nobody can ask for; the
+        // worker applies the forget after it, so removal wins either way.
+        for kind in PreviewKind::ALL {
+            builder.cancel_running(Some(&[id]), kind);
+        }
         builder.maintain(Op::ForgetIntent(catalog, vec![id]));
     }
 
