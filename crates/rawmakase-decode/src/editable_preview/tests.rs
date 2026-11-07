@@ -4,6 +4,7 @@ use rawmakase_model::camera_data::{
     EmbeddedProfileStatus, HdrSource, HighlightTonePriority, MatrixSource, NeutralCalibration,
     Source, WhiteBalancePresets,
 };
+use rawmakase_model::camera_profiles::fitted;
 use rawmakase_model::optics::{GainGrid, LensCorrection, Radial};
 use std::sync::atomic::AtomicBool;
 
@@ -494,6 +495,7 @@ fn the_golden_version_1_file_opens() {
         write(path, &preview).unwrap();
     }
     let golden = read(path, Cancel::NEVER).expect("the golden version 1 editable preview");
+    assert!(golden.camera_look().is_none(), "written before LOOK");
     assert_eq!(
         golden.header(),
         Header {
@@ -589,6 +591,140 @@ fn the_golden_version_1_groups_file_opens() {
         write(path, &preview).unwrap();
     }
     let golden = read(path, Cancel::NEVER).expect("the golden version 1 groups file");
+    assert!(golden.camera_look().is_none());
     assert_eq!(golden.header().preview, [2100, 260]);
     assert!(golden.image().pixels == im.pixels, "a code changed");
+}
+
+/// A Camera Look (fitted) for [`every_fact`]'s camera, over a fitted matrix as a
+/// camera without colour data has: what the default fit of such a photo makes.
+fn fitted_look() -> CameraProfile {
+    let m = every_fact(4, 3);
+    let d50 = [0.9642, 1., 0.8249];
+    let raw = [[0.6, 0.3, 0.1], [0.25, 0.7, 0.05], [0.0, 0.1, 0.9]];
+    let forward = std::array::from_fn(|i| {
+        let sum: f32 = raw[i].iter().sum();
+        std::array::from_fn(|j| raw[i][j] * d50[i] / sum)
+    });
+    let base = fitted::matrix_base(&m, forward).unwrap();
+    let mut look = fitted::FittedLook::identity();
+    // Something other than the identity, still small once compressed.
+    for node in look.table.iter_mut().step_by(7) {
+        *node = [4., 1.05, 0.98];
+    }
+    fitted::with_look(&base, &look).unwrap()
+}
+
+fn with_look(mut preview: EditablePreview) -> EditablePreview {
+    preview.set_camera_look(&fitted_look()).unwrap();
+    preview
+}
+
+/// The default Camera Look written with an editable preview comes back whole, and
+/// a file without one reads as before.
+#[test]
+fn the_camera_look_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let preview = with_look(built(30, 20, 30));
+    assert_eq!(preview.camera_look(), Some(&fitted_look()));
+    let path = written(dir.path(), &preview);
+    let back = read(&path, Cancel::NEVER).unwrap();
+    assert_same(&preview, &back);
+    assert_eq!(back.camera_look(), Some(&fitted_look()));
+    assert_eq!(read_header(&path).unwrap(), preview.header());
+    let again = dir.path().join("again.rmep");
+    write(&again, &back).unwrap();
+    assert_eq!(fs_bytes(&path), fs_bytes(&again));
+    let plain = built(30, 20, 30);
+    let path = dir.path().join("plain.rmep");
+    write(&path, &plain).unwrap();
+    assert!(read(&path, Cancel::NEVER).unwrap().camera_look().is_none());
+}
+
+/// A look that wouldn't read back (another camera's) is not kept.
+#[test]
+fn a_look_that_would_not_read_back_is_refused() {
+    let mut preview = with_look(built(30, 20, 30));
+    let mut other = every_fact(4, 3);
+    other.model = "Other".into();
+    let base = fitted::matrix_base(&other, [[0.4, 0.4, 0.2], [0.2, 0.7, 0.1], [0., 0.1, 0.8]]);
+    let foreign = fitted::with_look(&base.unwrap(), &fitted::FittedLook::identity()).unwrap();
+    assert!(preview.set_camera_look(&foreign).is_err());
+    assert!(preview.camera_look().is_none(), "the earlier one goes too");
+}
+
+/// A `LOOK` section whose hash holds but whose profile doesn't read (a later
+/// carried version, or one altered before it was hashed) refuses the file, saying
+/// why: the photo must not quietly render with other colours.
+#[test]
+fn a_camera_look_that_does_not_read_refuses_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = written(dir.path(), &with_look(built(20, 10, 20)));
+    let mut bytes = fs_bytes(&path);
+    let at = find(&bytes, b"LOOK");
+    let len = u64::from_le_bytes(bytes[at + 4..at + 12].try_into().unwrap()) as usize;
+    let payload = at + 12;
+    let version = payload + find(&bytes[payload..payload + len], b"v1:");
+    bytes[version + 1] = b'9';
+    let hash = hash(&bytes[payload..payload + len]);
+    bytes[payload + len..payload + len + 8].copy_from_slice(&hash.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let message = format!("{:#}", read(&path, Cancel::NEVER).err().unwrap());
+    assert!(message.contains("Camera Look"), "{message}");
+    // Its structure is sound: the header reads.
+    assert!(read_header(&path).is_ok());
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .unwrap()
+}
+
+const GOLDEN_LOOK: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/editable-preview/v1-camera-look.rmep"
+);
+
+/// A version 1 file with a Camera Look, written once and checked in: every later
+/// release must keep opening it with its look. Never write it again.
+#[test]
+fn the_golden_version_1_camera_look_file_opens() {
+    let path = Path::new(GOLDEN_LOOK);
+    if std::env::var_os("RAWMAKASE_WRITE_EDITABLE_PREVIEW_GOLDEN").is_some() && !path.exists() {
+        let preview = build(
+            &golden_source(),
+            &identity(),
+            Some(exif()),
+            LONG_EDGE,
+            Cancel::NEVER,
+        )
+        .unwrap();
+        write(path, &with_look(preview)).unwrap();
+    }
+    let golden = read(path, Cancel::NEVER).expect("the golden version 1 Camera Look file");
+    assert_eq!(golden.camera_look(), Some(&fitted_look()));
+    let plain = read(Path::new(GOLDEN), Cancel::NEVER).unwrap();
+    assert_same(&plain, &golden);
+    assert_eq!(read_header(path).unwrap(), plain.header());
+}
+
+/// What a version 1 reader from before `LOOK` makes of the golden file with one:
+/// it skips the section as one it doesn't know (its tag renamed here to one no
+/// release knows, which this reader skips the same way), and reads the rest
+/// exactly as the file without it.
+#[test]
+fn a_reader_from_before_the_camera_look_skips_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = fs_bytes(Path::new(GOLDEN_LOOK));
+    let at = find(&bytes, b"LOOK");
+    bytes[at..at + 4].copy_from_slice(b"ZZZZ");
+    let path = dir.path().join("old-reader.rmep");
+    std::fs::write(&path, &bytes).unwrap();
+    let skipped = read(&path, Cancel::NEVER).unwrap();
+    assert!(skipped.camera_look().is_none());
+    let plain = read(Path::new(GOLDEN), Cancel::NEVER).unwrap();
+    assert_same(&plain, &skipped);
+    assert_eq!(read_header(&path).unwrap(), plain.header());
 }
