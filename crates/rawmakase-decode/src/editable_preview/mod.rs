@@ -599,6 +599,27 @@ fn read_look(payload: &[u8], m: &Metadata) -> Result<CameraProfile> {
     let text = r
         .str(LOOK_PROFILE)?
         .context("An editable preview's Camera Look section holds no profile")?;
-    fitted::from_carried(&text, m)
-        .context("This editable preview's Camera Look (fitted) can't be read")
+    fitted::from_carried(&text, m).map_err(|e| {
+        if look_from_a_later_release(&text, &e) {
+            e.context("This editable preview's Camera Look (fitted) was written by a later release of RAWmakase: update RAWmakase to open it")
+        } else {
+            e.context("This editable preview's Camera Look (fitted) can't be read")
+        }
+    })
+}
+
+/// Whether [`fitted::from_carried`] refused `text` as a later release would
+/// write it: a carried version above 1, or a profile field this release doesn't
+/// know (profiles refuse unknown fields).
+fn look_from_a_later_release(text: &str, refused: &anyhow::Error) -> bool {
+    let later_version = text
+        .strip_prefix('v')
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(version, _)| version.parse::<u32>().ok())
+        .is_some_and(|version| version > 1);
+    later_version
+        || refused
+            .chain()
+            .filter_map(|e| e.downcast_ref::<serde_json::Error>())
+            .any(|e| e.to_string().starts_with("unknown field"))
 }

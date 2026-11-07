@@ -671,8 +671,32 @@ fn a_camera_look_that_does_not_read_refuses_the_file() {
     std::fs::write(&path, &bytes).unwrap();
     let message = format!("{:#}", read(&path, Cancel::NEVER).err().unwrap());
     assert!(message.contains("Camera Look"), "{message}");
+    // A later carried version says that updating opens it.
+    assert!(message.contains("update RAWmakase to open it"), "{message}");
     // Its structure is sound: the header reads.
     assert!(read_header(&path).is_ok());
+}
+
+/// A later release's look says that updating opens it; one that is damaged
+/// doesn't.
+#[test]
+fn a_camera_look_from_a_later_release_is_told_apart() {
+    let damaged = anyhow::anyhow!("The fitted profile does not match its UUID");
+    assert!(look_from_a_later_release("v2:abc", &damaged));
+    assert!(look_from_a_later_release("v10:abc", &damaged));
+    assert!(!look_from_a_later_release("v1:abc", &damaged));
+    assert!(!look_from_a_later_release("abc", &damaged));
+    // A field this release doesn't know, as serde refuses it.
+    let unknown = serde_json::from_str::<CameraProfile>(r#"{"later_field": 1}"#).unwrap_err();
+    assert!(look_from_a_later_release(
+        "v1:abc",
+        &anyhow::Error::new(unknown)
+    ));
+    let malformed = serde_json::from_str::<CameraProfile>("{").unwrap_err();
+    assert!(!look_from_a_later_release(
+        "v1:abc",
+        &anyhow::Error::new(malformed)
+    ));
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> usize {
