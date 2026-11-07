@@ -257,8 +257,10 @@ pub(super) fn photo_cell(
     let action = photo_menu(
         &response,
         photo,
-        available,
-        editable_preview,
+        Presence {
+            available,
+            editable_preview,
+        },
         single,
         super::Module::Library,
         stacks,
@@ -530,6 +532,13 @@ fn stacking_menu(
     }
     choice
 }
+/// Whether a photo's file is `available`, and whether it has an
+/// `editable_preview` recorded that Develop could open it from while it isn't.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) struct Presence {
+    pub available: bool,
+    pub editable_preview: bool,
+}
 /// Whether Find on Disk… is offered: for one photo, offline.
 pub(in crate::app) fn find_on_disk_enabled(available: bool, single: bool) -> bool {
     !available && single
@@ -545,12 +554,15 @@ pub(in crate::app) fn find_on_disk_enabled(available: bool, single: bool) -> boo
 pub(in crate::app) fn photo_menu(
     response: &egui::Response,
     photo: &Photo,
-    available: bool,
-    editable_preview: bool,
+    presence: Presence,
     single: bool,
     module: super::Module,
     stacks: bool,
 ) -> Option<PhotoAction> {
+    let Presence {
+        available,
+        editable_preview,
+    } = presence;
     use crate::app::library::photo_metadata::{Edit, LABELS};
     use crate::app::ui::widgets::{menu_item, menu_separator, submenu_style};
     let mut action = None;

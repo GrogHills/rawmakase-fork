@@ -353,7 +353,7 @@ impl Editor {
         }
         // Decision 4 of the editable previews plan: masks already made keep
         // rendering, but none is made from an editable preview.
-        if self.document.from_editable_preview() {
+        if self.document.opened_from_preview() {
             return Some("Connect the original to use AI masks");
         }
         if self.document.full().is_none() {

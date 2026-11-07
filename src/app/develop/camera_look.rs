@@ -121,7 +121,7 @@ impl Editor {
     /// applied is part of the edit and keeps rendering.
     pub(in crate::app) fn camera_look_unavailable(&self) -> Option<&'static str> {
         self.document
-            .from_editable_preview()
+            .opened_from_preview()
             .then_some("Connect the original to fit a Camera Look")
     }
     /// Whether Profile → Fit Camera Look can run for the open photo: a RAW, decoded

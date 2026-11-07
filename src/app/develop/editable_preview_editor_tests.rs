@@ -198,7 +198,7 @@ fn an_offline_photo_opens_from_its_editable_preview_saves_and_loads_from_the_ori
     fx.open(a);
     let d = &fx.e.document;
     assert!(d.failed.is_none(), "{:?}", d.failed);
-    assert!(d.from_editable_preview());
+    assert!(d.opened_from_preview());
     assert_eq!(d.from.label(), "Editable Preview");
     assert_eq!(
         fx.e.opened_from().map(|(label, _)| label),
@@ -274,7 +274,7 @@ fn the_original_returning_while_open_keeps_the_preview_and_checks_saves_against_
     fx.e.document.edit.setup_mut().exposure = 0.3;
     fx.e.document.edit.save_state_mut().mark_changed();
     assert!(fx.e.flush());
-    assert!(fx.e.document.from_editable_preview());
+    assert!(fx.e.document.opened_from_preview());
     assert_eq!(fx.saved_exposure(a, &path), 0.3);
     assert!(fx.stored_identity(a).same_photo(&original));
     // Replaced while open: the file is read, and gets none of the edit.
@@ -299,7 +299,7 @@ fn a_failed_offline_save_stays_pending_and_keeps_the_photo_open() {
     let path = fx.path(a);
     let other = Identity {
         size: original.size + 1,
-        ..original.clone()
+        ..original
     };
     Catalog::open(catalog(&fx.e).location())
         .unwrap()
@@ -323,6 +323,16 @@ fn a_failed_offline_save_stays_pending_and_keeps_the_photo_open() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(fx.e.document.edit.save_state().needs_save());
+    // Refused by the catalog's check of the stored edit, not for the missing
+    // file: the save went through with the recorded identity.
+    let why =
+        fx.e.document
+            .edit
+            .save_state()
+            .message()
+            .unwrap()
+            .to_string();
+    assert!(why.contains("catalog edit protected"), "{why}");
     // Navigation saves first, fails again, and stays on the photo.
     fx.e.develop_catalog_photo(b);
     assert_eq!(fx.e.document.catalog_photo, Some(a));
@@ -470,13 +480,12 @@ fn stepping_and_automation_open_take_a_preview_and_pass_over_or_refuse_photos_wi
     let ctx = fx.ctx.clone();
     let refused =
         fx.e.execute_command(Command::new(Operation::Open(PhotoTarget::Id(b))), &ctx)
-            .err()
-            .expect("refused");
+            .expect_err("refused");
     assert_eq!(refused.code, "not_editable");
     fx.e.execute_command(Command::new(Operation::Open(PhotoTarget::Id(c))), &ctx)
         .unwrap();
     fx.wait_loaded();
-    assert!(fx.e.document.from_editable_preview());
+    assert!(fx.e.document.opened_from_preview());
     assert_eq!(fx.e.command_state().opened_from, Some("editable_preview"));
     // What Quick Develop and the menu are told, offline.
     let l = fx.e.library.as_ref().unwrap();
@@ -499,4 +508,164 @@ fn the_library_filters_photos_with_an_editable_preview() {
     assert_eq!(l.visible_ids(), vec![a]);
     l.show_only_editable_previews(false);
     assert_eq!(l.visible_ids().len(), 2);
+}
+
+#[test]
+fn autosave_saves_an_offline_edit_against_the_recorded_identity() {
+    let mut fx = fixture(&["a.dng"]);
+    let a = fx.id("a.dng");
+    let original = fx.build(a, false);
+    fx.take_offline(a);
+    fx.open(a);
+    fx.e.document.edit.setup_mut().exposure = 0.45;
+    fx.e.document.edit.save_state_mut().mark_changed();
+    let until = Instant::now() + Duration::from_secs(10);
+    while fx.e.document.edit.save_state().needs_save() {
+        fx.e.autosave(&fx.ctx);
+        fx.e.events(&fx.ctx);
+        assert!(
+            fx.e.document.edit.save_state().message().is_none(),
+            "{:?}",
+            fx.e.document.edit.save_state().message()
+        );
+        assert!(Instant::now() < until, "the save never ended");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let path = fx.path(a);
+    assert_eq!(
+        fx.saved_exposure(a, crate::edits::Original::recorded(&path, &original)),
+        0.45
+    );
+    assert_eq!(fx.stored_identity(a), original);
+}
+
+#[test]
+fn a_photo_moved_while_offline_keeps_saving_against_the_recorded_identity() {
+    let mut fx = fixture(&["a.dng"]);
+    let a = fx.id("a.dng");
+    let original = fx.build(a, false);
+    fx.take_offline(a);
+    fx.open(a);
+    // Its folder renamed, say: the original still not there at the new path.
+    let moved = fx.path(a).with_file_name("moved.dng");
+    fx.e.document.relink(moved);
+    assert_eq!(fx.e.document.file.as_ref(), Some(&original));
+    fx.e.document.edit.setup_mut().exposure = 0.25;
+    fx.e.document.edit.save_state_mut().mark_changed();
+    assert!(
+        fx.e.flush(),
+        "{:?}",
+        fx.e.document.edit.save_state().message()
+    );
+    assert_eq!(fx.stored_identity(a), original);
+}
+
+#[test]
+fn automation_output_is_refused_for_a_photo_open_from_its_editable_preview() {
+    let mut fx = fixture(&["a.dng"]);
+    let a = fx.id("a.dng");
+    fx.build(a, false);
+    let bytes = fx.take_offline(a);
+    fx.open(a);
+    // Even with the original back: nothing is decoded in the preview's place.
+    std::fs::write(fx.path(a), bytes).unwrap();
+    let ctx = fx.ctx.clone();
+    let out = fx._dir.path().join("out.jpg");
+    let refused =
+        fx.e.execute_command(
+            Command::new(Operation::Output {
+                path: out.clone(),
+                max_edge: 64,
+                space: Default::default(),
+            }),
+            &ctx,
+        )
+        .expect_err("refused");
+    assert_eq!(refused.code, "not_ready");
+    assert!(!out.exists());
+}
+
+/// A path that is there but can't be read (here a link to itself, which the
+/// file system can't resolve) is never taken for an offline original.
+#[cfg(unix)]
+#[test]
+fn an_original_that_is_there_but_unreadable_is_not_opened_from_its_preview() {
+    let mut fx = fixture(&["a.dng"]);
+    let a = fx.id("a.dng");
+    fx.build(a, false);
+    let path = fx.path(a);
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&path, &path).unwrap();
+    assert!(!path.is_file());
+    let refusal = fx.refusal(a).expect("refused");
+    assert!(
+        refusal.detail().contains("can't be read"),
+        "{}",
+        refusal.detail()
+    );
+}
+
+#[test]
+fn the_loupe_shows_an_unusable_preview_s_photo_as_before() {
+    let mut fx = fixture(&["a.dng", "b.dng"]);
+    let (a, b) = (fx.id("a.dng"), fx.id("b.dng"));
+    fx.build(a, false);
+    fx.build(b, false);
+    fx.take_offline(a);
+    fx.take_offline(b);
+    let file = catalog(&fx.e).editable_preview(b).unwrap().unwrap().path;
+    std::fs::remove_file(file).unwrap();
+    fx.e.editable_previews_changed();
+    let l = fx.e.library.as_mut().unwrap();
+    // The scan of which files are there finds them gone.
+    l.refresh().unwrap();
+    l.wait_for_availability();
+    l.select(Some(a));
+    l.open_loupe();
+    assert_eq!(l.loupe_develops(), Some(a));
+    assert_eq!(l.loupe_offline_developed(), None);
+    // A missing preview: the Loupe's own stored preview, as for any offline RAW.
+    l.select(Some(b));
+    assert_eq!(l.loupe_develops(), None);
+    assert_eq!(l.loupe_offline_developed(), Some(b));
+}
+
+#[test]
+fn undo_after_leaving_an_offline_photo_saves_against_its_recorded_identity() {
+    let mut fx = fixture(&["a.dng", "b.dng"]);
+    let (a, b) = (fx.id("a.dng"), fx.id("b.dng"));
+    let original = fx.build(a, false);
+    fx.take_offline(a);
+    fx.open(a);
+    let before = fx.e.document.edit.recipe().clone();
+    fx.e.document.edit.setup_mut().exposure = 1.;
+    fx.e.commit_edit(before, None);
+    assert!(fx.e.flush());
+    fx.e.sync_undo();
+    fx.open(b);
+    assert_eq!(fx.e.document.catalog_photo, Some(b));
+    fx.e.undo();
+    let path = fx.path(a);
+    assert_eq!(
+        fx.saved_exposure(a, crate::edits::Original::recorded(&path, &original)),
+        0.
+    );
+    assert_eq!(fx.stored_identity(a), original);
+}
+
+#[test]
+fn find_on_disk_saves_a_change_made_offline_rather_than_offer_to_discard_it() {
+    let mut fx = fixture(&["a.dng"]);
+    let a = fx.id("a.dng");
+    let original = fx.build(a, false);
+    fx.take_offline(a);
+    fx.open(a);
+    fx.e.document.edit.setup_mut().exposure = 0.35;
+    fx.e.document.edit.save_state_mut().mark_changed();
+    assert!(!fx.e.unsaved_on_missing_file());
+    let path = fx.path(a);
+    assert_eq!(
+        fx.saved_exposure(a, crate::edits::Original::recorded(&path, &original)),
+        0.35
+    );
 }

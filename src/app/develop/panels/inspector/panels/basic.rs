@@ -192,11 +192,13 @@ pub(in crate::app::develop::panels::inspector) fn show(
                         ui.close();
                     }
                     ui.separator();
-                    if ui
+                    let mut fit = ui
                         .add_enabled(can_fit_camera_look, egui::Button::new("Fit Camera Look"))
-                        .on_hover_text("Fits a look to this photo's own JPEG preview, the camera's rendering of it, and uses it as the profile: Camera Look (fitted). It is saved with the edit; fitting again makes a new one.")
-                        .on_disabled_hover_text(fit_camera_look_unavailable.unwrap_or_default())
-                        .clicked()
+                        .on_hover_text("Fits a look to this photo's own JPEG preview, the camera's rendering of it, and uses it as the profile: Camera Look (fitted). It is saved with the edit; fitting again makes a new one.");
+                    if let Some(why) = fit_camera_look_unavailable {
+                        fit = fit.on_disabled_hover_text(why);
+                    }
+                    if fit.clicked()
                     {
                         actions.push(Action::FitCameraLook);
                         ui.close();

@@ -509,7 +509,7 @@ impl Editor {
         let d = &self.document;
         if d.metadata.is_none() || d.full().is_none() {
             Some("it is still loading")
-        } else if d.from_editable_preview() {
+        } else if d.opened_from_preview() {
             // Editable previews are never exported (and never decoded again to
             // export in their place): an original back online is exported once
             // the photo is opened from it.

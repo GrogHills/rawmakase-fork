@@ -72,6 +72,30 @@ impl Editor {
         if !self.flush() {
             return false;
         }
+        // An offline photo opens from its editable preview, when it has a usable
+        // one. One without opens from its file, whose load says it can't be
+        // read; one whose editable preview can't be used says why instead.
+        let from = match photo {
+            Some(id) if !path.is_file() => {
+                let chosen = self
+                    .library
+                    .as_ref()
+                    .and_then(|l| l.photo(id).map(|p| (l, p)))
+                    .filter(|(_, p)| p.path == path)
+                    .map(|(l, p)| l.develop_from(p, false));
+                match chosen {
+                    Some(Ok(from)) => from,
+                    Some(Err(refusal @ crate::app::library::Refusal::EditablePreview(_))) => {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        self.messages
+                            .warn(format!("{name} can't be opened: {}", refusal.detail()));
+                        return false;
+                    }
+                    _ => crate::app::worker::OpenedFrom::Original,
+                }
+            }
+            _ => crate::app::worker::OpenedFrom::Original,
+        };
         // The photo left, saved with another edit: its built previews follow it.
         if let Some(left) = self.document.catalog_photo
             && self.left_edited(left)
@@ -97,18 +121,6 @@ impl Editor {
         if another && let Some(settings) = self.current_settings() {
             self.previous_settings = Some(settings);
         }
-        // An offline photo opens from its editable preview, when it has a usable
-        // one; otherwise from its file, whose load says why it can't be read.
-        let from = match photo {
-            Some(id) if !path.is_file() => self
-                .library
-                .as_ref()
-                .and_then(|l| l.photo(id).map(|p| (l, p)))
-                .filter(|(_, p)| p.path == path)
-                .and_then(|(l, p)| l.develop_from(p, false).ok())
-                .unwrap_or_default(),
-            _ => crate::app::worker::OpenedFrom::Original,
-        };
         let (id, cancel) = self.document.open(photo);
         // The reference photo stays on screen from photo to photo; Before goes.
         let reference = self
@@ -296,7 +308,7 @@ impl Editor {
             photo,
             raw,
             source,
-            from_editable_preview: self.document.from_editable_preview(),
+            from_editable_preview: self.document.opened_from_preview(),
             recipe: self.document.edit.recipe().clone(),
             export: self.document.export.clone(),
             history: self
@@ -642,7 +654,13 @@ impl Editor {
         let mut at = first;
         loop {
             let photo = library.photo(at)?;
-            if at == id || library.develop_from(photo, photo.path.is_file()).is_ok() {
+            // An offline photo without an editable preview recorded is passed
+            // over by its file alone, as before; only the others are asked.
+            let online = photo.path.is_file();
+            if at == id
+                || ((online || library.has_editable_preview(at))
+                    && library.develop_from(photo, online).is_ok())
+            {
                 return Some(at);
             }
             match library.navigate(at, step) {

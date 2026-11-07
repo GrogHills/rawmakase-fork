@@ -143,7 +143,7 @@ impl crate::app::Editor {
         let renders = self.document.edit.recipe().ai_denoise.renders();
         // An editable preview has no sensor data to denoise: the photo shows
         // plain, and the Detail panel says why.
-        if !renders || self.document.from_editable_preview() {
+        if !renders || self.document.opened_from_preview() {
             self.document.ai.release();
             return;
         }

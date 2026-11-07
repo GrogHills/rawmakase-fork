@@ -284,6 +284,10 @@ pub(crate) struct Library {
     /// as the catalog recorded them when the Library last filtered or was told
     /// of a build or discard.
     editable_previews: std::collections::BTreeSet<PhotoId>,
+    /// The offline photo last asked whether Develop would open it from its
+    /// editable preview ([`Self::develops_from_preview`]), and the answer, so the
+    /// Loupe asks once each time it comes to it rather than every frame.
+    preview_usable: std::cell::RefCell<Option<(PhotoId, bool)>>,
     /// Read Metadata from Files while it reads.
     reread: Option<descriptive::Reread>,
     /// Read Metadata from Files finished since the editor last asked.
@@ -366,6 +370,7 @@ impl Library {
             loupe_stored: None,
             refusal_shown: None,
             editable_previews: Default::default(),
+            preview_usable: Default::default(),
             reread: None,
             reread_finished: false,
         };
@@ -575,6 +580,36 @@ impl Library {
             .map(|i| self.session.photos()[*i].id)
             .collect()
     }
+    /// The identity photo `id`'s editable preview recorded of its original, when
+    /// the original is offline and Develop would open the photo from it
+    /// ([`Self::develop_from`]): what stands in for the file when its edit is
+    /// changed without it being open (Undo).
+    pub(in crate::app) fn recorded_original(
+        &self,
+        id: PhotoId,
+    ) -> Option<crate::storage::Identity> {
+        let photo = self.photo(id)?;
+        match self.develop_from(photo, photo.path.is_file()) {
+            Ok(crate::app::worker::OpenedFrom::EditablePreview(preview)) => Some(preview.original),
+            _ => None,
+        }
+    }
+    /// Whether Develop would open offline `photo` from its editable preview
+    /// ([`Self::develop_from`]), checked once while it stays the photo asked
+    /// about: for the Loupe, which asks every frame.
+    pub(in crate::app) fn develops_from_preview(&self, photo: &Photo) -> bool {
+        if !self.has_editable_preview(photo.id) {
+            return false;
+        }
+        if let Some((id, usable)) = *self.preview_usable.borrow()
+            && id == photo.id
+        {
+            return usable;
+        }
+        let usable = self.develop_from(photo, false).is_ok();
+        self.preview_usable.replace(Some((photo.id, usable)));
+        usable
+    }
     /// How many photos have an editable preview, virtual copies included.
     pub(in crate::app) fn editable_preview_count(&self) -> usize {
         self.editable_previews.len()
@@ -582,6 +617,9 @@ impl Library {
     /// Editable previews were built or discarded: reads which photos have one
     /// again, and filters again when only those are shown.
     pub(in crate::app) fn editable_previews_changed(&mut self) {
+        // What the right panel and the Loupe say of a photo may have changed.
+        self.refusal_shown = None;
+        self.preview_usable.replace(None);
         if self.filters.only_editable_previews {
             self.filter();
         } else {
@@ -615,6 +653,15 @@ impl Library {
             return Ok(OpenedFrom::Original);
         }
         let unusable = |why: &str| Err(Refusal::EditablePreview(why.into()));
+        // Saves stand the recorded identity in only for a file certainly not
+        // there; one that is there but can't be read is never edited from its
+        // preview, as nothing it saved could be checked.
+        if !crate::edits::Original::is_absent(&photo.path) {
+            return match self.session.catalog().offline_editable_preview(photo.id) {
+                Ok(crate::catalog::OfflinePreview::None) => Err(Refusal::Offline),
+                _ => unusable("its original is there but can't be read"),
+            };
+        }
         match self.session.catalog().offline_editable_preview(photo.id) {
             Ok(OfflinePreview::None) => Err(Refusal::Offline),
             Ok(OfflinePreview::Missing(_)) => unusable("its file is missing"),
@@ -1382,6 +1429,7 @@ impl Library {
             self.filters.collection = None;
             self.filters.previous_import = false;
             self.filters.only_missing = false;
+            self.filters.only_editable_previews = false;
             self.selected_folders.clear();
             self.filter();
         }

@@ -102,17 +102,23 @@ impl<'a> Original<'a> {
         }
     }
     /// The photo's identity: its file's, read now; else, only when the file is
-    /// certainly not there (not merely unreadable), the recorded one.
+    /// certainly not there ([`Original::is_absent`]), the recorded one.
     pub fn identity(&self) -> Result<Identity> {
         match Identity::read(self.path) {
             Ok(now) => Ok(now),
             Err(e) => match self.recorded {
-                Some(recorded) if matches!(self.path.try_exists(), Ok(false)) => {
-                    Ok(recorded.clone())
-                }
+                Some(recorded) if Self::is_absent(self.path) => Ok(recorded.clone()),
                 _ => Err(e),
             },
         }
+    }
+    /// Whether nothing is at `path`, as far as the file system can say: not
+    /// merely unreadable (a folder without permission, a network share that
+    /// stopped answering). The one rule for when an editable preview's identity
+    /// may stand in for its original, so a photo is opened from its editable
+    /// preview only when its saves could be checked that way too.
+    pub fn is_absent(path: &Path) -> bool {
+        matches!(path.try_exists(), Ok(false))
     }
 }
 impl<'a> From<&'a Path> for Original<'a> {

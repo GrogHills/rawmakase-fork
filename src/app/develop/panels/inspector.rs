@@ -478,7 +478,7 @@ impl Editor {
             status: self.document.ai.status().cloned(),
             unavailable: self
                 .document
-                .from_editable_preview()
+                .opened_from_preview()
                 .then_some(crate::app::develop::ai_denoise::CONNECT_FOR_AI_DENOISE),
         };
         // Cached per camera: this scans Adobe's profile folders.

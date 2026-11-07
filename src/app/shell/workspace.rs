@@ -993,7 +993,7 @@ impl Editor {
             return;
         };
         library.loupe_overlay(ui.painter(), area);
-        if self.document.from_editable_preview() {
+        if self.document.opened_from_preview() {
             crate::app::develop::viewport::source_badge(
                 ui,
                 area,
@@ -1900,7 +1900,7 @@ impl Editor {
             )
             .show(ui, |ui| {
                 let response = self.viewport_ui(ui);
-                if self.document.from_editable_preview() {
+                if self.document.opened_from_preview() {
                     crate::app::develop::viewport::source_badge(
                         ui,
                         response.rect,

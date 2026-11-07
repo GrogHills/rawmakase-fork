@@ -511,7 +511,15 @@ impl Document {
     /// whether it still needs saving; a save that failed on the old path is
     /// tried again on the new one.
     pub(in crate::app) fn relink(&mut self, path: PathBuf) {
-        self.file = crate::storage::Identity::read(&path).ok();
+        // Opened from its editable preview with its original still not there
+        // (its folder moved, say), the recorded identity stays what saves are
+        // checked against.
+        let recorded = self
+            .from
+            .editable_preview()
+            .filter(|_| crate::edits::Original::is_absent(&path))
+            .map(|preview| preview.original.clone());
+        self.file = crate::storage::Identity::read(&path).ok().or(recorded);
         self.path = Some(path);
         self.edit.save_state_mut().retry_now();
     }
@@ -839,7 +847,7 @@ impl Document {
         }
     }
     /// Whether the photo was opened from its editable preview.
-    pub(in crate::app) fn from_editable_preview(&self) -> bool {
+    pub(in crate::app) fn opened_from_preview(&self) -> bool {
         self.from.is_final_reduced()
     }
     pub(crate) fn full(&self) -> Option<&Arc<CameraImage>> {
