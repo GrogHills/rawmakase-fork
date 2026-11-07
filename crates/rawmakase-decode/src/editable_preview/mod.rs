@@ -68,6 +68,8 @@ mod fields;
 #[cfg(test)]
 mod measure;
 #[cfg(test)]
+mod measured_tone;
+#[cfg(test)]
 mod tests;
 
 use crate::storage::Identity;
