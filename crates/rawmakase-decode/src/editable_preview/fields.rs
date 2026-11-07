@@ -1,4 +1,4 @@
-//! The record encoding every section of a smart preview but its pixels uses: a
+//! The record encoding every section of an editable preview but its pixels uses: a
 //! list of fields, each a `u16` id, a `u32` byte length and that many bytes, all
 //! little-endian, in increasing id order with no id twice. A reader looks fields
 //! up by id, so a field it doesn't know is skipped and a field missing takes its
@@ -20,10 +20,10 @@ impl Writer {
     pub(super) fn bytes(&mut self, id: u16, value: &[u8]) {
         assert!(
             self.last.is_none_or(|last| last < id),
-            "smart preview field {id} written out of order"
+            "editable preview field {id} written out of order"
         );
         self.last = Some(id);
-        let len = u32::try_from(value.len()).expect("a smart preview field under 4 GiB");
+        let len = u32::try_from(value.len()).expect("an editable preview field under 4 GiB");
         self.bytes.extend(id.to_le_bytes());
         self.bytes.extend(len.to_le_bytes());
         self.bytes.extend_from_slice(value);
@@ -96,15 +96,15 @@ impl<'a> Record<'a> {
         while !bytes.is_empty() {
             ensure!(
                 bytes.len() >= 6,
-                "A smart preview record ends inside a field"
+                "An editable preview record ends inside a field"
             );
             let id = u16::from_le_bytes([bytes[0], bytes[1]]);
             let len = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
             let value = bytes
                 .get(6..6 + len)
-                .context("A smart preview field runs past its record")?;
+                .context("An editable preview field runs past its record")?;
             if let Some((last, _)) = fields.last() {
-                ensure!(*last < id, "Smart preview fields out of order");
+                ensure!(*last < id, "Editable preview fields out of order");
             }
             fields.push((id, value));
             bytes = &bytes[6 + len..];
@@ -125,7 +125,7 @@ impl<'a> Record<'a> {
         self.bytes(id)
             .map(|b| {
                 <[u8; N]>::try_from(b).ok().with_context(|| {
-                    format!("Smart preview field {id} has {} bytes, not {N}", b.len())
+                    format!("Editable preview field {id} has {} bytes, not {N}", b.len())
                 })
             })
             .transpose()
@@ -141,7 +141,7 @@ impl<'a> Record<'a> {
             None => Ok(None),
             Some(0) => Ok(Some(false)),
             Some(1) => Ok(Some(true)),
-            Some(v) => bail!("Smart preview field {id} is {v}, not a yes or no"),
+            Some(v) => bail!("Editable preview field {id} is {v}, not a yes or no"),
         }
     }
     pub(super) fn u32(&self, id: u16) -> Result<Option<u32>> {
@@ -153,7 +153,7 @@ impl<'a> Record<'a> {
         };
         ensure!(
             b.len() == N * 4,
-            "Smart preview field {id} has {} bytes, not {}",
+            "Editable preview field {id} has {} bytes, not {}",
             b.len(),
             N * 4
         );
@@ -176,7 +176,7 @@ impl<'a> Record<'a> {
         };
         ensure!(
             b.len().is_multiple_of(4),
-            "Smart preview field {id} is not a list of numbers"
+            "Editable preview field {id} is not a list of numbers"
         );
         Ok(Some(
             b.as_chunks::<4>()
@@ -191,7 +191,10 @@ impl<'a> Record<'a> {
             return Ok(None);
         };
         <[f32; N]>::try_from(v).map(Some).map_err(|v| {
-            anyhow::anyhow!("Smart preview field {id} has {} numbers, not {N}", v.len())
+            anyhow::anyhow!(
+                "Editable preview field {id} has {} numbers, not {N}",
+                v.len()
+            )
         })
     }
     pub(super) fn f32(&self, id: u16) -> Result<Option<f32>> {
@@ -202,7 +205,7 @@ impl<'a> Record<'a> {
             .map(|b| {
                 String::from_utf8(b.to_vec())
                     .ok()
-                    .with_context(|| format!("Smart preview field {id} is not UTF-8 text"))
+                    .with_context(|| format!("Editable preview field {id} is not UTF-8 text"))
             })
             .transpose()
     }
@@ -214,16 +217,16 @@ impl<'a> Record<'a> {
         while !b.is_empty() {
             ensure!(
                 b.len() >= 4,
-                "Smart preview field {id} ends inside a string"
+                "Editable preview field {id} ends inside a string"
             );
             let len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
             let s = b
                 .get(4..4 + len)
-                .with_context(|| format!("Smart preview field {id} ends inside a string"))?;
+                .with_context(|| format!("Editable preview field {id} ends inside a string"))?;
             out.push(
                 String::from_utf8(s.to_vec())
                     .ok()
-                    .with_context(|| format!("Smart preview field {id} is not UTF-8 text"))?,
+                    .with_context(|| format!("Editable preview field {id} is not UTF-8 text"))?,
             );
             b = &b[4 + len..];
         }

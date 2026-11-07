@@ -11,7 +11,7 @@ pub(super) fn encode(width: u32, height: u32, codes: &[[u16; 3]]) -> Result<Vec<
     use zune_core::{bit_depth::BitDepth, colorspace::ColorSpace, options::EncoderOptions};
     ensure!(
         codes.len() == width as usize * height as usize,
-        "A smart preview's pixels have the wrong size"
+        "An editable preview's pixels have the wrong size"
     );
     let bytes: Vec<u8> = codes
         .iter()
@@ -27,7 +27,7 @@ pub(super) fn encode(width: u32, height: u32, codes: &[[u16; 3]]) -> Result<Vec<
     let mut out = Vec::new();
     zune_jpegxl::JxlSimpleEncoder::new(&bytes, options)
         .encode(&mut out)
-        .map_err(|e| anyhow::anyhow!("Smart preview encoding failed: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("Editable preview encoding failed: {e:?}"))?;
     Ok(out)
 }
 
@@ -47,7 +47,7 @@ pub(super) fn decode(data: &[u8], width: u32, height: u32) -> Result<Vec<[u16; 3
         .saturating_mul(BYTES_PER_SAMPLE)
         .max(MIN_BYTES);
     let jxl = |e: Box<dyn std::error::Error + Send + Sync>| {
-        anyhow::anyhow!("A smart preview's pixels are damaged: {e}")
+        anyhow::anyhow!("An editable preview's pixels are damaged: {e}")
     };
     let mut uninit = JxlImage::builder()
         .alloc_tracker(AllocTracker::with_limit(limit))
@@ -56,12 +56,12 @@ pub(super) fn decode(data: &[u8], width: u32, height: u32) -> Result<Vec<[u16; 3
     let mut image = match uninit.try_init().map_err(jxl)? {
         InitializeResult::Initialized(image) => image,
         InitializeResult::NeedMoreData(_) => {
-            anyhow::bail!("A smart preview's pixels are cut short")
+            anyhow::bail!("An editable preview's pixels are cut short")
         }
     };
     ensure!(
         (image.width() as usize, image.height() as usize) == (w, h),
-        "A smart preview's pixels are not the size its header gives"
+        "An editable preview's pixels are not the size its header gives"
     );
     let metadata = &image.image_header().metadata;
     ensure!(
@@ -72,7 +72,7 @@ pub(super) fn decode(data: &[u8], width: u32, height: u32) -> Result<Vec<[u16; 3
             }
         ) && !metadata.xyb_encoded
             && !metadata.grayscale(),
-        "A smart preview's pixels are not 16-bit lossless RGB"
+        "An editable preview's pixels are not 16-bit lossless RGB"
     );
     let mut rest = data.get(used..).unwrap_or_default();
     while !rest.is_empty() {
@@ -85,18 +85,18 @@ pub(super) fn decode(data: &[u8], width: u32, height: u32) -> Result<Vec<[u16; 3
     image.finalize().map_err(jxl)?;
     ensure!(
         image.num_loaded_keyframes() == 1,
-        "A smart preview's pixels are cut short"
+        "An editable preview's pixels are cut short"
     );
     let render = image.render_frame(0).map_err(jxl)?;
     let mut stream = render.stream_no_alpha();
     ensure!(
         stream.channels() == 3 && (stream.width() as usize, stream.height() as usize) == (w, h),
-        "A smart preview's pixels are not three channels"
+        "An editable preview's pixels are not three channels"
     );
     let mut samples = vec![0f32; w * h * 3];
     ensure!(
         stream.write_to_buffer(&mut samples) == samples.len(),
-        "A smart preview's pixels are cut short"
+        "An editable preview's pixels are cut short"
     );
     // jxl-oxide gives an integer sample s of a 16-bit image as s / 65535, exactly
     // enough in single precision for the rounding to recover s.
@@ -110,5 +110,5 @@ pub(super) fn decode(data: &[u8], width: u32, height: u32) -> Result<Vec<[u16; 3
         .iter()
         .map(|p| Some([code(p[0])?, code(p[1])?, code(p[2])?]))
         .collect::<Option<Vec<_>>>()
-        .context("A smart preview's pixels are out of range")
+        .context("An editable preview's pixels are out of range")
 }

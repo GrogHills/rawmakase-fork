@@ -1,10 +1,10 @@
-//! Smart previews: a reduced copy of a photo, about 2560 pixels on the long edge,
+//! Editable previews: a reduced copy of a photo, about 2560 pixels on the long edge,
 //! built while its original is online so that Develop can edit the photo while the
-//! original is offline. A smart preview is not a cache: once the original is
+//! original is offline. An editable preview is not a cache: once the original is
 //! offline it cannot be rebuilt, so **every format version ever written stays
 //! readable**. This module owns the file format; which photos have one and where
 //! the files live is the catalog's (one file per master photo, named
-//! `<photo id>-<identity key>.rmsp`, the key being the original's
+//! `<photo id>-<identity key>.rmep`, the key being the original's
 //! [`Identity::key`]).
 //!
 //! # Layout, version 1
@@ -13,7 +13,7 @@
 //!
 //! | Bytes | Content |
 //! | --- | --- |
-//! | 8 | Magic, `RMKSMPV\0` |
+//! | 8 | Magic, `RMKEDPV\0` |
 //! | 4 | Format version, `u32`: 1 |
 //! | … | Sections, to the end of the file |
 //!
@@ -32,7 +32,7 @@
 //! - `FACT`, a record: the original's [`Metadata`] field by field, with defaults
 //!   for fields missing (`facts`).
 //! - `EXIF`, a record: the camera's EXIF ([`photo::camera_exif`](crate::photo::camera_exif)),
-//!   kept so that exporting from a smart preview can be added later; empty when the
+//!   kept so that exporting from an editable preview can be added later; empty when the
 //!   original has none.
 //! - `PIXL`: the pixels in the codec's encoding. Codec 1, the only one version 1
 //!   knows, is a lossless JPEG XL codestream of three 16-bit channels (`codec`);
@@ -62,10 +62,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-const MAGIC: &[u8; 8] = b"RMKSMPV\0";
+const MAGIC: &[u8; 8] = b"RMKEDPV\0";
 /// The format version this release writes.
 pub const VERSION: u32 = 1;
-/// The long edge Develop's smart previews are built at, as Lightroom Classic's.
+/// The long edge Develop's editable previews are built at, as Lightroom Classic's.
 pub const LONG_EDGE: u32 = 2560;
 
 const HEAD: [u8; 4] = *b"HEAD";
@@ -94,7 +94,7 @@ const MAX_ORIGINAL_PIXELS: u64 = 1 << 34;
 /// The largest `HEAD`, `FACT` or `EXIF` section read.
 const MAX_RECORD: u64 = 64 << 20;
 
-/// How a smart preview's pixels are coded.
+/// How an editable preview's pixels are coded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     /// Lossless JPEG XL, three 16-bit channels on the log curve (code 1).
@@ -110,28 +110,28 @@ impl Codec {
         match code {
             1 => Ok(Codec::LosslessJxl16),
             _ => bail!(
-                "This smart preview's pixels are coded in a way (codec {code}) only a later release of RAWmakase reads"
+                "This editable preview's pixels are coded in a way (codec {code}) only a later release of RAWmakase reads"
             ),
         }
     }
 }
 
-/// What the catalog needs from a smart preview file, read without decoding its
+/// What the catalog needs from an editable preview file, read without decoding its
 /// pixels ([`read_header`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     pub version: u32,
     pub codec: Codec,
-    /// The original's identity when the smart preview was built.
+    /// The original's identity when the editable preview was built.
     pub identity: Identity,
     /// The original's full decoded size, width and height.
     pub original: [u32; 2],
-    /// The smart preview's own size, width and height.
+    /// The editable preview's own size, width and height.
     pub preview: [u32; 2],
 }
 
-/// A smart preview: the reduced camera image, standing for its original.
-pub struct SmartPreview {
+/// An editable preview: the reduced camera image, standing for its original.
+pub struct EditablePreview {
     /// The format version of the file it was read from; [`VERSION`] for one built.
     version: u32,
     codec: Codec,
@@ -143,7 +143,7 @@ pub struct SmartPreview {
     image: CameraImage,
 }
 
-impl SmartPreview {
+impl EditablePreview {
     /// The camera image to develop: `fast`, a reduced decode, its pixels already
     /// recovered, and its metadata the original's (its width and height the
     /// original's full size). The imported lens profiles that fit are not part of
@@ -173,7 +173,7 @@ impl SmartPreview {
     }
 }
 
-/// The smart preview of `original`, the full-size decode of the file `identity`
+/// The editable preview of `original`, the full-size decode of the file `identity`
 /// names, at `long_edge` pixels on its long edge (never enlarged), with the camera's
 /// `exif`.
 ///
@@ -188,31 +188,31 @@ pub fn build(
     exif: Option<CameraExif>,
     long_edge: u32,
     cancel: Cancel<'_>,
-) -> Result<SmartPreview> {
+) -> Result<EditablePreview> {
     ensure!(
         original.hdr().is_none() && original.metadata.hdr_source.is_none(),
-        "A smart preview can't keep an HDR file's light yet"
+        "An editable preview can't keep an HDR file's light yet"
     );
     ensure!(
         !original.fast,
-        "A smart preview is built from a full-size decode"
+        "An editable preview is built from a full-size decode"
     );
     ensure!(
         original.width > 0
             && original.height > 0
             && original.pixels.len() == original.width as usize * original.height as usize,
-        "A smart preview's original has no pixels"
+        "An editable preview's original has no pixels"
     );
-    ensure!(long_edge >= 2, "A smart preview needs a size");
+    ensure!(long_edge >= 2, "An editable preview needs a size");
     rawmakase_model::lens::auto_ca::prime(original);
     let recovered = crate::develop::quality::recovered(original, cancel)?;
-    ensure!(!cancel.is_cancelled(), "Smart preview cancelled");
+    ensure!(!cancel.is_cancelled(), "Editable preview cancelled");
     let reduced = crate::develop::preview(&recovered, long_edge);
-    ensure!(!cancel.is_cancelled(), "Smart preview cancelled");
+    ensure!(!cancel.is_cancelled(), "Editable preview cancelled");
     // The JPEG XL encoder codes 2 × 2 pixels and more.
     ensure!(
         reduced.width >= 2 && reduced.height >= 2,
-        "A photo this narrow can't have a smart preview"
+        "A photo this narrow can't have an editable preview"
     );
     let codes = encode_pixels(&reduced.pixels);
     let lateral_ca = Arc::new(std::sync::OnceLock::new());
@@ -228,7 +228,7 @@ pub fn build(
         [reduced.width, reduced.height],
         [original.width, original.height],
     )?;
-    Ok(SmartPreview {
+    Ok(EditablePreview {
         version: VERSION,
         codec: Codec::LosslessJxl16,
         identity: identity.clone(),
@@ -251,7 +251,7 @@ fn encode_pixels(pixels: &[[f32; 3]]) -> Vec<[u16; 3]> {
     pixels.par_iter().map(|p| p.map(curve::encode)).collect()
 }
 
-/// The camera image of `codes`, as [`SmartPreview::image`] describes it.
+/// The camera image of `codes`, as [`EditablePreview::image`] describes it.
 fn image_of(
     width: u32,
     height: u32,
@@ -284,20 +284,20 @@ fn image_of(
 /// Writes `preview` to `path`: a temporary file in the same folder, synced, then
 /// renamed to `path` only if nothing has that name. An existing file is never
 /// replaced; that is an error of kind [`std::io::ErrorKind::AlreadyExists`]. A
-/// crash may leave the temporary file (`.rmsp-*.tmp`) behind for the folder's
+/// crash may leave the temporary file (`.rmep-*.tmp`) behind for the folder's
 /// owner to remove.
 ///
 /// On a volume with neither an exclusive rename nor hard links (exFAT on macOS)
 /// the file is copied into a name created only if free
 /// ([`storage::persist_noclobber`](crate::storage::persist_noclobber)). A crash
 /// during that copy can leave a partial file under the name: [`read`] refuses it,
-/// and whoever rebuilds the smart preview removes it first, or this write fails
+/// and whoever rebuilds the editable preview removes it first, or this write fails
 /// with `AlreadyExists`.
 ///
 /// The folder is synced after the rename, so an error can follow a file already
 /// complete at `path`: after a failed write, [`read`] tells whether the file is
 /// usable before anything removes it.
-pub fn write(path: &Path, preview: &SmartPreview) -> Result<()> {
+pub fn write(path: &Path, preview: &EditablePreview) -> Result<()> {
     let image = &preview.image;
     check_sizes([image.width, image.height], preview.original)?;
     let codes = encode_pixels(&image.pixels);
@@ -321,7 +321,7 @@ pub fn write(path: &Path, preview: &SmartPreview) -> Result<()> {
 
     let dir = crate::storage::parent_dir(path);
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".rmsp-").suffix(".tmp");
+    builder.prefix(".rmep-").suffix(".tmp");
     // Readable as any file the user makes (the umask applies), not only by its owner
     // as a temporary file is.
     #[cfg(unix)]
@@ -357,7 +357,7 @@ fn check_sizes(preview: [u32; 2], original: [u32; 2]) -> Result<()> {
     ensure!(
         within(preview, MAX_SIDE, MAX_PIXELS)
             && within(original, MAX_ORIGINAL_SIDE, MAX_ORIGINAL_PIXELS),
-        "A smart preview of {}×{} pixels for an original of {}×{} is larger than smart previews may be",
+        "An editable preview of {}×{} pixels for an original of {}×{} is larger than editable previews may be",
         preview[0],
         preview[1],
         original[0],
@@ -371,17 +371,17 @@ fn hash(bytes: &[u8]) -> u64 {
 }
 
 /// The magic and version at the start of `file`; an error for anything but a
-/// smart preview this release reads.
+/// editable preview this release reads.
 fn read_version(file: &mut impl Read) -> Result<u32> {
     let mut start = [0; 12];
     file.read_exact(&mut start)
-        .context("Not a smart preview: the file is too short")?;
-    ensure!(&start[..8] == MAGIC, "Not a smart preview");
+        .context("Not an editable preview: the file is too short")?;
+    ensure!(&start[..8] == MAGIC, "Not an editable preview");
     let version = u32::from_le_bytes([start[8], start[9], start[10], start[11]]);
-    ensure!(version != 0, "Not a smart preview: version 0");
+    ensure!(version != 0, "Not an editable preview: version 0");
     ensure!(
         version <= VERSION,
-        "This smart preview is format version {version}, newer than this release of RAWmakase reads (version {VERSION}): update RAWmakase to open it"
+        "This editable preview is format version {version}, newer than this release of RAWmakase reads (version {VERSION}): update RAWmakase to open it"
     );
     Ok(version)
 }
@@ -390,7 +390,7 @@ fn read_version(file: &mut impl Read) -> Result<u32> {
 fn read_section_start(file: &mut impl Read) -> Result<([u8; 4], u64)> {
     let mut start = [0; 12];
     file.read_exact(&mut start)
-        .context("A smart preview is cut short inside a section")?;
+        .context("An editable preview is cut short inside a section")?;
     let tag = [start[0], start[1], start[2], start[3]];
     let len = u64::from_le_bytes(start[4..].try_into().expect("8 bytes"));
     Ok((tag, len))
@@ -406,18 +406,23 @@ struct Head {
 
 fn read_head(payload: &[u8]) -> Result<Head> {
     let r = Record::parse(payload)?;
-    let codec = Codec::of(r.u8(CODEC)?.context("A smart preview without its codec")?)?;
-    let curve = r.u8(CURVE)?.context("A smart preview without its curve")?;
+    let codec = Codec::of(
+        r.u8(CODEC)?
+            .context("An editable preview without its codec")?,
+    )?;
+    let curve = r
+        .u8(CURVE)?
+        .context("An editable preview without its curve")?;
     ensure!(
         curve == CURVE_LOG,
-        "This smart preview's pixels are on a curve ({curve}) only a later release of RAWmakase reads"
+        "This editable preview's pixels are on a curve ({curve}) only a later release of RAWmakase reads"
     );
     let preview = r
         .u32_array::<2>(PREVIEW_SIZE)?
-        .context("A smart preview without its size")?;
+        .context("An editable preview without its size")?;
     let original = r
         .u32_array::<2>(ORIGINAL_SIZE)?
-        .context("A smart preview without its original's size")?;
+        .context("An editable preview without its original's size")?;
     check_sizes(preview, original)?;
     Ok(Head {
         codec,
@@ -428,7 +433,7 @@ fn read_head(payload: &[u8]) -> Result<Head> {
 }
 
 /// The format version, the original's identity and size, and the preview's size of
-/// the smart preview at `path`, without decoding its pixels. The file's structure is
+/// the editable preview at `path`, without decoding its pixels. The file's structure is
 /// checked to its end, so a file cut short is refused, but only the HEAD section's
 /// hash is: [`read`] checks the rest.
 pub fn read_header(path: &Path) -> Result<Header> {
@@ -438,11 +443,11 @@ pub fn read_header(path: &Path) -> Result<Header> {
     let (tag, len) = read_section_start(&mut file)?;
     ensure!(
         tag == HEAD,
-        "A smart preview must start with its HEAD section"
+        "An editable preview must start with its HEAD section"
     );
     ensure!(
         len <= MAX_RECORD && 12 + 12 + len + 8 <= size,
-        "A smart preview is cut short inside its HEAD section"
+        "An editable preview is cut short inside its HEAD section"
     );
     let mut payload = vec![0; len as usize];
     file.read_exact(&mut payload)?;
@@ -450,7 +455,7 @@ pub fn read_header(path: &Path) -> Result<Header> {
     file.read_exact(&mut stored)?;
     ensure!(
         u64::from_le_bytes(stored) == hash(&payload),
-        "A smart preview's HEAD section is damaged"
+        "An editable preview's HEAD section is damaged"
     );
     let head = read_head(&payload)?;
     // The other sections' lengths, to the end of the file.
@@ -462,14 +467,14 @@ pub fn read_header(path: &Path) -> Result<Header> {
             .checked_add(12 + 8)
             .and_then(|v| v.checked_add(len))
             .filter(|end| *end <= size)
-            .context("A smart preview is cut short")?;
+            .context("An editable preview is cut short")?;
         seen.push(tag);
         file.seek(SeekFrom::Start(end))?;
         at = end;
     }
     ensure!(
         [FACT, EXIF, PIXL].iter().all(|t| seen.contains(t)),
-        "A smart preview is cut short"
+        "An editable preview is cut short"
     );
     Ok(Header {
         version,
@@ -480,11 +485,11 @@ pub fn read_header(path: &Path) -> Result<Header> {
     })
 }
 
-/// The smart preview at `path`, its pixels decoded. Any damage, a file cut short, or
+/// The editable preview at `path`, its pixels decoded. Any damage, a file cut short, or
 /// a version, codec or fact only a later release knows is an error.
-pub fn read(path: &Path, cancel: Cancel<'_>) -> Result<SmartPreview> {
+pub fn read(path: &Path, cancel: Cancel<'_>) -> Result<EditablePreview> {
     let bytes = std::fs::read(path)?;
-    ensure!(!cancel.is_cancelled(), "Smart preview cancelled");
+    ensure!(!cancel.is_cancelled(), "Editable preview cancelled");
     let mut rest: &[u8] = &bytes;
     let version = read_version(&mut rest)?;
     let mut head = None;
@@ -496,18 +501,18 @@ pub fn read(path: &Path, cancel: Cancel<'_>) -> Result<SmartPreview> {
         let len = usize::try_from(len)
             .ok()
             .filter(|len| len.checked_add(8).is_some_and(|n| n <= rest.len()))
-            .context("A smart preview is cut short")?;
+            .context("An editable preview is cut short")?;
         let (payload, after) = rest.split_at(len);
         let (stored, after) = after.split_at(8);
         ensure!(
             u64::from_le_bytes(stored.try_into().expect("8 bytes")) == hash(payload),
-            "A smart preview's {} section is damaged",
+            "An editable preview's {} section is damaged",
             String::from_utf8_lossy(&tag)
         );
         rest = after;
         ensure!(
             tag == HEAD || head.is_some(),
-            "A smart preview must start with its HEAD section"
+            "An editable preview must start with its HEAD section"
         );
         let slot = match tag {
             HEAD => &mut head,
@@ -518,23 +523,23 @@ pub fn read(path: &Path, cancel: Cancel<'_>) -> Result<SmartPreview> {
         };
         ensure!(
             slot.replace(payload).is_none(),
-            "A smart preview has two {} sections",
+            "An editable preview has two {} sections",
             String::from_utf8_lossy(&tag)
         );
     }
     let (Some(head), Some(fact), Some(exif), Some(pixl)) = (head, fact, exif, pixl) else {
-        bail!("A smart preview is cut short");
+        bail!("An editable preview is cut short");
     };
     let head = read_head(head)?;
     let (metadata, scale) = facts::read_metadata(&Record::parse(fact)?, head.original)?;
     let exif = facts::read_exif(&Record::parse(exif)?)?;
-    ensure!(!cancel.is_cancelled(), "Smart preview cancelled");
+    ensure!(!cancel.is_cancelled(), "Editable preview cancelled");
     let [width, height] = head.preview;
     let codes = match head.codec {
         Codec::LosslessJxl16 => codec::decode(pixl, width, height)?,
     };
-    ensure!(!cancel.is_cancelled(), "Smart preview cancelled");
-    Ok(SmartPreview {
+    ensure!(!cancel.is_cancelled(), "Editable preview cancelled");
+    Ok(EditablePreview {
         version,
         codec: head.codec,
         identity: head.identity,

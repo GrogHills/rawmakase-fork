@@ -49,8 +49,8 @@ pub(super) fn table() -> Vec<f32> {
 mod tests {
     use super::*;
 
-    /// Every code reads back as a value that encodes to it again, so writing a smart
-    /// preview read from a file changes nothing.
+    /// Every code reads back as a value that encodes to it again, so writing an
+    /// editable preview read from a file changes nothing.
     #[test]
     fn every_code_round_trips() {
         let table = table();

@@ -1,12 +1,12 @@
-//! The measurement the smart preview format was chosen on (decision 3 of the Smart
-//! Previews plan): for each RAW in the folder `RAWMAKASE_SMART_PREVIEW_SAMPLES`,
+//! The measurement the editable preview format was chosen on (decision 3 of the
+//! editable previews plan): for each RAW in the folder `RAWMAKASE_EDITABLE_PREVIEW_SAMPLES`,
 //! the file's size at [`LONG_EDGE`], the time to build, write and read it, and how
 //! its renders differ from the original's at the same size. Run with
-//! `cargo test -p rawmakase-decode --release smart_preview::measure -- --ignored --nocapture`.
+//! `cargo test -p rawmakase-decode --release editable_preview::measure -- --ignored --nocapture`.
 //!
 //! Renders are compared in CIEDE2000 over every pixel. "format" compares the
 //! reduced image before and after the file, so it is the curve's loss alone; the
-//! recipes compare renders of the original and of the smart preview, per pixel and
+//! recipes compare renders of the original and of the editable preview, per pixel and
 //! averaged over 16-pixel blocks, both with the camera's default crop taken off
 //! ([`uncropped`]); an aspect crop the camera recorded reaches both as the recipe's
 //! crop. They also differ by what Stage 1 of the plan fixes: detail radii scaled to
@@ -40,7 +40,7 @@ fn blocks(im: &rawmakase_model::rendered::Rendered) -> (Vec<[f32; 3]>, u32, u32)
 }
 
 /// `im` with the camera's default and aspect crops taken off, its recovered image
-/// too. Comparisons render both images so, at the same size: a smart preview is
+/// too. Comparisons render both images so, at the same size: an editable preview is
 /// 2560 pixels before the crop, so its cropped frame is a few pixels smaller, and a
 /// render never enlarges.
 fn uncropped(im: &CameraImage) -> CameraImage {
@@ -104,10 +104,10 @@ fn camera_difference(a: &CameraImage, b: &CameraImage, exposure: f32) -> [f64; 3
 }
 
 #[test]
-#[ignore = "needs RAWs in RAWMAKASE_SMART_PREVIEW_SAMPLES"]
+#[ignore = "needs RAWs in RAWMAKASE_EDITABLE_PREVIEW_SAMPLES"]
 fn measure() {
-    let Some(dir) = std::env::var_os("RAWMAKASE_SMART_PREVIEW_SAMPLES") else {
-        eprintln!("RAWMAKASE_SMART_PREVIEW_SAMPLES is not set");
+    let Some(dir) = std::env::var_os("RAWMAKASE_EDITABLE_PREVIEW_SAMPLES") else {
+        eprintln!("RAWMAKASE_EDITABLE_PREVIEW_SAMPLES is not set");
         return;
     };
     let out = tempfile::tempdir().unwrap();
@@ -140,7 +140,7 @@ fn measure() {
                 Cancel::NEVER,
             )?;
             let build_s = t.elapsed().as_secs_f64();
-            let file = out.path().join(format!("{name}.rmsp"));
+            let file = out.path().join(format!("{name}.rmep"));
             let t = Instant::now();
             write(&file, &preview)?;
             let write_s = t.elapsed().as_secs_f64();

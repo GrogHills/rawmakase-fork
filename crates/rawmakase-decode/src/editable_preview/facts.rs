@@ -1,4 +1,4 @@
-//! The original's facts in a smart preview, field by field (`fields`'s encoding).
+//! The original's facts in an editable preview, field by field (`fields`'s encoding).
 //! Every field has a fixed id, and a field missing reads as the default given
 //! here, which is [`Metadata::default`]'s unless said otherwise. Ids are never
 //! reused: a fact a later release adds takes a new id, and a release that doesn't
@@ -249,7 +249,7 @@ pub(super) fn read_metadata(r: &Record, size: [u32; 2]) -> Result<(Metadata, Sca
         let measured = match (ca.record(1)?, ca.record(2)?) {
             (None, None) => None,
             (Some(red), Some(blue)) => Some([read_radial(&red)?, read_radial(&blue)?]),
-            _ => bail!("A smart preview's Auto CA has one channel"),
+            _ => bail!("An editable preview's Auto CA has one channel"),
         };
         let _ = lateral_ca.set(measured);
     }
@@ -390,7 +390,7 @@ fn read_radial(r: &Record) -> Result<Radial> {
         r.f32s(1)?.unwrap_or_default(),
         r.f32s(2)?.unwrap_or_default(),
     )
-    .context("A smart preview's lens table is not a valid one")
+    .context("An editable preview's lens table is not a valid one")
 }
 
 fn write_lens(l: &LensCorrection) -> Writer {
@@ -430,7 +430,7 @@ fn read_lens(r: &Record) -> Result<LensCorrection> {
     let chromatic = match (radial(5)?, radial(6)?) {
         (None, None) => None,
         (Some(red), Some(blue)) => Some([red, blue]),
-        _ => bail!("A smart preview's lens table has one chromatic channel"),
+        _ => bail!("An editable preview's lens table has one chromatic channel"),
     };
     Ok(LensCorrection {
         source: r.str(1)?.unwrap_or_default(),
@@ -480,7 +480,10 @@ fn read_gain_grid(r: &Record) -> Result<GainGrid> {
         planes: r.u32(6)?.map_or(d.planes, |v| v as usize),
         gains: r.f32s(7)?.unwrap_or(d.gains),
     };
-    ensure!(g.valid(), "A smart preview's gain map is not a valid one");
+    ensure!(
+        g.valid(),
+        "An editable preview's gain map is not a valid one"
+    );
     Ok(g)
 }
 
@@ -489,7 +492,7 @@ fn read_gain_grid(r: &Record) -> Result<GainGrid> {
 
 fn later(what: &str, code: u8) -> anyhow::Error {
     anyhow::anyhow!(
-        "A smart preview names a {what} ({code}) only a later release of RAWmakase knows"
+        "An editable preview names a {what} ({code}) only a later release of RAWmakase knows"
     )
 }
 
@@ -623,14 +626,17 @@ pub(super) fn read_exif(r: &Record) -> Result<Option<CameraExif>> {
         let mut b = r.bytes(id).unwrap_or_default();
         let mut out = Vec::new();
         while !b.is_empty() {
-            ensure!(b.len() >= 12, "A smart preview's EXIF ends inside a field");
+            ensure!(
+                b.len() >= 12,
+                "An editable preview's EXIF ends inside a field"
+            );
             let tag = u16::from_le_bytes([b[0], b[1]]);
             let kind = u16::from_le_bytes([b[2], b[3]]);
             let count = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
             let len = u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize;
             let bytes = b
                 .get(12..12 + len)
-                .context("A smart preview's EXIF ends inside a field")?
+                .context("An editable preview's EXIF ends inside a field")?
                 .to_vec();
             out.push(Field {
                 tag,
@@ -666,13 +672,13 @@ pub(super) fn read_identity(r: &Record, [size, modified, hash]: [u16; 3]) -> Res
     Ok(Identity {
         size: r
             .u64(size)?
-            .context("A smart preview without its original's size")?,
+            .context("An editable preview without its original's size")?,
         modified_ns: r
             .u128(modified)?
-            .context("A smart preview without its original's modification time")?,
+            .context("An editable preview without its original's modification time")?,
         prefix_hash: r
             .str(hash)?
-            .context("A smart preview without its original's identity")?,
+            .context("An editable preview without its original's identity")?,
     })
 }
 

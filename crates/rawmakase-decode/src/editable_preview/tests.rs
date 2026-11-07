@@ -149,7 +149,7 @@ fn original(width: u32, height: u32) -> CameraImage {
     image
 }
 
-fn built(width: u32, height: u32, long_edge: u32) -> SmartPreview {
+fn built(width: u32, height: u32, long_edge: u32) -> EditablePreview {
     build(
         &original(width, height),
         &identity(),
@@ -160,14 +160,14 @@ fn built(width: u32, height: u32, long_edge: u32) -> SmartPreview {
     .unwrap()
 }
 
-fn written(dir: &Path, preview: &SmartPreview) -> std::path::PathBuf {
-    let path = dir.join(format!("7-{}.rmsp", preview.identity().key()));
+fn written(dir: &Path, preview: &EditablePreview) -> std::path::PathBuf {
+    let path = dir.join(format!("7-{}.rmep", preview.identity().key()));
     write(&path, preview).unwrap();
     path
 }
 
 /// Everything that makes the camera image, compared exactly.
-fn assert_same(a: &SmartPreview, b: &SmartPreview) {
+fn assert_same(a: &EditablePreview, b: &EditablePreview) {
     assert_eq!(a.identity(), b.identity());
     assert_eq!(a.exif(), b.exif());
     assert_eq!(a.header(), b.header());
@@ -210,7 +210,7 @@ fn pixels_and_facts_round_trip() {
     let original = every_fact(300, 200);
     assert_eq!(format!("{:?}", m), format!("{:?}", original));
     // Writing what was read writes the same file.
-    let again = dir.path().join("again.rmsp");
+    let again = dir.path().join("again.rmep");
     write(&again, &back).unwrap();
     assert_eq!(fs_bytes(&path), fs_bytes(&again));
 }
@@ -329,7 +329,7 @@ fn truncated_and_damaged_files_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = written(dir.path(), &built(40, 30, 40));
     let bytes = fs_bytes(&path);
-    let damaged = dir.path().join("damaged.rmsp");
+    let damaged = dir.path().join("damaged.rmep");
     let check = |b: &[u8], header_too: bool| {
         let _ = std::fs::remove_file(&damaged);
         std::fs::write(&damaged, b).unwrap();
@@ -420,7 +420,7 @@ fn missing_facts_take_their_defaults() {
 fn writing_never_replaces_a_file() {
     let dir = tempfile::tempdir().unwrap();
     let preview = built(20, 10, 20);
-    let path = dir.path().join("7-key.rmsp");
+    let path = dir.path().join("7-key.rmep");
     std::fs::write(&path, b"someone else's").unwrap();
     let error = write(&path, &preview).unwrap_err();
     assert_eq!(
@@ -433,7 +433,7 @@ fn writing_never_replaces_a_file() {
     let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
     assert_eq!(names.len(), 1);
     // A folder that isn't there is an error, not a file elsewhere.
-    assert!(write(&dir.path().join("missing/7.rmsp"), &preview).is_err());
+    assert!(write(&dir.path().join("missing/7.rmep"), &preview).is_err());
 }
 
 #[test]
@@ -446,7 +446,7 @@ fn reading_stops_when_cancelled() {
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/data/smart-preview/v1.rmsp"
+    "/tests/data/editable-preview/v1.rmep"
 );
 
 /// The pixels of the golden file's source: 4 × 3, from black to 4,000 times white.
@@ -481,7 +481,7 @@ fn golden_source() -> CameraImage {
 #[test]
 fn the_golden_version_1_file_opens() {
     let path = Path::new(GOLDEN);
-    if std::env::var_os("RAWMAKASE_WRITE_SMART_PREVIEW_GOLDEN").is_some() && !path.exists() {
+    if std::env::var_os("RAWMAKASE_WRITE_EDITABLE_PREVIEW_GOLDEN").is_some() && !path.exists() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let preview = build(
             &golden_source(),
@@ -493,7 +493,7 @@ fn the_golden_version_1_file_opens() {
         .unwrap();
         write(path, &preview).unwrap();
     }
-    let golden = read(path, Cancel::NEVER).expect("the golden version 1 smart preview");
+    let golden = read(path, Cancel::NEVER).expect("the golden version 1 editable preview");
     assert_eq!(
         golden.header(),
         Header {
@@ -567,7 +567,7 @@ fn sizes_beyond_what_reads_are_refused_when_building() {
 
 const GOLDEN_GROUPS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/data/smart-preview/v1-groups.rmsp"
+    "/tests/data/editable-preview/v1-groups.rmep"
 );
 
 /// The golden groups file's codes: smooth, so the file stays small, over 2100 × 260
@@ -584,7 +584,7 @@ fn groups_code(i: usize) -> u16 {
 fn the_golden_version_1_groups_file_opens() {
     let path = Path::new(GOLDEN_GROUPS);
     let im = of_codes(2100, 260, groups_code);
-    if std::env::var_os("RAWMAKASE_WRITE_SMART_PREVIEW_GOLDEN").is_some() && !path.exists() {
+    if std::env::var_os("RAWMAKASE_WRITE_EDITABLE_PREVIEW_GOLDEN").is_some() && !path.exists() {
         let preview = build(&im, &identity(), None, 2100, Cancel::NEVER).unwrap();
         write(path, &preview).unwrap();
     }
