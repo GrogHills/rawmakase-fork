@@ -14,8 +14,9 @@
 //!   only along x, through [`build`], rendered with strong edits. Each column is
 //!   averaged over every row, which keeps a contour step and averages dither
 //!   away: the largest step between neighbouring columns against the lossless
-//!   preview's, and the noise left about that profile. Noise-free, so the worst
-//!   case for contours.
+//!   preview's, the noise left about that profile, and the largest step that noise
+//!   alone makes in the profile (about 4 σ √2 / √rows). A step within that floor
+//!   is noise, not a contour. Noise-free, so the worst case for contours.
 //! - `depths`: for each RAW in `RAWMAKASE_EDITABLE_PREVIEW_SAMPLES`, the file size
 //!   of each variant, build, encode and decode times, and CIEDE2000 between renders
 //!   of each variant and of the lossless preview (per pixel and over 16 px
@@ -239,7 +240,7 @@ fn banding_on_a_smooth_gradient() {
     let smaller = gradient(Precision::Smaller);
     let all = variants(lossless.image(), smaller.image());
     println!(
-        "| Edit | Variant | Largest column step (16-bit levels) | Step / lossless | Noise σ (16-bit levels) |\n| --- | --- | --- | --- | --- |"
+        "| Edit | Variant | Largest column step (16-bit levels) | Step / lossless | Noise σ (16-bit levels) | Noise floor of the step |\n| --- | --- | --- | --- | --- | --- |"
     );
     for (name, edit) in edits() {
         let mut r = Recipe::for_metadata(&lossless.image().metadata);
@@ -264,20 +265,20 @@ fn banding_on_a_smooth_gradient() {
                 .flat_map(|p| (0..3).map(move |c| (p[0][c] - p[1][c]).abs()))
                 .fold(0., f64::max);
             let mut squares = 0.;
-            for y in 0..h {
-                for x in 0..w {
-                    let p = out.pixels[y * w + x];
-                    (0..3).for_each(|c| {
-                        squares += (f64::from(p[c]) * 65535. - profile[x][c]).powi(2)
-                    });
+            for row in out.pixels.chunks_exact(w) {
+                for (p, mean) in row.iter().zip(&profile) {
+                    (0..3).for_each(|c| squares += (f64::from(p[c]) * 65535. - mean[c]).powi(2));
                 }
             }
             let noise = (squares / (w * h * 3) as f64).sqrt();
             if *label == "16" {
                 base = largest;
             }
+            // The largest neighbour step the profile's own left-over noise makes:
+            // about 4 standard deviations of a difference of two column means.
+            let floor = 4. * noise * std::f64::consts::SQRT_2 / (h as f64).sqrt();
             println!(
-                "| {name} | {label} | {largest:.1} | {:.2} | {noise:.1} |",
+                "| {name} | {label} | {largest:.1} | {:.2} | {noise:.1} | {floor:.1} |",
                 largest / base.max(1e-9)
             );
         }

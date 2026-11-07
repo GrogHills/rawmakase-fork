@@ -41,7 +41,7 @@
 //!   | Codec | Samples | Precision |
 //!   | --- | --- | --- |
 //!   | 1 | Curve 1's 16-bit codes | Lossless: within 0.013% of each value |
-//!   | 2 | Curve 1's 12-bit codes, 0 to 4095, each read as the middle of its 16 codes; dithered when built | [`Precision::Smaller`]: a step of 0.41%, about 40% smaller files |
+//!   | 2 | Curve 1's 12-bit codes, samples 0 to 4095 in the same 16-bit codestream (4096 and above are damage); code `q` reads as 16-bit code `16 q + 8`, the middle of the 16 codes it stands for; dithered when built | [`Precision::Smaller`]: a step of 0.41%, about 40% smaller files |
 //!
 //!   Codec 2 changes only the samples: a reader that knows it widens them
 //!   (`curve::widen`) and develops them as codec 1's. The dither is the writer's

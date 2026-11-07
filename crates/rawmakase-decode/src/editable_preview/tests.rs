@@ -779,8 +779,8 @@ fn the_dither_is_deterministic() {
 #[test]
 fn the_dither_keeps_flat_areas_unbiased() {
     let table = curve::table();
-    for v in [0.0123f32, 0.18, 0.7071, 3.3] {
-        // A value a third of the way between two 12-bit buckets' middles.
+    for v in [0.0123f32, 0.18, 0.7, 3.3] {
+        // Values that fall between two 12-bit buckets' middles.
         let at = curve::position(v);
         let mut im = original(64, 64);
         im.pixels = vec![[v; 3]; 64 * 64];
@@ -887,9 +887,41 @@ fn the_golden_version_1_smaller_file_opens() {
         write(path, &smaller(&golden_source(), LONG_EDGE)).unwrap();
     }
     let golden = read(path, Cancel::NEVER).expect("the golden version 1 Smaller file");
-    assert_eq!(golden.header().codec, Codec::DitheredJxl12);
+    assert_eq!(
+        golden.header(),
+        Header {
+            version: 1,
+            codec: Codec::DitheredJxl12,
+            identity: identity(),
+            original: [4, 3],
+            preview: [4, 3],
+        }
+    );
     assert_eq!(read_header(path).unwrap(), golden.header());
-    assert_eq!(golden.header().preview, [4, 3]);
+    let image = golden.image();
+    assert!(image.fast);
+    assert_eq!((image.scale_factor, image.scale_clipped), (1.25, 42));
+    // The file's 12-bit codes, exactly, each read as the middle of its 16 codes.
+    let codes: [[u16; 3]; 12] = [
+        [0, 0, 0],
+        [0, 84, 920],
+        [1626, 1625, 1626],
+        [2048, 2047, 2047],
+        [2273, 2048, 1822],
+        [2730, 2560, 2388],
+        [3180, 3353, 3451],
+        [4089, 4095, 2318],
+        [1877, 1707, 1536],
+        [400, 546, 637],
+        [2022, 2035, 2046],
+        [2050, 2053, 2055],
+    ];
+    let table = curve::table();
+    let read_as: Vec<[f32; 3]> = codes
+        .iter()
+        .map(|p| p.map(|q| table[(usize::from(q) << 4) + 8]))
+        .collect();
+    assert_eq!(image.pixels, read_as);
     assert_eq!(golden.exif(), Some(&exif()));
     assert_eq!(
         format!("{:?}", golden.image().metadata),
