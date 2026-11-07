@@ -18,6 +18,7 @@ fn record(fx: &mut Fx, photo: PhotoId, name: &str) -> PathBuf {
     fx.cat
         .record_smart_preview(
             photo,
+            &fx.root.join(name),
             &BuiltSmartPreview {
                 file: file.clone(),
                 format_version: 1,
@@ -160,5 +161,46 @@ fn a_moved_or_renamed_photo_keeps_its_smart_preview() -> Result<()> {
     assert_eq!(fx.rows()[&a], "sub/renamed.NEF");
     assert_eq!(fx.cat.smart_preview(a)?, was);
     assert!(pa.is_file());
+    Ok(())
+}
+
+#[test]
+fn a_smart_preview_built_or_discarded_after_planning_changes_no_operation() -> Result<()> {
+    let mut fx = fixture(&["a.NEF", "b.NEF", "sub/"]);
+    let (a, b) = (fx.photo("a.NEF"), fx.photo("b.NEF"));
+    let pb = record(&mut fx, b, "b.NEF");
+    let to = fx.folder("sub");
+    let plan = fx.plan(FileOp::MovePhotos {
+        photos: vec![a],
+        root: fx.root_of(to),
+        to: fx.logical(to),
+    });
+    // A build finishes while the move waits for its confirmation.
+    let pa = record(&mut fx, a, "a.NEF");
+    let moved = execute::execute_with(
+        &mut fx.cat,
+        plan.confirm(),
+        &NoTrash,
+        rawmakase_cancel::Cancel::NEVER,
+        &Faulty::default(),
+    )?;
+    assert!(
+        matches!(results(&moved)[..], [ItemResult::Moved { .. }]),
+        "{moved:?}"
+    );
+    assert!(fx.cat.smart_preview(a)?.is_some() && pa.is_file());
+    // Discarded while a Trash waits: the Trash goes ahead.
+    let trash = FakeTrash::new(&fx);
+    let plan = fx.plan(FileOp::TrashPhotos { photos: vec![b] });
+    fx.cat.discard_smart_previews(&[b])?;
+    let trashed = execute::execute_with(
+        &mut fx.cat,
+        plan.confirm(),
+        &trash,
+        rawmakase_cancel::Cancel::NEVER,
+        &Faulty::default(),
+    )?;
+    assert_eq!(results(&trashed), [ItemResult::Trashed], "{trashed:?}");
+    assert!(!pb.exists());
     Ok(())
 }

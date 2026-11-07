@@ -424,6 +424,7 @@ fn smart_preview(catalog: &mut Catalog, photo: PhotoId, path: &std::path::Path) 
     std::fs::write(folder.join(&file), file.as_bytes())?;
     catalog.record_smart_preview(
         photo,
+        path,
         &super::BuiltSmartPreview {
             file: file.clone(),
             format_version: 1,
@@ -453,7 +454,10 @@ fn an_export_carries_its_photos_smart_previews_and_no_others() -> Result<()> {
     assert_eq!(export.smart_previews, 1);
     assert_eq!(export.missing_smart_previews, [s.a2]);
     let out = Catalog::open(&destination)?;
-    let store = s.dir.join("out/Shoot A.rawmakase-smart-previews");
+    let store = s
+        .dir
+        .canonicalize()?
+        .join("out/Shoot A.rawmakase-smart-previews");
     assert_eq!(out.smart_preview_folder(), store);
     let found = out.smart_preview(s.a1)?.context("carried")?;
     assert_eq!(found.path, store.join(&a1));
@@ -493,6 +497,16 @@ fn a_failed_export_leaves_no_smart_preview_behind() -> Result<()> {
     assert_eq!(std::fs::read(store.join(&a2))?, b"someone else's");
     assert_eq!(std::fs::read_dir(&store)?.count(), 1);
 
+    // The same file, left by an export cut short, is kept as it was.
+    let again = out.join("c.rawmakase-smart-previews");
+    std::fs::create_dir(&again)?;
+    std::fs::copy(s.catalog.smart_preview_folder().join(&a2), again.join(&a2))?;
+    let export = s
+        .catalog
+        .export_catalog(&ExportScope::Folders(vec![s.a]), &out.join("c.rawmakase"))?;
+    assert_eq!(export.smart_previews, 2);
+    assert_eq!(std::fs::read_dir(&again)?.count(), 2);
+
     // Refused before anything is copied.
     std::fs::write(out.join("b.rawmakase"), b"mine")?;
     assert!(
@@ -501,5 +515,26 @@ fn a_failed_export_leaves_no_smart_preview_behind() -> Result<()> {
             .is_err()
     );
     assert!(!out.join("b.rawmakase-smart-previews").exists());
+    Ok(())
+}
+
+#[test]
+fn an_exported_folder_whose_smart_preview_changed_since_is_not_removed() -> Result<()> {
+    let mut s = shoots()?;
+    let photos = s.dir.join("photos");
+    let export = s
+        .catalog
+        .export_catalog(&ExportScope::Folders(vec![s.a]), &s.dir.join("a.rawmakase"))?;
+    let removal = export.removal.context("removal")?;
+    // Built since: the export doesn't have it, and removing would lose it.
+    smart_preview(&mut s.catalog, s.a1, &photos.join("A/a1.ARW"))?;
+    assert!(s.catalog.remove_exported_folders(&removal).is_err());
+    // Exported with it, then discarded: removing is what the user asked.
+    let export = s
+        .catalog
+        .export_catalog(&ExportScope::Folders(vec![s.a]), &s.dir.join("b.rawmakase"))?;
+    let removal = export.removal.context("removal")?;
+    s.catalog.discard_smart_previews(&[s.a1])?;
+    assert!(s.catalog.remove_exported_folders(&removal).is_err());
     Ok(())
 }

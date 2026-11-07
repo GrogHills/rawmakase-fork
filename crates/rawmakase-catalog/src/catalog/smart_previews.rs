@@ -25,7 +25,7 @@ use super::{Catalog, CatalogLocation, PhotoId};
 use crate::storage::Identity;
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// The extension of a smart preview file.
 const EXTENSION: &str = "rmsp";
@@ -85,28 +85,54 @@ pub fn smart_preview_file_name(master: PhotoId, original: &Identity) -> String {
 }
 
 /// The folder a catalog at `location` keeps its smart previews in: beside a
-/// catalog file, named after it (`Photos.rawmakase` keeps them in
-/// `Photos.rawmakase-smart-previews`). A catalog that isn't a file would keep
-/// them in RAWmakase's data folder (`storage::data_dir`).
+/// catalog file, named after its whole file name (`Photos.rawmakase` keeps
+/// them in `Photos.rawmakase-smart-previews`), so two catalogs differing only
+/// in extension never share one. It is beside the file's real path, through
+/// any link, as the file operation lock is, so every path a catalog is opened
+/// by finds the same folder. A catalog that isn't a file would keep them in
+/// RAWmakase's data folder (`storage::data_dir`).
 pub(super) fn folder(location: &CatalogLocation) -> PathBuf {
     match location {
         CatalogLocation::File(path) => {
-            let mut name = path.file_name().unwrap_or_default().to_os_string();
+            // A catalog not made yet (an export's destination) by its
+            // folder's real path.
+            let real = std::fs::canonicalize(path)
+                .or_else(|_| {
+                    std::fs::canonicalize(crate::storage::parent_dir(path))
+                        .map(|dir| dir.join(path.file_name().unwrap_or_default()))
+                })
+                .unwrap_or_else(|_| path.clone());
+            let mut name = real.file_name().unwrap_or_default().to_os_string();
             name.push("-smart-previews");
-            path.with_file_name(name)
+            real.with_file_name(name)
         }
     }
 }
 
-/// Whether `file` is a smart preview's name: a single plain file name with
-/// the extension, nothing that leads out of the store folder.
+/// Whether `file` is a smart preview's name, as [`smart_preview_file_name`]
+/// makes them: digits, lowercase hex letters and hyphens, then the
+/// extension. The same on every system, so a name a catalog holds can't lead
+/// out of the store folder wherever the catalog is opened (no separator,
+/// drive or `..` of any system).
 fn is_file_name(file: &str) -> bool {
-    let path = Path::new(file);
-    let mut parts = path.components();
-    matches!(parts.next(), Some(Component::Normal(_)))
-        && parts.next().is_none()
-        && !file.starts_with('.')
-        && path.extension().is_some_and(|e| e == EXTENSION)
+    file.strip_suffix(EXTENSION)
+        .and_then(|stem| stem.strip_suffix('.'))
+        .is_some_and(|stem| {
+            !stem.is_empty()
+                && stem
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
+        })
+}
+
+/// The path of smart preview `file` in `folder`. Refused for a name that
+/// isn't a smart preview's, whatever a catalog holds.
+pub(super) fn path_in(folder: &Path, file: &str) -> Result<PathBuf> {
+    ensure!(
+        is_file_name(file),
+        "Not a smart preview's file name: {file}"
+    );
+    Ok(folder.join(file))
 }
 
 row! {
@@ -136,7 +162,7 @@ impl Stored {
     fn read(self, folder: &Path) -> Result<SmartPreview> {
         Ok(SmartPreview {
             photo: self.photo,
-            path: folder.join(&self.file),
+            path: path_in(folder, &self.file)?,
             format_version: u32::try_from(self.version)?,
             original: serde_json::from_str(&self.identity)
                 .context("A smart preview's original can't be read")?,
@@ -164,13 +190,7 @@ fn master_of(db: &impl Reads, photo: PhotoId) -> Result<Option<PhotoId>> {
 /// and deletes their files after the commit, except `keep`. Returns whether
 /// there were any.
 fn forget_family(w: &mut Write<'_>, master: PhotoId, keep: Option<&str>) -> Result<bool> {
-    let rows: Vec<Named> = w.read(
-        sql!(
-            "SELECT s.photo, s.file FROM smart_previews s JOIN photos p ON p.id = s.photo
-             WHERE p.id = ? OR p.master_id = ?"
-        ),
-        &[&master, &master],
-    )?;
+    let rows = family_rows(w, master)?;
     let folder = folder(w.location());
     for row in &rows {
         w.execute(
@@ -178,22 +198,69 @@ fn forget_family(w: &mut Write<'_>, master: PhotoId, keep: Option<&str>) -> Resu
             &[&row.photo],
         )?;
         if keep != Some(row.file.as_str()) {
-            w.delete_after_commit(folder.join(&row.file));
+            discard(w, &folder, &row.file);
         }
     }
     Ok(!rows.is_empty())
 }
 
+/// Deletes smart preview `file` of `folder` once `w` commits. A name that
+/// isn't a smart preview's is left alone: the row goes, and nothing outside
+/// the store folder is touched.
+fn discard(w: &mut Write<'_>, folder: &Path, file: &str) {
+    if let Ok(path) = path_in(folder, file) {
+        w.delete_after_commit(path);
+    }
+}
+
+/// The rows of `master`'s family, keyed by the master or one of its copies.
+fn family_rows(db: &impl Reads, master: PhotoId) -> Result<Vec<Named>> {
+    db.read(
+        sql!(
+            "SELECT s.photo, s.file FROM smart_previews s JOIN photos p ON p.id = s.photo
+             WHERE p.id = ? OR p.master_id = ? ORDER BY s.photo"
+        ),
+        &[&master, &master],
+    )
+}
+
+/// The smart preview files `master`'s family's rows name.
+pub(super) fn family_files(db: &impl Reads, master: PhotoId) -> Result<Vec<String>> {
+    Ok(family_rows(db, master)?
+        .into_iter()
+        .map(|r| r.file)
+        .collect())
+}
+
 /// Removes `photo`'s own row, as the photo leaves the catalog, and deletes
-/// its file after the commit. A virtual copy normally has none.
+/// its file after the commit. A virtual copy normally has none; one that has
+/// (a release before this one made its master a copy) passes it to its
+/// master, if that is still in the catalog without one, as it is still the
+/// family's.
 pub(super) fn forget_photo(w: &mut Write<'_>, photo: PhotoId) -> Result<()> {
     let file: Option<String> = w.read_optional(
         sql!("SELECT file FROM smart_previews WHERE photo=?"),
         &[&photo],
     )?;
     if let Some(file) = file {
+        let heir: Option<PhotoId> = w.read_optional(
+            sql!(
+                "SELECT m.id FROM photos c JOIN photos m ON m.id = c.master_id
+                 WHERE c.id = ?
+                 AND NOT EXISTS (SELECT 1 FROM smart_previews s WHERE s.photo = m.id)"
+            ),
+            &[&photo],
+        )?;
+        if let Some(master) = heir {
+            w.execute(
+                sql!("UPDATE smart_previews SET photo=? WHERE photo=?"),
+                &[&master, &photo],
+            )?;
+            return Ok(());
+        }
         w.execute(sql!("DELETE FROM smart_previews WHERE photo=?"), &[&photo])?;
-        w.delete_after_commit(folder(w.location()).join(file));
+        let folder = folder(w.location());
+        discard(w, &folder, &file);
     }
     Ok(())
 }
@@ -233,26 +300,27 @@ impl Catalog {
     }
 
     /// Records the smart preview of `photo` (its master's, for a virtual
-    /// copy) just built in [`file`](BuiltSmartPreview::file) of the store
-    /// folder. In one transaction, it replaces the row of the photo's
-    /// previous one, whose file is deleted only after that commits (unless
-    /// it is the same file, built again from the same original).
+    /// copy) built from its original at `source`, in
+    /// [`file`](BuiltSmartPreview::file) of the store folder. In one
+    /// transaction, it replaces the row of the photo's previous one, whose
+    /// file is deleted only after that commits (unless it is the same file,
+    /// built again from the same original).
     ///
-    /// Refused, recording nothing, when the name isn't a smart preview's,
-    /// the file isn't there, or the photo has left the catalog. The new file
-    /// then stays where it is, for the caller to delete or record again.
+    /// Refused, recording nothing, when the name isn't a smart preview's, the
+    /// file isn't there, or the photo is no longer in the catalog with its
+    /// file at `source` on this computer: it left, was moved or renamed, or
+    /// its id was given to another photo while it was built. The new file
+    /// then stays where it is, for the caller to delete (unless another row
+    /// names it, which refuses it too) or record again.
     pub fn record_smart_preview(
         &mut self,
         photo: PhotoId,
+        source: &Path,
         built: &BuiltSmartPreview,
     ) -> Result<SmartPreview> {
-        ensure!(
-            is_file_name(&built.file),
-            "Not a smart preview's file name: {}",
-            built.file
-        );
         let folder = self.smart_preview_folder();
-        let path = folder.join(&built.file);
+        let path = path_in(&folder, &built.file)?;
+        let computer = self.computer.id.clone();
         let metadata = std::fs::metadata(&path)
             .with_context(|| format!("The smart preview {} is not there", path.display()))?;
         ensure!(metadata.is_file(), "Not a file: {}", path.display());
@@ -261,6 +329,21 @@ impl Catalog {
         let built_at = rawmakase_model::time::now_text();
         let master = self.db.write(|w| {
             let master = master_of(w, photo)?.context("The photo is no longer in the catalog")?;
+            row! {
+                struct Place {
+                    folder: super::FolderId,
+                    filename: String,
+                }
+            }
+            let place: Place = w.read_one(
+                sql!("SELECT folder, filename FROM photos WHERE id=?"),
+                &[&master],
+            )?;
+            let here = super::locations::folder_path(w, &computer, place.folder)?;
+            ensure!(
+                here.map(|folder| folder.join(&place.filename)).as_deref() == Some(source),
+                "The photo changed while its smart preview was built"
+            );
             forget_family(w, master, Some(&built.file))?;
             w.execute(
                 sql!(
@@ -361,7 +444,8 @@ impl Catalog {
             }
         }
         let total: Total = self.db.read_one(
-            sql!("SELECT COALESCE(sum(bytes), 0) FROM smart_previews"),
+            // Postgres sums BIGINT as NUMERIC.
+            sql!("SELECT CAST(COALESCE(sum(bytes), 0) AS BIGINT) FROM smart_previews"),
             &[],
         )?;
         Ok(u64::try_from(total.bytes)?)

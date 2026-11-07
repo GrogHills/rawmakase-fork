@@ -65,6 +65,17 @@ impl Fx {
             size: (2560, 1707),
         })
     }
+    /// Where `photo`'s file is, as a build reads it.
+    fn source(&self, photo: PhotoId) -> PathBuf {
+        let photos = self.cat.photos().unwrap();
+        let master = photos.iter().find(|p| p.id == photo).and_then(|p| p.master);
+        let id = master.unwrap_or(photo);
+        photos
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(|p| p.path)
+            .unwrap_or_default()
+    }
     fn file(&self, name: &str) -> PathBuf {
         self.cat.smart_preview_folder().join(name)
     }
@@ -81,8 +92,22 @@ fn the_store_is_beside_the_catalog_named_after_it() -> Result<()> {
     let fx = fixture()?;
     assert_eq!(
         fx.cat.smart_preview_folder(),
-        fx.dir.join("Photos.rawmakase-smart-previews")
+        fx.dir
+            .canonicalize()?
+            .join("Photos.rawmakase-smart-previews")
     );
+    // Opened through a link, it is the same folder.
+    #[cfg(unix)]
+    {
+        let link = fx.dir.join("link");
+        std::fs::create_dir(&link)?;
+        std::os::unix::fs::symlink(
+            fx.dir.join("Photos.rawmakase"),
+            link.join("Photos.rawmakase"),
+        )?;
+        let linked = Catalog::open(&link.join("Photos.rawmakase"))?;
+        assert_eq!(linked.smart_preview_folder(), fx.cat.smart_preview_folder());
+    }
     let original = fx.original("a.dng")?;
     assert_eq!(
         smart_preview_file_name(PhotoId(7), &original),
@@ -97,7 +122,9 @@ fn a_smart_preview_is_recorded_looked_up_listed_and_totalled() -> Result<()> {
     assert_eq!(fx.cat.smart_preview(fx.a)?, None);
     let original = fx.original("a.dng")?;
     let built = fx.build(fx.a, &original, &[1; 300])?;
-    let recorded = fx.cat.record_smart_preview(fx.a, &built)?;
+    let recorded = fx
+        .cat
+        .record_smart_preview(fx.a, &fx.source(fx.a), &built)?;
     let found = fx.cat.smart_preview(fx.a)?.context("recorded")?;
     assert_eq!(found, recorded);
     assert_eq!(found.photo, fx.a);
@@ -114,7 +141,7 @@ fn a_smart_preview_is_recorded_looked_up_listed_and_totalled() -> Result<()> {
         std::collections::BTreeSet::from([fx.a])
     );
     let b = fx.build(fx.b, &fx.original("b.dng")?, &[2; 200])?;
-    fx.cat.record_smart_preview(fx.b, &b)?;
+    fx.cat.record_smart_preview(fx.b, &fx.source(fx.b), &b)?;
     assert_eq!(fx.cat.smart_previews_size()?, 500);
     Ok(())
 }
@@ -124,7 +151,7 @@ fn recording_again_replaces_the_row_and_only_then_deletes_the_old_file() -> Resu
     let mut fx = fixture()?;
     let first = fx.original("a.dng")?;
     let old = fx.build(fx.a, &first, b"old")?;
-    fx.cat.record_smart_preview(fx.a, &old)?;
+    fx.cat.record_smart_preview(fx.a, &fx.source(fx.a), &old)?;
     // The original changed and was built again: another name.
     let second = Identity {
         modified_ns: first.modified_ns + 1,
@@ -134,7 +161,7 @@ fn recording_again_replaces_the_row_and_only_then_deletes_the_old_file() -> Resu
     assert_ne!(old.file, new.file);
     // Built, not recorded yet: the row still names the old file, which stays.
     assert!(fx.file(&old.file).is_file());
-    fx.cat.record_smart_preview(fx.a, &new)?;
+    fx.cat.record_smart_preview(fx.a, &fx.source(fx.a), &new)?;
     assert_eq!(fx.rows()?, 1);
     let found = fx.cat.smart_preview(fx.a)?.context("recorded")?;
     assert_eq!(
@@ -144,7 +171,7 @@ fn recording_again_replaces_the_row_and_only_then_deletes_the_old_file() -> Resu
     assert!(!fx.file(&old.file).exists(), "the old file is deleted");
     assert!(fx.file(&new.file).is_file());
     // Built again from the same original: the same name, which stays.
-    fx.cat.record_smart_preview(fx.a, &new)?;
+    fx.cat.record_smart_preview(fx.a, &fx.source(fx.a), &new)?;
     assert!(fx.file(&new.file).is_file());
     Ok(())
 }
@@ -154,7 +181,7 @@ fn a_failed_record_leaves_the_row_and_files_as_they_were() -> Result<()> {
     let mut fx = fixture()?;
     let original = fx.original("a.dng")?;
     let old = fx.build(fx.a, &original, b"old")?;
-    fx.cat.record_smart_preview(fx.a, &old)?;
+    fx.cat.record_smart_preview(fx.a, &fx.source(fx.a), &old)?;
     let new = fx.build(
         fx.a,
         &Identity {
@@ -167,7 +194,11 @@ fn a_failed_record_leaves_the_row_and_files_as_they_were() -> Result<()> {
         "CREATE TEMP TRIGGER fail BEFORE INSERT ON smart_previews
          BEGIN SELECT RAISE(FAIL, 'disk full'); END;",
     )?;
-    assert!(fx.cat.record_smart_preview(fx.a, &new).is_err());
+    assert!(
+        fx.cat
+            .record_smart_preview(fx.a, &fx.source(fx.a), &new)
+            .is_err()
+    );
     let found = fx.cat.smart_preview(fx.a)?.context("kept")?;
     assert_eq!(found.path, fx.file(&old.file));
     assert!(fx.file(&old.file).is_file(), "the old file stays");
@@ -183,16 +214,52 @@ fn a_record_is_refused_for_a_missing_file_a_bad_name_or_a_photo_gone() -> Result
     let mut fx = fixture()?;
     let original = fx.original("a.dng")?;
     let mut built = fx.build(fx.a, &original, b"x")?;
-    for bad in ["", ".", "..", "../a.rmsp", "sub/a.rmsp", "a.jpg", ".rmsp"] {
+    for bad in [
+        "",
+        ".",
+        "..",
+        "../1-a.rmsp",
+        "sub/1-a.rmsp",
+        "1-a.jpg",
+        ".rmsp",
+        "1\\..\\..\\x.rmsp",
+        "C:1-a.rmsp",
+        "1-A.rmsp",
+    ] {
         built.file = bad.into();
-        assert!(fx.cat.record_smart_preview(fx.a, &built).is_err(), "{bad}");
+        assert!(
+            fx.cat
+                .record_smart_preview(fx.a, &fx.source(fx.a), &built)
+                .is_err(),
+            "{bad}"
+        );
     }
     built.file = "never-written.rmsp".into();
-    assert!(fx.cat.record_smart_preview(fx.a, &built).is_err());
-    // Removed while it was built.
+    assert!(
+        fx.cat
+            .record_smart_preview(fx.a, &fx.source(fx.a), &built)
+            .is_err()
+    );
+    // Renamed while it was built, or its id given to another photo.
     let built = fx.build(fx.b, &fx.original("b.dng")?, b"x")?;
+    let source = fx.source(fx.b);
+    fx.cat.db_for_tests().execute(
+        "UPDATE photos SET filename='other.dng' WHERE id=?",
+        [fx.b.0],
+    )?;
+    assert!(fx.cat.record_smart_preview(fx.b, &source, &built).is_err());
+    fx.cat
+        .db_for_tests()
+        .execute("UPDATE photos SET filename='b.dng' WHERE id=?", [fx.b.0])?;
+    // Built from another path than the photo's.
+    assert!(
+        fx.cat
+            .record_smart_preview(fx.b, &fx.dir.join("elsewhere/b.dng"), &built)
+            .is_err()
+    );
+    // Removed while it was built.
     fx.cat.remove_folders(&[fx.cat.folders()?[0].id])?;
-    assert!(fx.cat.record_smart_preview(fx.b, &built).is_err());
+    assert!(fx.cat.record_smart_preview(fx.b, &source, &built).is_err());
     assert_eq!(fx.rows()?, 0, "no row names a file it should not");
     Ok(())
 }
@@ -203,7 +270,8 @@ fn virtual_copies_share_their_masters() -> Result<()> {
     let copy = fx.cat.create_virtual_copy(fx.a)?;
     let built = fx.build(fx.a, &fx.original("a.dng")?, b"x")?;
     // Recorded through the copy, it is the master's.
-    fx.cat.record_smart_preview(copy, &built)?;
+    fx.cat
+        .record_smart_preview(copy, &fx.source(copy), &built)?;
     let found = fx.cat.smart_preview(copy)?.context("the master's")?;
     assert_eq!(found.photo, fx.a);
     assert_eq!(fx.cat.smart_preview(fx.a)?, Some(found));
@@ -222,7 +290,8 @@ fn virtual_copies_share_their_masters() -> Result<()> {
 fn set_copy_as_master_takes_the_smart_preview_over() -> Result<()> {
     let mut fx = fixture()?;
     let built = fx.build(fx.a, &fx.original("a.dng")?, b"x")?;
-    fx.cat.record_smart_preview(fx.a, &built)?;
+    fx.cat
+        .record_smart_preview(fx.a, &fx.source(fx.a), &built)?;
     let copy = fx.cat.create_virtual_copy(fx.a)?;
     fx.cat.set_copy_as_master(copy)?;
     let found = fx.cat.smart_preview(fx.a)?.context("still shared")?;
@@ -233,12 +302,39 @@ fn set_copy_as_master_takes_the_smart_preview_over() -> Result<()> {
 }
 
 #[test]
+fn a_copy_an_older_release_left_holding_it_passes_it_to_its_master() -> Result<()> {
+    let mut fx = fixture()?;
+    let built = fx.build(fx.a, &fx.original("a.dng")?, b"x")?;
+    fx.cat
+        .record_smart_preview(fx.a, &fx.source(fx.a), &built)?;
+    let copy = fx.cat.create_virtual_copy(fx.a)?;
+    // Set Copy as Master as a release before smart previews makes it: the
+    // row stays with the photo that is now a copy.
+    fx.cat.db_for_tests().execute_batch(&format!(
+        "UPDATE photos SET master_id={copy} WHERE id={a};
+         UPDATE photos SET master_id=NULL, copy_name='' WHERE id={copy};",
+        copy = copy.0,
+        a = fx.a.0
+    ))?;
+    assert_eq!(
+        fx.cat.smart_preview(copy)?.map(|s| s.path),
+        Some(fx.file(&built.file))
+    );
+    // Removing the old master, now a copy, keeps the family's.
+    fx.cat.remove_virtual_copy(fx.a)?;
+    let kept = fx.cat.smart_preview(copy)?.context("kept")?;
+    assert_eq!(kept.photo, copy);
+    assert!(fx.file(&built.file).is_file());
+    Ok(())
+}
+
+#[test]
 fn discarding_removes_the_rows_and_files_of_a_selection() -> Result<()> {
     let mut fx = fixture()?;
     let a = fx.build(fx.a, &fx.original("a.dng")?, b"a")?;
     let b = fx.build(fx.b, &fx.original("b.dng")?, b"b")?;
-    fx.cat.record_smart_preview(fx.a, &a)?;
-    fx.cat.record_smart_preview(fx.b, &b)?;
+    fx.cat.record_smart_preview(fx.a, &fx.source(fx.a), &a)?;
+    fx.cat.record_smart_preview(fx.b, &fx.source(fx.b), &b)?;
     let copy = fx.cat.create_virtual_copy(fx.a)?;
     // A copy chosen discards its master's; one without any is left out.
     assert_eq!(fx.cat.discard_smart_previews(&[copy, copy])?, [fx.a]);
@@ -254,7 +350,7 @@ fn discarding_removes_the_rows_and_files_of_a_selection() -> Result<()> {
 fn a_failed_discard_keeps_rows_and_files() -> Result<()> {
     let mut fx = fixture()?;
     let a = fx.build(fx.a, &fx.original("a.dng")?, b"a")?;
-    fx.cat.record_smart_preview(fx.a, &a)?;
+    fx.cat.record_smart_preview(fx.a, &fx.source(fx.a), &a)?;
     fx.cat.db_for_tests().execute_batch(
         "CREATE TEMP TRIGGER fail BEFORE DELETE ON smart_previews
          BEGIN SELECT RAISE(FAIL, 'disk full'); END;",
@@ -269,7 +365,7 @@ fn a_failed_discard_keeps_rows_and_files() -> Result<()> {
 fn removing_folders_removes_their_photos_smart_previews_after_commit() -> Result<()> {
     let mut fx = fixture()?;
     let a = fx.build(fx.a, &fx.original("a.dng")?, b"a")?;
-    fx.cat.record_smart_preview(fx.a, &a)?;
+    fx.cat.record_smart_preview(fx.a, &fx.source(fx.a), &a)?;
     let folder = fx.cat.folders()?[0].id;
     // A failure removing the photos removes nothing.
     fx.cat.db_for_tests().execute_batch(
@@ -295,7 +391,9 @@ fn a_changed_original_makes_a_smart_preview_stale() -> Result<()> {
     let mut fx = fixture()?;
     let original = fx.original("a.dng")?;
     let built = fx.build(fx.a, &original, b"x")?;
-    let recorded = fx.cat.record_smart_preview(fx.a, &built)?;
+    let recorded = fx
+        .cat
+        .record_smart_preview(fx.a, &fx.source(fx.a), &built)?;
     assert!(!recorded.is_stale(&original));
     // Touched, or copied without its time: the same photo.
     let touched = Identity {
@@ -316,7 +414,7 @@ fn a_changed_original_makes_a_smart_preview_stale() -> Result<()> {
 fn orphans_are_files_no_row_names() -> Result<()> {
     let mut fx = fixture()?;
     let a = fx.build(fx.a, &fx.original("a.dng")?, b"a")?;
-    fx.cat.record_smart_preview(fx.a, &a)?;
+    fx.cat.record_smart_preview(fx.a, &fx.source(fx.a), &a)?;
     assert!(fx.cat.smart_preview_orphans()?.is_empty());
     let stray = fx.build(fx.b, &fx.original("b.dng")?, b"b")?;
     std::fs::write(fx.file("partial.tmp"), b"a build in progress")?;
@@ -328,7 +426,9 @@ fn orphans_are_files_no_row_names() -> Result<()> {
 fn a_catalog_reopens_with_its_smart_previews_and_an_older_one_gains_the_table() -> Result<()> {
     let mut fx = fixture()?;
     let built = fx.build(fx.a, &fx.original("a.dng")?, b"x")?;
-    let recorded = fx.cat.record_smart_preview(fx.a, &built)?;
+    let recorded = fx
+        .cat
+        .record_smart_preview(fx.a, &fx.source(fx.a), &built)?;
     let path = fx.dir.join("Photos.rawmakase");
     let reopened = Catalog::open(&path)?;
     assert_eq!(reopened.smart_preview(fx.a)?, Some(recorded));
@@ -345,7 +445,7 @@ fn a_catalog_reopens_with_its_smart_previews_and_an_older_one_gains_the_table() 
     assert_eq!(older.smart_preview(fx.a)?, None);
     assert_eq!(older.smart_previews_size()?, 0);
     let again = fx.build(fx.a, &fx.original("a.dng")?, b"x")?;
-    older.record_smart_preview(fx.a, &again)?;
+    older.record_smart_preview(fx.a, &fx.source(fx.a), &again)?;
     assert_eq!(version()?, before);
     Ok(())
 }

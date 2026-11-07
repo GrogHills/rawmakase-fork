@@ -196,12 +196,17 @@ fn combine(mut members: Vec<(PhotoId, [u8; 32])>) -> FamilyDigest {
 
 /// The tables background reads write (checksums, photo info, sequences, the
 /// EXIF capture time of import facts), which [`user_state`] leaves out so a
-/// queued read can't change it.
-pub(in crate::catalog) const BACKGROUND_TABLES: [&str; 4] = [
+/// queued read can't change it. Smart previews too: a build or discard
+/// between planning a file operation and finishing it changes nothing the
+/// operation acts on (removing a photo removes whatever row it has then),
+/// and [`ExportedFolders`](crate::catalog::ExportedFolders) checks them on
+/// its own.
+pub(in crate::catalog) const BACKGROUND_TABLES: [&str; 5] = [
     "photo_checksums",
     "photo_info",
     "photo_sequences",
     "photo_import_facts",
+    "smart_previews",
 ];
 
 /// The `photos` columns [`user_state`] covers: all but where the photo is
