@@ -5,3 +5,11 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Set for every process Cargo runs, and so for the tests and the app binaries
+# they start: a build with the catalog's test-support feature (tests only)
+# then skips SQLite's flush to disk on each commit. A binary run by hand or
+# installed never has it, so its catalogs stay synchronous=FULL; a build
+# without test-support ignores it (crates/rawmakase-catalog/src/catalog/db/mod.rs).
+[env]
+RAWMAKASE_TESTS_SKIP_CATALOG_FLUSH = "1"

@@ -386,6 +386,26 @@ impl CatalogSession {
 mod tests {
     use super::*;
 
+    /// The app's tests open their catalogs as the app does, through the catalog
+    /// crate built with `test-support`, and Cargo runs them with the variable
+    /// `.cargo/config.toml` sets. A commit there only has to reach the
+    /// operating system: flushing each one to disk made the Library, file
+    /// operation and folder sync tests take most of Windows CI's test time.
+    #[test]
+    fn a_test_catalog_does_not_flush_every_commit() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("library.rawmakase");
+        drop(Catalog::create(&path)?);
+        let Opened { session, .. } = CatalogSession::open(&CatalogLocation::from(&path))?;
+        let synchronous: i64 =
+            session
+                .catalog
+                .db_for_tests()
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+        assert_eq!(synchronous, 0, "PRAGMA synchronous=OFF");
+        Ok(())
+    }
+
     /// A catalog of two JPEGs, `a` with a virtual copy in a collection, and a session
     /// whose next read of the catalog fails (its collections are gone).
     fn session_that_cannot_read_again() -> Result<(tempfile::TempDir, CatalogSession, PhotoId)> {

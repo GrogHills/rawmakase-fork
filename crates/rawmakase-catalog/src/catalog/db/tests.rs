@@ -172,7 +172,8 @@ fn a_unit_test_catalog_does_not_flush_every_commit() -> Result<()> {
     // panic in this process, so synchronous=OFF (0) is enough on the
     // connection that recovery reopens. FULL is what made those matrices
     // take tens of minutes on NTFS. Shipping opens are compiled without
-    // `cfg(test)` and stay FULL; this test only runs as a unit test.
+    // `cfg(test)` or `test-support` and stay FULL; this test only runs as a
+    // unit test. The app's tests check the same through `test-support`.
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("Flush.rawmakase");
     Db::create(&path)?;
@@ -182,4 +183,17 @@ fn a_unit_test_catalog_does_not_flush_every_commit() -> Result<()> {
         .query_row("PRAGMA synchronous", [], |r| r.get(0))?;
     assert_eq!(mode, 0);
     Ok(())
+}
+
+/// Outside this crate's unit tests, a `test-support` build skips the flush only
+/// when Cargo runs it: the app binary `cargo test` leaves in `target/` gets no
+/// variable when run by hand or installed, and keeps catalogs FULL.
+#[test]
+fn only_the_variable_cargo_sets_skips_the_flush() {
+    use std::ffi::OsStr;
+    assert!(!asks_to_skip_flush(None));
+    assert!(!asks_to_skip_flush(Some(OsStr::new(""))));
+    assert!(!asks_to_skip_flush(Some(OsStr::new("0"))));
+    assert!(!asks_to_skip_flush(Some(OsStr::new("true"))));
+    assert!(asks_to_skip_flush(Some(OsStr::new("1"))));
 }
