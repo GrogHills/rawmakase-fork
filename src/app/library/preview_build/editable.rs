@@ -421,8 +421,15 @@ fn build(
     } = (steps.open)(item, &identity, cancel)?;
     ensure!(!cancel.is_cancelled(), "Cancelled");
     let look = (steps.fit)(&item.path, &image.metadata, &profiles, cancel);
-    let mut preview =
-        editable_preview::build(&image, &identity, exif, editable_preview::LONG_EDGE, cancel)?;
+    // Lossless until Preferences offers the Smaller choice.
+    let mut preview = editable_preview::build(
+        &image,
+        &identity,
+        exif,
+        editable_preview::LONG_EDGE,
+        editable_preview::Precision::Lossless,
+        cancel,
+    )?;
     drop(image);
     // A fit that failed or was refused doesn't fail the build: the editable
     // preview is kept without it, and the report says so.
