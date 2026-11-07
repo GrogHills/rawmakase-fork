@@ -575,7 +575,7 @@ mod tests {
     }
     /// A half-size decode renders as its photo rendered whole and resized to the same
     /// size: sharpening is sized in the photo's pixels, not the reduced image's, so a
-    /// Standard preview built from it, or a smart preview, sharpens as an export does.
+    /// Standard preview built from it, or an editable preview, sharpens as an export does.
     #[test]
     fn a_reduced_decode_sharpens_as_the_photo_resized() {
         let (w, h) = (640, 424);
