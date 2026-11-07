@@ -418,8 +418,13 @@ fn a_worker_that_is_gone_clears_busy() {
     e.build_editable_previews(&ids).unwrap();
     wait_started(&path_of(&e, ids[0]));
     e.editable_builds.builder.as_ref().unwrap().shared.close();
-    settle(&mut e);
-    assert!(e.editable_builds.builder.is_none());
+    // The worker ends once its build sees the cancel; until then nothing is lost.
+    let until = Instant::now() + Duration::from_secs(10);
+    while e.editable_builds.builder.is_some() {
+        assert!(Instant::now() < until, "the worker's loss was never seen");
+        e.poll_editable_builds();
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert!(!e.editable_builds.running());
     assert!(
         e.messages.line().contains("stopped being built"),
@@ -571,7 +576,10 @@ fn preferences_shows_a_stale_preview_gone_when_its_rebuild_fails() {
     e.build_editable_previews(&ids).unwrap();
     settle(&mut e);
     e.open_preferences(crate::app::preferences::Tab::Catalog);
-    assert!(e.shown_editable_previews_size().is_some_and(|size| size > 0));
+    assert!(
+        e.shown_editable_previews_size()
+            .is_some_and(|size| size > 0)
+    );
     let path = path_of(&e, ids[0]);
     std::fs::write(&path, "the original, changed since").unwrap();
     add(&FAIL, &path);
