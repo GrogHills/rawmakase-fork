@@ -306,20 +306,22 @@ dependency direction changes, and the measurement in
     ΔE2000 0.18 on average over 16 px blocks for the default edit (p99 1.43 at the
     p95 photo, 1.67 on the worst). For the Auto edit the difference is 0.22 (p99
     1.48 at the p95 photo). That changes by at most 0.001 on average when both
-    images take the original's Auto values, so the Auto values add almost nothing.
-    The measures can't be swapped between the two images, so their share is
+    images take the original's Auto values (0.03 on the one photo whose Whites
+    differs), so the Auto values add almost nothing. The measures can't be swapped between the two images, so their share is
     bounded rather than isolated. A different measure moves tone in flat areas as
     much as anywhere. In flat blocks (L* deviation under 2 within the block), the
     default edit differs by 0.05 on average, p99 at most 0.66 on the worst photo.
     The Auto edit, whose Blacks reads the darkest level, differs there by 0.08,
     p99 0.55 at the p95 photo (Smaller 0.63). The largest differences are in blocks
     of fine detail, which a 2560 px image renders differently from a full-size one.
-    Per pixel, that detail makes renders differ more (mean 1.2, worst photo's
-    p99 14.5).
+    Per pixel, that detail makes renders of the default edit differ more (mean 1.2,
+    worst photo's p99 14.5).
 
-  So the measured tone of an offline edit differs from its original's by at most
-  about the flat-block figures above, well under a visible difference. Auto gives
-  the same values beyond its own rounding. Nothing about measured tone needs to
+  So the measured tone of an offline edit differs from its original's by about the
+  flat-block figures above: for the default edit, under 1 ΔE2000 in 99% of flat
+  blocks on every photo; for the Auto edit, p99 0.55 at the p95 photo. Single flat
+  blocks reach 1.24 (default edit) and 1.64 (Auto edit). Auto gives the same values
+  beyond its own rounding. Nothing about measured tone needs to
   change, and no reference was re-blessed.
 - **Size on disk.** The measurement in decision 3 may force the lossy option
   into the first release.
