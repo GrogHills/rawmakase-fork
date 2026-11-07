@@ -669,3 +669,19 @@ fn find_on_disk_saves_a_change_made_offline_rather_than_offer_to_discard_it() {
         0.35
     );
 }
+
+#[test]
+fn a_synced_photo_that_can_t_be_opened_again_is_closed_not_left_stale() {
+    let mut fx = fixture(&["a.dng"]);
+    let a = fx.id("a.dng");
+    fx.build(a, false);
+    fx.open(a);
+    assert_eq!(fx.e.document.from, OpenedFrom::Original);
+    // A Sync wrote its edit; meanwhile its drive went away, and its editable
+    // preview can't be used (deleted).
+    fx.take_offline(a);
+    let file = catalog(&fx.e).editable_preview(a).unwrap().unwrap().path;
+    std::fs::remove_file(file).unwrap();
+    fx.e.reopen_synced(&[a]);
+    assert_eq!(fx.e.document.catalog_photo, None);
+}

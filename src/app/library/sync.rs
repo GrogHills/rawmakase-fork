@@ -994,7 +994,13 @@ impl Editor {
             && let Some(path) = self.document.path.clone()
         {
             self.document.edit.save_state_mut().saved();
-            self.load_raw(path, Some(open));
+            // Not opened again (its editable preview can't be used now, or what
+            // must be saved first could not be): the recipe on screen is the one
+            // from before, marked saved, so it is closed rather than left to be
+            // saved over what was written. The catalog has the photo's edit.
+            if !self.load_raw(path, Some(open)) {
+                self.close_removed_document();
+            }
         }
     }
     /// A finished Sync: one command for Undo, and the top bar naming what failed.

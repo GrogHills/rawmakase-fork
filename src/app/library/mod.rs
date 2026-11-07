@@ -284,9 +284,9 @@ pub(crate) struct Library {
     /// as the catalog recorded them when the Library last filtered or was told
     /// of a build or discard.
     editable_previews: std::collections::BTreeSet<PhotoId>,
-    /// The offline photo last asked whether Develop would open it from its
-    /// editable preview ([`Self::develops_from_preview`]), and the answer, so the
-    /// Loupe asks once each time it comes to it rather than every frame.
+    /// The photo last asked whether Develop would open it from its editable
+    /// preview ([`Self::develops_from_preview`]), and the answer, so the Loupe
+    /// asks once each time it comes to a photo rather than every frame.
     preview_usable: std::cell::RefCell<Option<(PhotoId, bool)>>,
     /// Read Metadata from Files while it reads.
     reread: Option<descriptive::Reread>,
@@ -596,15 +596,21 @@ impl Library {
     }
     /// Whether Develop would open offline `photo` from its editable preview
     /// ([`Self::develop_from`]), checked once while it stays the photo asked
-    /// about: for the Loupe, which asks every frame.
+    /// about: for the Loupe, which asks every frame. Asking about any other
+    /// photo forgets the answer.
     pub(in crate::app) fn develops_from_preview(&self, photo: &Photo) -> bool {
+        // Asked about another photo, the answer kept is dropped: coming back to
+        // a photo asks again, as its preview or original may have changed.
+        let kept = *self.preview_usable.borrow();
+        match kept {
+            Some((id, usable)) if id == photo.id => return usable,
+            Some(_) => {
+                self.preview_usable.replace(None);
+            }
+            None => {}
+        }
         if !self.has_editable_preview(photo.id) {
             return false;
-        }
-        if let Some((id, usable)) = *self.preview_usable.borrow()
-            && id == photo.id
-        {
-            return usable;
         }
         let usable = self.develop_from(photo, false).is_ok();
         self.preview_usable.replace(Some((photo.id, usable)));
