@@ -704,7 +704,16 @@ fn the_golden_version_1_camera_look_file_opens() {
         write(path, &with_look(preview)).unwrap();
     }
     let golden = read(path, Cancel::NEVER).expect("the golden version 1 Camera Look file");
-    assert_eq!(golden.camera_look(), Some(&fitted_look()));
+    // Read, its look passed `fitted::from_carried`: of a known version, whole (its
+    // UUID its content's hash) and for the photo's camera. What it holds is
+    // frozen here as written, not as today's fit would make it.
+    let look = golden.camera_look().expect("its Camera Look");
+    assert_eq!(look.name, "Camera Look (fitted)");
+    assert_eq!(look.camera, "Testmaker T-1 Mark II");
+    let enhanced = look.enhanced.as_ref().unwrap();
+    assert_eq!(enhanced.uuid, "F0369FC82A0BCFD409E2E1F8C00CF909");
+    assert_eq!(enhanced.camera_look, None);
+    look.ensure_camera(&golden.image().metadata).unwrap();
     let plain = read(Path::new(GOLDEN), Cancel::NEVER).unwrap();
     assert_same(&plain, &golden);
     assert_eq!(read_header(path).unwrap(), plain.header());
