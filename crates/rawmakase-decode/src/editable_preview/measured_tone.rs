@@ -10,8 +10,9 @@
 //! image Develop and Auto get). Lossless and Smaller are both measured. Then:
 //!
 //! - Auto: [`develop::auto_tone`] on the original's decode and on the preview's image,
-//!   from the photo's default edit, as the Basic panel's Auto runs it on the open
-//!   photo. Each slider's difference (preview minus original) is in slider units:
+//!   from [`Recipe::for_metadata`] (the built-in profile, without user defaults, an
+//!   installed DCP or a fitted Camera Look), as the Basic panel's Auto runs it on the
+//!   open photo. Each slider's difference (preview minus original) is in slider units:
 //!   EV for Exposure, the panel's −100…+100 for the others.
 //! - The rendered difference, in CIEDE2000, of the original and the preview both
 //!   rendered at the preview's size with the camera's default crop taken off, as
@@ -41,7 +42,9 @@
 //! The photo set used for the recorded numbers is 25 CC0 RAWs from 11 makes of
 //! `tests/corpus/pixls.json`: per make, its smallest files (by `size_mb`, then URL)
 //! whose extension RAWmakase opens as a RAW (`RAW_EXTENSIONS`, so no `.ORI`), three each of Sony, Canon, Fujifilm and Nikon, two each of Panasonic, Leica,
-//! Olympus, OM System, Pentax and Ricoh, and one Hasselblad. Run with
+//! Olympus, OM System, Pentax and Ricoh, and one Hasselblad. Sigma, the twelfth make
+//! there, is left out to keep decision 3's 11. Decision 3's own list was not recorded,
+//! so this is a reconstruction of its size, not necessarily its files. Run with
 //! `cargo test -p rawmakase-decode --release --lib
 //! editable_preview::measured_tone -- --ignored --nocapture --test-threads=1`.
 use super::*;
@@ -50,8 +53,11 @@ use crate::develop;
 use rawmakase_model::model::recipe::Recipe;
 use rawmakase_model::rendered::Rendered;
 
-/// The sliders Auto sets, by name, read from a recipe in slider units.
-const SLIDERS: [(&str, fn(&Recipe) -> f32); 8] = [
+/// A slider's name and its value in a recipe, in slider units.
+type Slider = (&'static str, fn(&Recipe) -> f32);
+
+/// The sliders Auto sets. Contrast and Vibrance are constants, the others estimated.
+const SLIDERS: [Slider; 8] = [
     ("Exposure (EV)", |r| r.exposure),
     ("Contrast", |r| r.contrast * 100.),
     ("Highlights", |r| r.highlights * 100.),
