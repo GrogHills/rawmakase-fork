@@ -228,8 +228,14 @@ pub enum Request {
     /// queued and skipped, and `state` how far they have got.
     BuildEditablePreviews,
     /// Discards the selected photos' editable previews and stops their builds;
-    /// the reply says how many photos' went.
-    DiscardEditablePreviews,
+    /// the reply says how many photos' went, and how many were kept because
+    /// their originals are offline.
+    DiscardEditablePreviews {
+        /// Discards those of photos whose originals are offline too, which can't
+        /// be built again until the originals are back; kept by default.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_offline: bool,
+    },
     /// An output job's status.
     Job {
         /// The job's id, from the reply that started it.
@@ -751,7 +757,16 @@ mod tests {
         );
         assert_eq!(
             parse(json!({"cmd":"discard_editable_previews"})).unwrap(),
-            Request::DiscardEditablePreviews
+            Request::DiscardEditablePreviews {
+                include_offline: false
+            }
         );
+        assert_eq!(
+            parse(json!({"cmd":"discard_editable_previews","include_offline":true})).unwrap(),
+            Request::DiscardEditablePreviews {
+                include_offline: true
+            }
+        );
+        assert!(parse(json!({"cmd":"discard_editable_previews","include_offline":"yes"})).is_err());
     }
 }

@@ -150,8 +150,12 @@ pub(in crate::app) enum Operation {
     BuildPreviews(crate::catalog::preview_cache::PreviewKind),
     /// Builds editable previews of the selection, as the thumbnail menu does.
     BuildEditablePreviews,
-    /// Discards the selection's editable previews, as the thumbnail menu does.
-    DiscardEditablePreviews,
+    /// Discards the selection's editable previews, as the thumbnail menu does,
+    /// keeping those of photos whose originals are offline unless
+    /// `include_offline`, as the menu asks before it discards them.
+    DiscardEditablePreviews {
+        include_offline: bool,
+    },
     /// Answers once `Until` holds, or after the time given, so a client waiting
     /// for a photo or an output is woken rather than polling.
     Wait(Until, std::time::Duration),
@@ -635,7 +639,7 @@ impl Editor {
                     skipped: queued.skipped,
                 });
             }
-            Operation::BuildEditablePreviews | Operation::DiscardEditablePreviews => {
+            Operation::BuildEditablePreviews | Operation::DiscardEditablePreviews { .. } => {
                 if self.activity.is_busy() || self.command_modal() {
                     return Err(Error::new(
                         "busy",
@@ -650,14 +654,16 @@ impl Editor {
                     ));
                 }
                 use crate::app::library::preview_build::editable;
-                if matches!(operation, Operation::DiscardEditablePreviews) {
-                    let done = self
-                        .discard_editable_previews(Some(&ids))
+                if let Operation::DiscardEditablePreviews { include_offline } = operation {
+                    let (done, kept_offline) = self
+                        .discard_editable_previews_online(&ids, include_offline)
                         .map_err(|e| Error::new("not_discarded", e))?;
-                    self.messages.note(editable::discarded_message(done));
+                    self.messages
+                        .note(editable::discarded_online_message(done, kept_offline));
                     return Ok(Outcome::EditablePreviewsDiscarded {
                         discarded: done.discarded,
                         stopped: done.stopped,
+                        kept_offline,
                     });
                 }
                 let queued = self
@@ -886,7 +892,7 @@ impl Editor {
             | Operation::Job(_)
             | Operation::BuildPreviews(_)
             | Operation::BuildEditablePreviews
-            | Operation::DiscardEditablePreviews
+            | Operation::DiscardEditablePreviews { .. }
             | Operation::Wait(..) => unreachable!(),
         }
         Ok(Outcome::Empty)

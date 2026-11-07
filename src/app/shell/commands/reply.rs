@@ -102,10 +102,12 @@ pub(in crate::app) enum Outcome {
         skipped: usize,
     },
     /// What `discard_editable_previews` did: the photos (masters) whose
-    /// editable previews went, and the builds of them it stopped.
+    /// editable previews went, the builds of them it stopped, and the photos
+    /// whose editable previews it kept as their originals are offline.
     EditablePreviewsDiscarded {
         discarded: usize,
         stopped: usize,
+        kept_offline: usize,
     },
 }
 #[derive(Debug, Serialize)]

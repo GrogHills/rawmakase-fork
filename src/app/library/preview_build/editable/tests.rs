@@ -627,19 +627,62 @@ fn automation_builds_and_discards_the_selection() {
     settle(&mut e);
     let state = serde_json::to_value(e.command_state()).unwrap();
     assert!(state["building_editable_previews"].is_null());
-    let reply = e
-        .execute_command(Command::new(Operation::DiscardEditablePreviews), &ctx)
-        .unwrap();
+    let discard = Operation::DiscardEditablePreviews {
+        include_offline: false,
+    };
+    let reply = e.execute_command(Command::new(discard), &ctx).unwrap();
     assert!(matches!(
         reply,
         Reply::EditablePreviewsDiscarded {
             discarded: 2,
-            stopped: 0
+            stopped: 0,
+            kept_offline: 0
         }
     ));
     assert!(files(&e).is_empty());
     let reply = serde_json::to_value(&reply).unwrap();
-    assert_eq!(reply, serde_json::json!({"discarded": 2, "stopped": 0}));
+    assert_eq!(
+        reply,
+        serde_json::json!({"discarded": 2, "stopped": 0, "kept_offline": 0})
+    );
+}
+
+/// Automation's discard keeps offline photos' editable previews, counting
+/// masters, unless `include_offline`.
+#[test]
+fn automation_keeps_offline_photos_editable_previews_unless_asked() {
+    use crate::app::shell::commands::{Command, Operation};
+    let (_dir, mut e, ids) = editor(&["a.ARW", "b.ARW"]);
+    let [a, b] = ["a.ARW", "b.ARW"].map(|name| id_named(&e, &ids, name));
+    let copy = copy_of(&mut e, a);
+    e.build_editable_previews(&[a, b]).unwrap();
+    settle(&mut e);
+    std::fs::remove_file(path_of(&e, a)).unwrap();
+    let ctx = e.context.clone();
+    let discard = |e: &mut Editor, include_offline| {
+        let library = e.library.as_mut().unwrap();
+        library.select(Some(copy));
+        library.select_range_to(b);
+        let operation = Operation::DiscardEditablePreviews { include_offline };
+        let reply = e.execute_command(Command::new(operation), &ctx).unwrap();
+        serde_json::to_value(&reply).unwrap()
+    };
+    // a (by its copy, and perhaps itself) offline and kept; b discarded.
+    assert_eq!(
+        discard(&mut e, false),
+        serde_json::json!({"discarded": 1, "stopped": 0, "kept_offline": 1})
+    );
+    assert!(recorded(&e, a).is_some() && recorded(&e, b).is_none());
+    assert!(
+        e.messages.line().contains("kept those of 1 photo offline"),
+        "{}",
+        e.messages.line()
+    );
+    assert_eq!(
+        discard(&mut e, true),
+        serde_json::json!({"discarded": 1, "stopped": 0, "kept_offline": 0})
+    );
+    assert!(recorded(&e, a).is_none() && files(&e).is_empty());
 }
 
 /// The real steps, on the synthetic chart: decoded in full, reduced and recorded.

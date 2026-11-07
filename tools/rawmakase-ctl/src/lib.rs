@@ -103,8 +103,14 @@ enum Command {
     /// Build editable previews of the selected photos in the background; reports
     /// how many were queued (see state's building_editable_previews)
     BuildEditablePreviews,
-    /// Discard the selected photos' editable previews; reports how many went
-    DiscardEditablePreviews,
+    /// Discard the selected photos' editable previews; reports how many went,
+    /// and how many were kept as their originals are offline
+    DiscardEditablePreviews {
+        /// Discard those of photos whose originals are offline too, which can't
+        /// be built again until the originals are back
+        #[arg(long)]
+        include_offline: bool,
+    },
     /// Render the captured edit to a new JPEG, TIFF or PNG, without overwriting files
     Export {
         path: PathBuf,
@@ -413,7 +419,11 @@ fn commands(command: &Command) -> Result<Vec<Request>, String> {
             },
         }],
         Command::BuildEditablePreviews => vec![Request::BuildEditablePreviews],
-        Command::DiscardEditablePreviews => vec![Request::DiscardEditablePreviews],
+        Command::DiscardEditablePreviews { include_offline } => {
+            vec![Request::DiscardEditablePreviews {
+                include_offline: *include_offline,
+            }]
+        }
         Command::Export {
             path,
             max_edge,
@@ -623,7 +633,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         | Command::Job { .. }
         | Command::BuildPreviews { .. }
         | Command::BuildEditablePreviews
-        | Command::DiscardEditablePreviews
+        | Command::DiscardEditablePreviews { .. }
         | Command::Export { .. }
         | Command::Preview { .. }
             if !cli.state =>
@@ -707,6 +717,25 @@ mod tests {
             let cli = Cli::try_parse_from(args).unwrap();
             assert_eq!(requests(&cli.command).unwrap()[0]["cmd"], cmd);
         }
+        // Offline photos' editable previews are kept unless asked for.
+        let discard = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            requests(&cli.command).unwrap()[0]
+                .get("include_offline")
+                .cloned()
+        };
+        assert_eq!(
+            discard(&["rawmakase-ctl", "discard-editable-previews"]),
+            None
+        );
+        assert_eq!(
+            discard(&[
+                "rawmakase-ctl",
+                "discard-editable-previews",
+                "--include-offline"
+            ]),
+            Some(json!(true))
+        );
     }
 
     #[test]

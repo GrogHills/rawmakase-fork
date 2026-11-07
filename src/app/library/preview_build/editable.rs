@@ -740,6 +740,31 @@ impl Editor {
             .collect())
     }
 
+    /// Discard Editable Previews for `ids` (their masters'), keeping those of
+    /// photos whose originals are offline ([`Self::offline_editable_previews`])
+    /// unless `include_offline`: automation's discard. Returns what went and how
+    /// many photos' were kept.
+    pub(in crate::app) fn discard_editable_previews_online(
+        &mut self,
+        ids: &[PhotoId],
+        include_offline: bool,
+    ) -> Result<(Discarded, usize), String> {
+        let kept = if include_offline {
+            BTreeSet::new()
+        } else {
+            self.offline_editable_previews(Some(ids))?
+        };
+        let Some(library) = &self.library else {
+            return Err("No catalog is open".into());
+        };
+        let masters: Vec<PhotoId> = masters_of(library, ids)
+            .into_iter()
+            .filter(|m| !kept.contains(m))
+            .collect();
+        let done = self.discard_editable_previews(Some(&masters))?;
+        Ok((done, kept.len()))
+    }
+
     /// The thumbnail menu's Discard Editable Previews: at once when every photo
     /// whose editable preview it removes is online, else after asking, as none
     /// of an offline photo's can be built again until its original is back.
@@ -973,6 +998,19 @@ pub(in crate::app) fn discarded_message(done: Discarded) -> String {
         0 => "No editable previews to discard".into(),
         n => format!(
             "Discarded the editable previews of {}",
+            plural(n, "photo", "photos")
+        ),
+    }
+}
+
+/// [`discarded_message`], and how many photos' were kept as their originals
+/// are offline.
+pub(in crate::app) fn discarded_online_message(done: Discarded, kept_offline: usize) -> String {
+    match kept_offline {
+        0 => discarded_message(done),
+        n => format!(
+            "{}; kept those of {} offline",
+            discarded_message(done),
             plural(n, "photo", "photos")
         ),
     }
