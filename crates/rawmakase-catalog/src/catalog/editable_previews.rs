@@ -128,12 +128,12 @@ fn is_file_name(file: &str) -> bool {
 /// Whether `source` names the file at `at`, the photo's path as the catalog
 /// has it: the same path, or another spelling of it through links (a folder
 /// is kept by its real path, and a build may have been given the path through
-/// a link, as macOS's `/var` is `/private/var`).
-fn is_same_file(at: &Path, source: &Path) -> bool {
+/// a link, as macOS's `/var` is `/private/var`). `real_source` is `source`'s
+/// real path, read before the transaction, so a slow volume holds no lock
+/// for it.
+fn is_same_file(at: &Path, source: &Path, real_source: Option<&Path>) -> bool {
     at == source
-        || std::fs::canonicalize(at)
-            .ok()
-            .is_some_and(|at| std::fs::canonicalize(source).ok() == Some(at))
+        || real_source.is_some_and(|real| std::fs::canonicalize(at).ok().as_deref() == Some(real))
 }
 
 /// The path of editable preview `file` in `folder`. Refused for a name that
@@ -336,6 +336,7 @@ impl Catalog {
         let folder = self.editable_preview_folder();
         let path = path_in(&folder, &built.file)?;
         let computer = self.computer.id.clone();
+        let real_source = std::fs::canonicalize(source).ok();
         let metadata = std::fs::metadata(&path)
             .with_context(|| format!("The editable preview {} is not there", path.display()))?;
         ensure!(metadata.is_file(), "Not a file: {}", path.display());
@@ -357,7 +358,7 @@ impl Catalog {
             let here = super::locations::folder_path(w, &computer, place.folder)?;
             let at = here.map(|folder| folder.join(&place.filename));
             ensure!(
-                at.is_some_and(|at| is_same_file(&at, source)),
+                at.is_some_and(|at| is_same_file(&at, source, real_source.as_deref())),
                 "The photo changed while its editable preview was built"
             );
             forget_family(w, master, Some(&built.file))?;

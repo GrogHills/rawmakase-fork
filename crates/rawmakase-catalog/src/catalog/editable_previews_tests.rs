@@ -521,14 +521,15 @@ fn a_build_read_through_a_link_to_the_photos_file_is_recorded() -> Result<()> {
         std::os::unix::fs::symlink(fx.dir.join("photos"), &link)?;
         fx.cat
             .record_editable_preview(fx.a, &link.join("a.dng"), &built)?;
-        // A link to another file is not the photo's.
-        std::fs::write(fx.dir.join("other.dng"), b"another")?;
-        std::os::unix::fs::symlink(fx.dir.join("other.dng"), fx.dir.join("other-link.dng"))?;
-        assert!(
-            fx.cat
-                .record_editable_preview(fx.a, &fx.dir.join("other-link.dng"), &built)
-                .is_err()
-        );
+        let recorded = fx.cat.editable_preview(fx.a)?;
+        // A link to another photo's file is not this photo's.
+        let error = fx
+            .cat
+            .record_editable_preview(fx.a, &link.join("b.dng"), &built)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("changed while"), "{error:#}");
+        assert_eq!(fx.cat.editable_preview(fx.a)?, recorded);
+        assert_eq!(fx.rows()?, 1);
     }
     Ok(())
 }
