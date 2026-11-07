@@ -7,10 +7,9 @@
 //! Renders are compared in CIEDE2000 over every pixel. "format" compares the
 //! reduced image before and after the file, so it is the curve's loss alone; the
 //! recipes compare renders of the original and of the smart preview, per pixel and
-//! averaged over 16-pixel blocks. Those also differ by what later stages of the plan
-//! fix: detail radii scaled to the image in memory (Stage 1), and the camera's crop,
-//! in the original's pixels, applied to the reduced image (opening with the
-//! original's frame, Stage 5), which is reported as a frame difference.
+//! averaged over 16-pixel blocks, both with the camera's crop taken off
+//! ([`uncropped`]). They also differ by what Stage 1 of the plan fixes: detail
+//! radii scaled to the image in memory.
 use super::*;
 use crate::color_difference::{delta_e2000, lab};
 use crate::develop;
@@ -37,6 +36,30 @@ fn blocks(im: &rawmakase_model::rendered::Rendered) -> (Vec<[f32; 3]>, u32, u32)
         })
         .collect();
     (pixels, w, h)
+}
+
+/// `im` with the camera's default and aspect crops taken off, its recovered image
+/// too. Comparisons render both images so: until Develop opens a smart preview with
+/// its original's frame (Stage 5 of the plan), the renderer applies the crop, in the
+/// original's pixels, to the reduced image, and the frames would differ.
+fn uncropped(im: &CameraImage) -> CameraImage {
+    let strip = |im: &CameraImage| CameraImage {
+        recovered: Default::default(),
+        metadata: Metadata {
+            crop_left: 0,
+            crop_top: 0,
+            crop_width: im.metadata.width,
+            crop_height: im.metadata.height,
+            camera_crop: None,
+            ..im.metadata.clone()
+        },
+        ..im.clone()
+    };
+    let out = strip(im);
+    if let Some(recovered) = im.recovered.get() {
+        let _ = out.recovered.set(Arc::new(strip(recovered)));
+    }
+    out
 }
 
 fn srgb_lab(p: [f32; 3]) -> [f64; 3] {
@@ -137,8 +160,8 @@ fn measure() {
                 let mut r = Recipe::for_metadata(&original.metadata);
                 edit(&mut r);
                 let r = r.checked()?;
-                let a = develop::render(&original, &r, LONG_EDGE, Cancel::NEVER)?;
-                let b = develop::render(image, &r, LONG_EDGE, Cancel::NEVER)?;
+                let a = develop::render(&uncropped(&original), &r, LONG_EDGE, Cancel::NEVER)?;
+                let b = develop::render(&uncropped(image), &r, LONG_EDGE, Cancel::NEVER)?;
                 if (a.width, a.height) != (b.width, b.height) {
                     return Ok(format!(
                         "frame differs: {}×{} vs {}×{}",

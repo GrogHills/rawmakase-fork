@@ -293,6 +293,10 @@ fn image_of(
 /// during that copy can leave a partial file under the name: [`read`] refuses it,
 /// and whoever rebuilds the smart preview removes it first, or this write fails
 /// with `AlreadyExists`.
+///
+/// The folder is synced after the rename, so an error can follow a file already
+/// complete at `path`: after a failed write, [`read`] tells whether the file is
+/// usable before anything removes it.
 pub fn write(path: &Path, preview: &SmartPreview) -> Result<()> {
     let image = &preview.image;
     check_sizes([image.width, image.height], preview.original)?;
