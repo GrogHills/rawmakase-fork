@@ -9,6 +9,8 @@ publish = false
 
 [features]
 # The file system's, model's and file formats' fixtures, for tests that share them.
+# Under Cargo, it also skips SQLite's flush to disk on each commit
+# (src/catalog/db/mod.rs), so only dev-dependencies may turn it on.
 test-support = ["rawmakase-fs/test-support", "rawmakase-model/test-support", "rawmakase-interop/test-support"]
 
 [dependencies]

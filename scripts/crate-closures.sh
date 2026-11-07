@@ -122,5 +122,15 @@ if [ -n "$paths" ]; then
     echo "$paths" | sed 's/^/    /' >&2
     status=1
 fi
+# Under Cargo, test-support turns off the catalog's flush to disk on each
+# commit, among other test-only helpers, so only dev-dependencies may turn it
+# on: a build of the workspace without them has it off in every crate.
+support=$(cargo tree --locked --workspace --target all -e normal,build \
+    --prefix none --format '{p} [{f}]' | sed 's/ (\*)$//' | sort -u | grep -E '[[,]test-support[],]' || true)
+if [ -n "$support" ]; then
+    echo "Only dev-dependencies may turn on test-support:" >&2
+    echo "$support" | sed 's/^/    /' >&2
+    status=1
+fi
 [ "$status" -eq 0 ] && echo "The extracted crates depend on no app, GPU, GUI or native imaging crate beyond their own, and nothing links a C RAW library or Little CMS."
 exit "$status"
