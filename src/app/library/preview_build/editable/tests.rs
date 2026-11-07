@@ -189,7 +189,7 @@ fn copy_of(e: &mut Editor, master: PhotoId) -> PhotoId {
 }
 
 #[test]
-fn offline_and_unsupported_photos_are_skipped_and_copies_build_their_master_once() {
+fn offline_photos_are_skipped_rendered_files_built_and_copies_build_their_master_once() {
     let (_dir, mut e, ids) = editor(&["a.ARW", "b.ARW", "c.JPG", "d.ARW"]);
     let [a, b, c, d] = [
         id_named(&e, &ids, "a.ARW"),
@@ -200,21 +200,23 @@ fn offline_and_unsupported_photos_are_skipped_and_copies_build_their_master_once
     let copy = copy_of(&mut e, a);
     std::fs::remove_file(path_of(&e, d)).unwrap();
     let queued = e.build_editable_previews(&[copy, a, b, c, d]).unwrap();
-    // The JPEG and the offline RAW are skipped; the copy and its master are one.
+    // The offline RAW is skipped; the JPEG is built as the RAWs are; the copy
+    // and its master are one.
     assert_eq!(
         queued,
         Queued {
-            queued: 2,
-            skipped: 2
+            queued: 3,
+            skipped: 1
         }
     );
     settle(&mut e);
     assert_eq!(opens_of(&path_of(&e, a)), 1);
-    assert_eq!(opens_of(&path_of(&e, c)), 0);
+    assert_eq!(opens_of(&path_of(&e, c)), 1);
+    assert_eq!(opens_of(&path_of(&e, d)), 0);
     let p = progress(&e);
-    assert_eq!((p.done, p.total), (2, 2));
+    assert_eq!((p.done, p.total), (3, 3));
     assert!(p.failed.is_empty() && p.without_look.is_empty(), "{p:?}");
-    for id in [a, b] {
+    for id in [a, b, c] {
         let row = recorded(&e, id).expect("recorded");
         assert_eq!(row.photo, id);
         let identity = Identity::read(&path_of(&e, id)).unwrap();
@@ -236,7 +238,7 @@ fn offline_and_unsupported_photos_are_skipped_and_copies_build_their_master_once
         recorded(&e, a),
         "the copy shares its master's"
     );
-    assert_eq!(files(&e).len(), 2);
+    assert_eq!(files(&e).len(), 3);
 }
 
 #[test]
@@ -597,6 +599,8 @@ fn automation_builds_and_discards_the_selection() {
     use crate::app::shell::commands::{Command, Operation, Outcome as Reply};
     let (_dir, mut e, ids) = editor(&["slow-a.ARW", "slow-b.ARW", "c.JPG"]);
     let raws = ["slow-a.ARW", "slow-b.ARW"].map(|name| path_of(&e, id_named(&e, &ids, name)));
+    // Offline: skipped.
+    std::fs::remove_file(path_of(&e, id_named(&e, &ids, "c.JPG"))).unwrap();
     let library = e.library.as_mut().unwrap();
     library.select(Some(ids[0]));
     library.select_range_to(ids[2]);
@@ -706,6 +710,75 @@ fn a_real_raw_is_built_from_its_full_decode() {
     );
     assert_eq!(row.original_size, (raw.metadata.width, raw.metadata.height));
     assert!(file.image().fast);
+}
+
+/// The real steps, on a JPEG: opened whole (rendered files are never decoded
+/// again or decode-cached), reduced and recorded, its facts a rendered file's.
+#[test]
+fn a_real_jpeg_is_built_from_its_whole_file() {
+    let (_dir, mut e, ids) = editor_with_catalog(&["photo.jpg"]).unwrap();
+    let path = path_of(&e, ids[0]);
+    image::RgbImage::from_fn(2600, 40, |x, y| {
+        image::Rgb([(x / 11) as u8, (y * 5) as u8, 120])
+    })
+    .save_with_format(&path, image::ImageFormat::Jpeg)
+    .unwrap();
+    e.build_editable_previews(&ids).unwrap();
+    settle(&mut e);
+    let p = progress(&e);
+    assert!(p.failed.is_empty() && p.without_look.is_empty(), "{p:?}");
+    let row = recorded(&e, ids[0]).unwrap();
+    assert_eq!(row.original, Identity::read(&path).unwrap());
+    assert_eq!(row.original_size, (2600, 40));
+    let file = editable_preview::read(&row.path, Cancel::NEVER).unwrap();
+    assert_eq!(file.header().original, [2600, 40]);
+    assert_eq!(file.header().preview, [2560, 39]);
+    assert!(file.image().fast && file.image().metadata.is_rendered());
+    assert!(
+        file.camera_look().is_none(),
+        "a rendered file has no Camera Look"
+    );
+}
+
+/// An HDR file's light can't be kept by an editable preview yet: its build fails
+/// with that reason, recording nothing, and the next photo still builds.
+#[test]
+fn an_hdr_file_is_refused_with_its_reason() {
+    let (_dir, mut e, ids) = editor_with_catalog(&["a-pq.avif", "b.jpg"]).unwrap();
+    let (hdr, jpeg) = (id_named(&e, &ids, "a-pq.avif"), id_named(&e, &ids, "b.jpg"));
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/formats/pq.avif");
+    std::fs::copy(&fixture, path_of(&e, hdr)).unwrap();
+    image::RgbImage::from_pixel(16, 12, image::Rgb([90, 120, 150]))
+        .save_with_format(path_of(&e, jpeg), image::ImageFormat::Jpeg)
+        .unwrap();
+    e.build_editable_previews(&[hdr, jpeg]).unwrap();
+    settle(&mut e);
+    let p = progress(&e);
+    assert_eq!(p.failed.len(), 1, "{p:?}");
+    assert_eq!(p.failed[0].0, "a-pq.avif");
+    assert!(p.failed[0].1.contains("HDR"), "{p:?}");
+    assert!(recorded(&e, hdr).is_none());
+    assert!(recorded(&e, jpeg).is_some());
+    assert_eq!(files(&e).len(), 1);
+}
+
+/// A file Develop can't edit fails with Develop's reason for it.
+#[test]
+fn a_file_develop_can_t_edit_fails_with_develop_s_reason() {
+    let (_dir, mut e, ids) = editor_with_catalog(&["sequence.avif"]).unwrap();
+    let mut bytes =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/formats/pq.avif"))
+            .unwrap();
+    // The ftyp box's major brand, at bytes 8–12: `avif` made `avis`, a sequence.
+    assert_eq!(&bytes[8..12], b"avif");
+    bytes[11] = b's';
+    std::fs::write(path_of(&e, ids[0]), bytes).unwrap();
+    e.build_editable_previews(&ids).unwrap();
+    settle(&mut e);
+    let p = progress(&e);
+    assert_eq!(p.failed.len(), 1, "{p:?}");
+    assert_eq!(p.failed[0].1, "RAWmakase can't edit animated images");
+    assert!(recorded(&e, ids[0]).is_none() && files(&e).is_empty());
 }
 
 /// The thumbnail menu's commands, as the grid hands them to the editor: the

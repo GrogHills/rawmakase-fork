@@ -1,7 +1,8 @@
 //! Build Editable Previews and Discard Editable Previews: a smaller copy of each
-//! chosen photo (2560 pixels on its long edge, [`editable_preview`]), built while
-//! its original is online, so that Develop can edit the photo while the original
-//! is offline (`Library::develop_from`). Editable previews are not a cache: once the original is
+//! chosen photo (2560 pixels on its long edge, [`editable_preview`]), a RAW or a
+//! rendered file Develop edits (a JPEG, PNG, TIFF, WebP, AVIF, HEIF or JPEG XL),
+//! built while its original is online, so that Develop can edit the photo while
+//! the original is offline (`Library::develop_from`). Editable previews are not a cache: once the original is
 //! offline one can't be built again, so the catalog keeps a row for each
 //! (`catalog::editable_previews`), and only RAWmakase's own files are ever deleted.
 //!
@@ -38,6 +39,7 @@ use crate::catalog::{
 };
 use crate::editable_preview;
 use crate::exif::CameraExif;
+use crate::photo::Opened;
 use crate::storage::Identity;
 use anyhow::{Context, ensure};
 use rawmakase_cancel::Cancel;
@@ -102,27 +104,37 @@ impl Steps {
     };
 }
 
-/// Opens the RAW at `item`'s path and decodes it in full, as Develop's image is
-/// decoded: the decode cache's copy of the version `identity` names (highlights
-/// recovered) when it has one, else a decode, which is not stored, so a batch
-/// never fills the cache, as exports don't.
+/// Opens the photo at `item`'s path and decodes it in full, as Develop's image is
+/// decoded. A RAW is the decode cache's copy of the version `identity` names
+/// (highlights recovered) when it has one, else a decode, which is not stored, so a
+/// batch never fills the cache, as exports don't. A rendered file is opened whole,
+/// as opening one is its whole decode and is never cached; one Develop can't edit
+/// fails with Develop's reason.
 pub(in crate::app) fn open(
     item: &Item,
     identity: &Identity,
     cancel: Cancel<'_>,
 ) -> anyhow::Result<Original> {
-    let raw = crate::photo::open(&item.path)
-        .with_context(|| format!("{} can't be read", item.path.display()))?;
-    let (profiles, _) = crate::camera_profiles::installed(&raw.metadata);
+    let opened = crate::photo::open_source(&item.path, cancel).map_err(|e| {
+        match crate::app::library::Refusal::opening(&item.path, &e) {
+            Some(refusal) => anyhow::anyhow!(refusal.detail()),
+            None => e.context(format!("{} can't be read", item.path.display())),
+        }
+    })?;
+    let (profiles, _) = crate::camera_profiles::installed(opened.metadata());
     let exif = crate::photo::camera_exif(&item.path);
-    let full = crate::decode::FullSize::of_version(
-        Some(identity),
-        item.demosaic,
-        item.decode_cache.clone(),
-    );
-    let image = full
-        .get(|| Ok(raw), crate::decode::DecodePolicy::Export, cancel)?
-        .context("The photo wasn't decoded")?;
+    let image = match opened {
+        Opened::Rendered(image) => image,
+        Opened::Raw(raw) => {
+            let full = crate::decode::FullSize::of_version(
+                Some(identity),
+                item.demosaic,
+                item.decode_cache.clone(),
+            );
+            full.get(|| Ok(raw), crate::decode::DecodePolicy::Export, cancel)?
+                .context("The photo wasn't decoded")?
+        }
+    };
     Ok(Original {
         image,
         exif,
@@ -640,9 +652,11 @@ pub(in crate::app) struct Discarded {
 }
 
 impl Editor {
-    /// Build Editable Previews for `ids`: each available RAW's master, once.
-    /// Offline photos and other files are skipped and counted; a photo whose
-    /// editable preview is of its original as it is costs nothing.
+    /// Build Editable Previews for `ids`: each available photo's master, once.
+    /// Offline photos are skipped and counted; a photo whose editable preview is of
+    /// its original as it is costs nothing. A file Develop can't edit is found when
+    /// the build opens it, and fails with the reason, as reading every file's
+    /// header here would hold the app up.
     pub(in crate::app) fn build_editable_previews(
         &mut self,
         ids: &[PhotoId],
@@ -663,13 +677,7 @@ impl Editor {
                 continue;
             }
             match library.photo(master) {
-                // Only a RAW: a JPEG, PNG, TIFF, WebP, AVIF, HEIF or JPEG XL
-                // offline shows its Standard preview, and its file is no larger
-                // than one.
-                Some(m)
-                    if crate::storage::is_raw(&m.path)
-                        && library.export_refusal(master).is_none() =>
-                {
+                Some(m) if library.export_refusal(master).is_none() => {
                     items.push(Item {
                         catalog: catalog.clone(),
                         photo: master,
@@ -975,7 +983,7 @@ fn report(progress: &Progress) -> Option<(String, String)> {
     Some((parts.join(" · "), reasons))
 }
 
-/// "Building 12 editable previews · 3 skipped (offline or not RAW)".
+/// "Building 12 editable previews · 3 skipped (offline)".
 pub(in crate::app) fn queued_message(queued: Queued) -> String {
     let mut line = match queued.queued {
         0 => "No editable previews to build".to_string(),
@@ -985,10 +993,7 @@ pub(in crate::app) fn queued_message(queued: Queued) -> String {
         ),
     };
     if queued.skipped > 0 {
-        line.push_str(&format!(
-            " · {} skipped (offline or not RAW)",
-            queued.skipped
-        ));
+        line.push_str(&format!(" · {} skipped (offline)", queued.skipped));
     }
     line
 }

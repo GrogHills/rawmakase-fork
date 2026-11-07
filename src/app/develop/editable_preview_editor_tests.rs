@@ -1257,3 +1257,143 @@ fn a_syncs_undo_writes_no_photo_when_one_without_an_edit_was_replaced() {
     assert_eq!(fx.saved_exposure(a, &fx.path(a)), 0.7);
     assert_eq!(fx.stored_exposure(c), 0.7);
 }
+
+/// A smooth gradient a little wider than an editable preview's long edge, so its
+/// editable preview is reduced and stands for a larger original, as a camera
+/// JPEG's does.
+fn write_gradient_jpeg(path: &std::path::Path) {
+    image::RgbImage::from_fn(2600, 96, |x, y| {
+        image::Rgb([
+            (30 + x * 200 / 2599) as u8,
+            (60 + y) as u8,
+            (210 - x * 150 / 2599) as u8,
+        ])
+    })
+    .save_with_format(path, image::ImageFormat::Jpeg)
+    .unwrap();
+}
+
+impl Fx {
+    /// Builds `id`'s editable preview as Build Editable Previews does, with the
+    /// real steps, and waits for it.
+    fn build_for_real(&mut self, id: PhotoId) {
+        let queued = self.e.build_editable_previews(&[id]).unwrap();
+        assert_eq!((queued.queued, queued.skipped), (1, 0));
+        let until = Instant::now() + Duration::from_secs(60);
+        while self.e.editable_builds.running() {
+            assert!(Instant::now() < until, "the build never ended");
+            self.e.poll_editable_builds();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.e.poll_editable_builds();
+        let p = self.e.editable_builds.progress().unwrap_or_default();
+        assert!(p.failed.is_empty(), "{p:?}");
+    }
+}
+
+/// A JPEG's editable preview is built from the file itself, and offline the photo
+/// opens from it as the rendered file it is: its default rendering is the file,
+/// its edit saves against the identity recorded, and that edit loads from the
+/// original once it is back.
+#[test]
+fn an_offline_jpeg_opens_from_its_editable_preview_as_its_file_looks() {
+    let mut fx = fixture(&["a.jpg"]);
+    let a = fx.id("a.jpg");
+    let path = fx.path(a);
+    write_gradient_jpeg(&path);
+    let original = Identity::read(&path).unwrap();
+    fx.build_for_real(a);
+    let recorded = catalog(&fx.e).editable_preview(a).unwrap().unwrap();
+    assert_eq!(recorded.original, original);
+    assert_eq!(recorded.original_size, (2600, 96));
+    let bytes = fx.take_offline(a);
+    assert!(fx.refusal(a).is_none(), "{:?}", fx.refusal(a));
+    fx.open(a);
+    let d = &fx.e.document;
+    assert!(d.failed.is_none(), "{:?}", d.failed);
+    assert!(d.opened_from_preview());
+    let image = d.full().unwrap().clone();
+    assert!(image.metadata.is_rendered());
+    assert!(image.fast);
+    assert_eq!((image.metadata.width, image.metadata.height), (2600, 96));
+    assert_eq!(image.width, 2560);
+    assert!(image.photo_scale() < 1.);
+    assert_eq!(d.file.as_ref(), Some(&original));
+
+    // At its defaults it renders as the file looks, reduced.
+    let out = fx._dir.path().join("offline.jpg");
+    let started = fx
+        .automate(serde_json::json!({"cmd": "preview", "path": out}))
+        .expect("previewed");
+    let job = fx.finished(&started);
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["opened_from"], "editable_preview");
+    let shown = image::open(&out).unwrap().to_rgb8();
+    let file = image::load_from_memory(&bytes).unwrap().to_rgb8();
+    let file = image::imageops::resize(
+        &file,
+        shown.width(),
+        shown.height(),
+        image::imageops::FilterType::Triangle,
+    );
+    let (mut sum, mut largest) = (0u64, 0u8);
+    for (s, f) in shown.pixels().zip(file.pixels()) {
+        for c in 0..3 {
+            let d = s[c].abs_diff(f[c]);
+            sum += u64::from(d);
+            largest = largest.max(d);
+        }
+    }
+    let mean = sum as f64 / (u64::from(shown.width() * shown.height()) * 3) as f64;
+    // Measured: a mean of 0.74 levels and at most 5, from the JPEG preview's
+    // own coding and the resize compared with.
+    assert!(mean < 1. && largest <= 6, "mean {mean}, largest {largest}");
+
+    fx.e.document.edit.setup_mut().exposure = 0.6;
+    fx.e.document.edit.save_state_mut().mark_changed();
+    assert!(
+        fx.e.flush(),
+        "{:?}",
+        fx.e.document.edit.save_state().message()
+    );
+    assert_eq!(fx.stored_identity(a), original);
+    assert_eq!(
+        fx.saved_exposure(a, crate::edits::Original::recorded(&path, &original)),
+        0.6
+    );
+
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(fx.saved_exposure(a, &path), 0.6);
+    fx.e.document.close();
+    fx.open(a);
+    assert_eq!(fx.e.document.from, OpenedFrom::Original);
+}
+
+/// The Loupe develops an offline JPEG from its editable preview even before it
+/// has an edit: offline, its file can't be shown as it is.
+#[test]
+fn the_loupe_develops_an_offline_unedited_jpeg_from_its_editable_preview() {
+    let mut fx = fixture(&["a.jpg", "b.jpg"]);
+    let (a, b) = (fx.id("a.jpg"), fx.id("b.jpg"));
+    for id in [a, b] {
+        write_gradient_jpeg(&fx.path(id));
+    }
+    fx.build_for_real(a);
+    let l = fx.e.library.as_mut().unwrap();
+    l.select(Some(a));
+    l.open_loupe();
+    // Online and unedited, its file is shown as it is.
+    assert_eq!(l.loupe_develops(), None);
+    fx.take_offline(a);
+    fx.take_offline(b);
+    let l = fx.e.library.as_mut().unwrap();
+    l.refresh().unwrap();
+    l.wait_for_availability();
+    l.select(Some(a));
+    assert_eq!(l.loupe_develops(), Some(a));
+    assert_eq!(l.loupe_offline_developed(), None);
+    // Without one, as before: nothing to develop it from.
+    l.select(Some(b));
+    assert_eq!(l.loupe_develops(), None);
+    assert_eq!(l.loupe_offline_developed(), None);
+}

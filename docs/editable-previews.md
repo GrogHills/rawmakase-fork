@@ -1,6 +1,7 @@
 # Editable previews
 
-Status: Plan (2026-11-06), partly built: stages 1a, 2, 3, 4 and 5 are in (2026-11-07).
+Status: Plan (2026-11-06), partly built: stages 1a, 2, 3, 4 and 5 are in (2026-11-07), and
+rendered files have them too (decision 9).
 
 Proposed implementation, 2026-11-06. Repository inspected at `509dda0`
 (`pch/rawmakase` main). This is a plan, not a claim of implemented support.
@@ -189,6 +190,32 @@ JPEG. So, decided 2026-11-07:
   of the edit and keeps working.
 
 Set aside: storing the embedded JPEG (1–5 MB) so fitting works offline too.
+
+### 9. Rendered files: built and edited as RAWs are
+
+Decided 2026-11-07, after stage 5. JPEG, PNG, TIFF, WebP, AVIF, HEIF and JPEG XL
+files have editable previews too, through the same build, file and offline Develop.
+Stage 4 skipped them, as an unedited one offline still showed: but the Library keeps
+no Standard preview of an unedited rendered file (it is its own preview), so offline
+it was shown only from the grid's thumbnail, and it couldn't be edited at all.
+
+- The build opens the file whole (`photo::open_source`), as Develop does: opening a
+  rendered file is its whole decode, so the decode cache plays no part. Its
+  pseudo-scene (`develop::rendered`) is kept as a RAW's camera image is, on the same
+  curve, and its facts say `Source::Rendered`, so offline it develops as it does
+  online, its defaults reproducing the file. No format change: version 1 already
+  stores the source, and curve 1's scale names a rendered file's white.
+- A file Develop can't edit (animated, tiled…) fails with Develop's reason.
+- An HDR file (PQ, HLG, linear light, or a gain map) fails: "An editable preview
+  can't keep an HDR file's light yet". Version 1 keeps one image, the SDR
+  pseudo-scene, and an HDR photo rendered offline without its light would not be
+  the photo. Keeping the light is later work, as an optional section, as `LOOK` was.
+- The Loupe develops an offline rendered file from its editable preview even
+  without an edit, at the defaults, rather than enlarging the grid's thumbnail.
+- An 8-bit file's editable preview can be larger than the file, as it keeps 16-bit
+  codes (or Smaller's 12-bit ones). Not measured on a corpus.
+- Unchanged: AI Denoise and Fit Camera Look never apply to a rendered file, and
+  export stays refused offline (decision 5).
 
 ## Ownership
 
