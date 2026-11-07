@@ -992,7 +992,9 @@ fn a_syncs_undo_never_clears_the_edit_of_a_replaced_original_that_had_none() {
     assert_eq!(fx.stored_exposure(a), 0.7);
     assert_eq!(fx.stored_identity(a), synced);
     // The command stays on the Undo stack: Redo has nothing to redo.
+    assert_eq!(fx.e.undo_log.len(), (1, 0));
     fx.e.redo();
+    assert_eq!(fx.e.undo_log.len(), (1, 0));
     assert_eq!(fx.stored_exposure(a), 0.7);
     // With the original back, Undo clears it and Redo writes it again.
     std::fs::write(fx.path(a), &kept).unwrap();
