@@ -509,27 +509,26 @@ fn a_catalog_reopens_with_its_editable_previews_and_an_older_one_gains_the_table
     Ok(())
 }
 
+// Symlinks need privileges on Windows; the comparison is the same there.
+#[cfg(unix)]
 #[test]
 fn a_build_read_through_a_link_to_the_photos_file_is_recorded() -> Result<()> {
     // The catalog keeps a folder by its real path; a build may have been
     // given another spelling of it, as macOS's /var is /private/var.
     let mut fx = fixture()?;
     let built = fx.build(fx.a, &fx.original("a.dng")?, b"x")?;
-    #[cfg(unix)]
-    {
-        let link = fx.dir.join("linked");
-        std::os::unix::fs::symlink(fx.dir.join("photos"), &link)?;
-        fx.cat
-            .record_editable_preview(fx.a, &link.join("a.dng"), &built)?;
-        let recorded = fx.cat.editable_preview(fx.a)?;
-        // A link to another photo's file is not this photo's.
-        let error = fx
-            .cat
-            .record_editable_preview(fx.a, &link.join("b.dng"), &built)
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("changed while"), "{error:#}");
-        assert_eq!(fx.cat.editable_preview(fx.a)?, recorded);
-        assert_eq!(fx.rows()?, 1);
-    }
+    let link = fx.dir.join("linked");
+    std::os::unix::fs::symlink(fx.dir.join("photos"), &link)?;
+    fx.cat
+        .record_editable_preview(fx.a, &link.join("a.dng"), &built)?;
+    let recorded = fx.cat.editable_preview(fx.a)?;
+    // A link to another photo's file is not this photo's.
+    let error = fx
+        .cat
+        .record_editable_preview(fx.a, &link.join("b.dng"), &built)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("changed while"), "{error:#}");
+    assert_eq!(fx.cat.editable_preview(fx.a)?, recorded);
+    assert_eq!(fx.rows()?, 1);
     Ok(())
 }
