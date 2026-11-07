@@ -93,8 +93,25 @@ A **"Smaller" choice comes later, in its own change**: 12-bit codes on the same
 curve (mean 9.1 MB, 42% smaller; worst p99 about 2 ΔE2000 under Saturation and
 Vibrance +100), opt-in, with dither added when writing, because on a clean,
 noise-free gradient undithered 12-bit codes show contour steps under strong
-colour or curve edits. It ships only if the dither removes most of those steps
-while adding under about 1 ΔE2000. 10-bit codes (6.1 MB) were set aside: 5–7
+colour or curve edits. It was to ship only if the dither removed most of those
+steps while adding under about 1 ΔE2000.
+
+Measured 2026-11-07 (codec 2, `editable_preview::depths`, the same 25 RAWs):
+dithered 12-bit files average 9.2 MB (median 8.8, largest 14.6). On the
+noise-free gradient, under every edit measured, the largest contour step is
+0.7–1.3 times the lossless preview's (undithered 12-bit: 1.6–9 times), at the
+cost of fine grain, at most about 0.6 of an 8-bit level. Against the lossless
+preview, 16 px blocks differ by at most 0.32 ΔE2000 (p99, worst photo) and pixels
+by 0.05–0.31 on average; per-pixel p99 stays under 1 for defaults, ±EV and
+Shadows (worst photo 0.90), but reaches 2.3–3.3 on the worst photo under
+Contrast, Clarity and Texture +100, a steep curve, or Saturation and Vibrance
++100. Undithered 12-bit codes already exceed 1 there (1.3–1.9), so no 12-bit
+choice meets a per-pixel bar; the excess is the dither's grain. Decided
+2026-11-07: the bar is restated as what shows — no contour steps beyond the
+lossless preview's on smooth gradients, 16 px block p99 under 1 ΔE2000, per-pixel
+mean under about 0.35, and the grain under extreme edits said where the choice
+is offered — which Smaller meets, and it ships opt-in, lossless staying the
+default. 10-bit codes (6.1 MB) were set aside: 5–7
 ΔE2000 p99 under strong edits, and banding under ordinary ones. Version 1 already
 allows the new codec or curve code.
 
