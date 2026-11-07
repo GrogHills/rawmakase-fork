@@ -330,6 +330,8 @@ impl Library {
         }
         self.loupe.before_click = None;
         self.scroll_to_active = true;
+        // Opened again, whatever changed while it was closed is asked about.
+        self.preview_usable.replace(None);
     }
     /// The offline photo the Loupe shows that a stored preview can stand in for:
     /// one it would develop (see [`Self::loupe_develops`]).
@@ -356,6 +358,7 @@ impl Library {
     /// Loupe's own, quicker preview instead.
     pub(crate) fn loupe_develops(&self) -> Option<PhotoId> {
         let photo = self.selection.active.and_then(|id| self.photo(id))?;
+        self.forget_preview_answer_unless(photo.id);
         let source = self.is_available(&photo.path) || self.develops_from_preview(photo);
         (self.loupe.open && source && self.develops(photo)).then_some(photo.id)
     }

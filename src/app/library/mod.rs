@@ -594,20 +594,23 @@ impl Library {
             _ => None,
         }
     }
+    /// Forgets the answer [`Self::develops_from_preview`] keeps unless it is
+    /// photo `id`'s: the Loupe calls this for every photo it shows, online ones
+    /// too, so coming back to a photo asks again, as its editable preview or
+    /// original may have changed meanwhile.
+    pub(in crate::app) fn forget_preview_answer_unless(&self, id: PhotoId) {
+        let kept = *self.preview_usable.borrow();
+        if kept.is_some_and(|(kept, _)| kept != id) {
+            self.preview_usable.replace(None);
+        }
+    }
     /// Whether Develop would open offline `photo` from its editable preview
     /// ([`Self::develop_from`]), checked once while it stays the photo asked
-    /// about: for the Loupe, which asks every frame. Asking about any other
-    /// photo forgets the answer.
+    /// about: for the Loupe, which asks every frame.
     pub(in crate::app) fn develops_from_preview(&self, photo: &Photo) -> bool {
-        // Asked about another photo, the answer kept is dropped: coming back to
-        // a photo asks again, as its preview or original may have changed.
-        let kept = *self.preview_usable.borrow();
-        match kept {
-            Some((id, usable)) if id == photo.id => return usable,
-            Some(_) => {
-                self.preview_usable.replace(None);
-            }
-            None => {}
+        self.forget_preview_answer_unless(photo.id);
+        if let Some((_, usable)) = *self.preview_usable.borrow() {
+            return usable;
         }
         if !self.has_editable_preview(photo.id) {
             return false;

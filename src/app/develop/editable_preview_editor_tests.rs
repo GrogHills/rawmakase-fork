@@ -685,3 +685,31 @@ fn a_synced_photo_that_can_t_be_opened_again_is_closed_not_left_stale() {
     fx.e.reopen_synced(&[a]);
     assert_eq!(fx.e.document.catalog_photo, None);
 }
+
+#[test]
+fn the_loupe_asks_again_after_passing_through_an_online_photo() {
+    let mut fx = fixture(&["a.dng", "b.dng"]);
+    let (a, b) = (fx.id("a.dng"), fx.id("b.dng"));
+    fx.build(a, false);
+    fx.take_offline(a);
+    let l = fx.e.library.as_mut().unwrap();
+    l.refresh().unwrap();
+    l.wait_for_availability();
+    l.select(Some(a));
+    l.open_loupe();
+    assert_eq!(l.loupe_develops(), Some(a));
+    // Past an online photo and back, with A's editable preview gone meanwhile.
+    l.select(Some(b));
+    assert_eq!(l.loupe_develops(), Some(b));
+    let file = l
+        .session
+        .catalog()
+        .editable_preview(a)
+        .unwrap()
+        .unwrap()
+        .path;
+    std::fs::remove_file(file).unwrap();
+    l.select(Some(a));
+    assert_eq!(l.loupe_develops(), None);
+    assert_eq!(l.loupe_offline_developed(), Some(a));
+}
