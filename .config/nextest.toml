@@ -1,0 +1,17 @@
+# cargo-nextest settings. CI's Windows, macOS and aarch64 jobs run the
+# workspace's tests with `cargo nextest run`; `cargo test` (make check, the
+# Linux lint job) ignores this file.
+#
+# nextest runs every test in a process of its own, and the test binaries side by
+# side rather than one after another. A static Mutex therefore no longer makes
+# tests take turns: anything they share outside the process needs a test group.
+
+# The real-trash tests recycle real files when CI is set, one at a time: two at
+# once, on a fresh Windows runner, once had the shell refuse to recycle one of
+# them (platform::trash::tests::one_at_a_time).
+[test-groups]
+real-trash = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^platform::trash::tests::/)'
+test-group = 'real-trash'

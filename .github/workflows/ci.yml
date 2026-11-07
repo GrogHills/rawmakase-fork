@@ -126,8 +126,14 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest@0.9.151
+      # nextest runs no doctests, so cargo test runs those.
       - name: Test
-        run: cargo test --locked --workspace
+        run: |
+          cargo nextest run --locked --workspace
+          cargo test --locked --workspace --doc
 
   check-windows:
     name: Test on Windows
@@ -145,6 +151,22 @@ jobs:
         id: source
         shell: bash
         run: echo "windows=$(test -f packaging/windows/rawmakase.ico && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      # The catalog commits with synchronous=FULL into tempfile directories.
+      # %TEMP% is on C:, the runner's OS disk, where each flush is slow, and
+      # Defender scans every file created there: the catalog and library tests
+      # ran 10 to 20 times slower than on Linux or macOS. RUNNER_TEMP is on D:.
+      # The checkout, and so target\, is on D: as well. Cargo's registry and
+      # the toolchain stay on C:, under the user profile, and are excluded too.
+      # This comes before the toolchain install and the cache restore, so that
+      # Defender scans none of the files they write or the builds read.
+      - if: steps.source.outputs.windows == 'true'
+        name: Temporary files on D:, outside Defender's scan
+        run: |
+          $cargo = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $rustup = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
+          Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP", "$env:GITHUB_WORKSPACE", $cargo, $rustup
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
       - if: steps.source.outputs.windows == 'true'
         name: Rust
         run: |
@@ -156,19 +178,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
       - if: steps.source.outputs.windows == 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # The catalog commits with synchronous=FULL into tempfile directories.
-      # %TEMP% is on C:, the runner's OS disk, where each flush is slow, and
-      # Defender scans every file created there: the catalog and library tests
-      # ran 10 to 20 times slower than on Linux or macOS. RUNNER_TEMP is on D:.
       - if: steps.source.outputs.windows == 'true'
-        name: Temporary files on D:, outside Defender's scan
-        run: |
-          Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP", "$env:GITHUB_WORKSPACE"
-          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest@0.9.151
       # Tests that need private RAW files, camera profiles or a GPU are #[ignore]d.
+      # nextest runs the test binaries side by side (.config/nextest.toml);
+      # it runs no doctests, so cargo test runs those.
       - if: steps.source.outputs.windows == 'true'
-        run: cargo test --locked --workspace
+        run: cargo nextest run --locked --workspace
+      - if: steps.source.outputs.windows == 'true'
+        run: cargo test --locked --workspace --doc
 
   # Without this job the macOS-only code is compiled for the first time by
   # release.yml, after the release commit is already on main, so a macOS-only
@@ -191,8 +211,13 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest@0.9.151
       # Tests that need private RAW files, camera profiles or a GPU are #[ignore]d.
-      - run: cargo test --locked --workspace
+      # nextest runs no doctests, so cargo test runs those.
+      - run: cargo nextest run --locked --workspace
+      - run: cargo test --locked --workspace --doc
 
   package:
     name: Build, install and run Arch package
@@ -312,6 +337,9 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
       - run: scripts/crate-closures.sh
       - run: cargo test --locked -p rawmakase-model --all-features
       - run: cargo test --locked -p rawmakase-cancel -p rawmakase-fs -p rawmakase-tiff -p rawmakase-raw -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine -p rawmakase-protocol
@@ -342,6 +370,9 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
       - name: Write the check
         run: cargo test --locked -p rawmakase-catalog writes_the_postgres_check -- --ignored
         env:
