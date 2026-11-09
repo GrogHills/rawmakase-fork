@@ -346,14 +346,17 @@ fn footer_badges(
         flag_icon(painter, palette, Pos2::new(x + 4., y), photo.flag, selected);
         x += 14.;
     }
+    // How far the flag, stars and copy name reach, for the editable preview glyph.
+    let mut taken = x;
     if photo.rating > 0 {
-        painter.text(
+        let stars = painter.text(
             Pos2::new(x, y),
             Align2::LEFT_CENTER,
             "★".repeat(photo.rating as usize),
             FontId::proportional(text::MICRO),
             palette.tone(if selected { Tone::PANEL } else { Tone::SOFT }),
         );
+        taken = stars.right();
     }
     if photo.master.is_some() {
         let name = if photo.copy_name.is_empty() {
@@ -364,6 +367,7 @@ fn footer_badges(
         let galley = painter.layout_no_wrap(name.into(), FontId::proportional(text::MICRO), ink);
         let space = cell.width() * 0.36;
         let left = cell.center().x - galley.size().x.min(space) / 2.;
+        taken = taken.max(left + galley.size().x.min(space));
         painter
             .with_clip_rect(Rect::from_min_size(
                 Pos2::new(left, y - 7.),
@@ -386,7 +390,11 @@ fn footer_badges(
         hover.push((mark, OFFLINE_MARK));
         right = mark.left() - 4.;
     }
-    if let Some(tone) = marks.editable_preview {
+    // Left out where it would cover the stars or the copy name, in a narrow
+    // cell: the photo's own marks come first.
+    if let Some(tone) = marks.editable_preview
+        && right - 11. >= taken + 3.
+    {
         let glyph = Rect::from_min_size(Pos2::new(right - 11., y - 4.5), Vec2::new(11., 9.));
         editable_preview_glyph(painter, glyph, palette.tone(tone));
         hover.push((glyph, EDITABLE_PREVIEW_MARK));
@@ -892,5 +900,114 @@ mod tests {
         // On a selected cell's lighter fill, the same marks in darker tones.
         assert_eq!(marks(true, true, true).editable_preview, Some(Tone::HOVER));
         assert_eq!(marks(false, true, true).editable_preview, Some(Tone::PANEL));
+    }
+
+    /// The editable preview glyph never covers the stars: in the narrowest cell,
+    /// an offline, flagged five-star photo's is left out, while a wider cell
+    /// has room for it.
+    #[test]
+    fn the_editable_preview_glyph_keeps_clear_of_the_stars() {
+        let photo = Photo {
+            flag: 1,
+            rating: 5,
+            ..Default::default()
+        };
+        let presence = Presence {
+            available: false,
+            editable_preview: true,
+        };
+        let footer = |width: f32| {
+            let ctx = egui::Context::default();
+            let mut marks = Vec::new();
+            let mut stars = None;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let cell =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, width)).shrink(1.);
+                let badges = Badges {
+                    quick: true,
+                    selected: false,
+                    presence,
+                    ink: Color32::GRAY,
+                };
+                let palette = theme::palette(ui.ctx());
+                marks = footer_badges(ui.painter(), &palette, cell, 20., &photo, badges);
+            });
+            out.textures_delta.clear();
+            for shape in out.shapes {
+                if let egui::Shape::Text(t) = shape.shape
+                    && t.galley.text() == "★★★★★"
+                {
+                    stars = Some(t.visual_bounding_rect());
+                }
+            }
+            (marks, stars.expect("the stars"))
+        };
+        let glyph = |marks: &[(egui::Rect, &str)]| {
+            marks
+                .iter()
+                .find(|(_, why)| *why == EDITABLE_PREVIEW_MARK)
+                .map(|(rect, _)| *rect)
+        };
+        // The thumbnail size slider's narrowest cell.
+        let (marks, stars) = footer(110.);
+        assert!(marks.iter().any(|(_, why)| *why == OFFLINE_MARK));
+        assert_eq!(glyph(&marks), None, "no room beside {stars:?}");
+        let (marks, stars) = footer(160.);
+        let glyph = glyph(&marks).expect("room for it");
+        assert!(glyph.left() > stars.right(), "{glyph:?} clear of {stars:?}");
+    }
+
+    /// Nor does it cover a virtual copy's name, centred in the same footer.
+    #[test]
+    fn the_editable_preview_glyph_keeps_clear_of_a_copy_name() {
+        let photo = Photo {
+            master: Some(crate::catalog::PhotoId(1)),
+            copy_name: "Black and White Version".into(),
+            ..Default::default()
+        };
+        let presence = Presence {
+            available: false,
+            editable_preview: true,
+        };
+        for width in [110., 140., 180., 240., 360.] {
+            let ctx = egui::Context::default();
+            let mut marks = Vec::new();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let cell =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, width)).shrink(1.);
+                let badges = Badges {
+                    quick: false,
+                    selected: false,
+                    presence,
+                    ink: Color32::GRAY,
+                };
+                let palette = theme::palette(ui.ctx());
+                marks = footer_badges(ui.painter(), &palette, cell, 20., &photo, badges);
+            });
+            out.textures_delta.clear();
+            // The name as drawn: clipped to its space.
+            let name = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == photo.copy_name => {
+                        Some(t.visual_bounding_rect().intersect(s.clip_rect))
+                    }
+                    _ => None,
+                })
+                .expect("the copy name");
+            if let Some((glyph, _)) = marks.iter().find(|(_, why)| *why == EDITABLE_PREVIEW_MARK) {
+                assert!(
+                    glyph.left() > name.right(),
+                    "at {width}: {glyph:?} clear of {name:?}"
+                );
+            }
+            if width >= 240. {
+                assert!(
+                    marks.iter().any(|(_, why)| *why == EDITABLE_PREVIEW_MARK),
+                    "at {width}, room for it"
+                );
+            }
+        }
     }
 }
