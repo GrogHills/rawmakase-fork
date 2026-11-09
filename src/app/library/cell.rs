@@ -249,10 +249,21 @@ pub(super) fn photo_cell(
         let badges = Badges {
             quick,
             selected,
-            available,
+            presence: Presence {
+                available,
+                editable_preview,
+            },
             ink,
         };
-        footer_badges(painter, &palette, cell, footer, photo, badges);
+        // Hover only, so a click on a mark still selects the photo.
+        for (rect, why) in footer_badges(painter, &palette, cell, footer, photo, badges) {
+            ui.interact(
+                rect,
+                egui::Id::new(("catalog-presence-mark", photo.id, why)),
+                Sense::hover(),
+            )
+            .on_hover_text(why);
+        }
     }
     let action = photo_menu(
         &response,
@@ -272,12 +283,38 @@ pub(super) fn photo_cell(
 struct Badges {
     quick: bool,
     selected: bool,
-    available: bool,
+    presence: Presence,
     /// The colour of the cell's text.
     ink: Color32,
 }
+/// The marks a cell's footer shows for where its photo is edited from.
+#[derive(Debug, PartialEq, Eq)]
+struct PresenceMarks {
+    /// The editable preview glyph's tone, when the photo has one: faint while
+    /// the original is online, bright while it is offline and Develop opens
+    /// the editable preview instead.
+    editable_preview: Option<Tone>,
+    /// The original is offline: "?".
+    offline: bool,
+}
+fn presence_marks(presence: Presence, selected: bool) -> PresenceMarks {
+    let tone = match (presence.available, selected) {
+        (true, true) => Tone::HOVER,
+        (true, false) => Tone::FAINT,
+        (false, true) => Tone::PANEL,
+        (false, false) => Tone::SOFT,
+    };
+    PresenceMarks {
+        editable_preview: presence.editable_preview.then_some(tone),
+        offline: !presence.available,
+    }
+}
+const OFFLINE_MARK: &str = "Offline: its original can't be found.";
+const EDITABLE_PREVIEW_MARK: &str =
+    "Has an editable preview: it can be edited while its original is offline.";
 /// The footer of a cell with extras: flag, stars, copy name, the Quick
-/// Collection marker and the offline mark.
+/// Collection marker, the offline mark and the editable preview glyph.
+/// Returns where the last two are, with what they mean, for hovering.
 fn footer_badges(
     painter: &egui::Painter,
     palette: &theme::Palette,
@@ -285,13 +322,13 @@ fn footer_badges(
     footer: f32,
     photo: &Photo,
     badges: Badges,
-) {
+) -> Vec<(egui::Rect, &'static str)> {
     use crate::app::library::photo_metadata::flag_icon;
     use egui::{Align2, FontId, Pos2, Rect};
     let Badges {
         quick,
         selected,
-        available,
+        presence,
         ink,
     } = badges;
     // Lightroom's Quick Collection marker, in the footer's right corner,
@@ -309,14 +346,17 @@ fn footer_badges(
         flag_icon(painter, palette, Pos2::new(x + 4., y), photo.flag, selected);
         x += 14.;
     }
+    // How far the flag, stars and copy name reach, for the editable preview glyph.
+    let mut taken = x;
     if photo.rating > 0 {
-        painter.text(
+        let stars = painter.text(
             Pos2::new(x, y),
             Align2::LEFT_CENTER,
             "★".repeat(photo.rating as usize),
             FontId::proportional(text::MICRO),
             palette.tone(if selected { Tone::PANEL } else { Tone::SOFT }),
         );
+        taken = stars.right();
     }
     if photo.master.is_some() {
         let name = if photo.copy_name.is_empty() {
@@ -327,6 +367,7 @@ fn footer_badges(
         let galley = painter.layout_no_wrap(name.into(), FontId::proportional(text::MICRO), ink);
         let space = cell.width() * 0.36;
         let left = cell.center().x - galley.size().x.min(space) / 2.;
+        taken = taken.max(left + galley.size().x.min(space));
         painter
             .with_clip_rect(Rect::from_min_size(
                 Pos2::new(left, y - 7.),
@@ -334,15 +375,44 @@ fn footer_badges(
             ))
             .galley(Pos2::new(left, y - galley.size().y / 2.), galley, ink);
     }
-    if !available {
-        painter.text(
-            Pos2::new(cell.right() - 24., y),
+    let marks = presence_marks(presence, selected);
+    let mut hover = Vec::new();
+    // Both right-aligned left of the Quick Collection marker, "?" nearest it.
+    let mut right = cell.right() - 24.;
+    if marks.offline {
+        let mark = painter.text(
+            Pos2::new(right, y),
             Align2::RIGHT_CENTER,
             "?",
             FontId::proportional(text::SMALL),
             Color32::from_rgb(210, 150, 60),
         );
+        hover.push((mark, OFFLINE_MARK));
+        right = mark.left() - 4.;
     }
+    // Left out where it would cover the stars or the copy name, in a narrow
+    // cell: the photo's own marks come first.
+    if let Some(tone) = marks.editable_preview
+        && right - 11. >= taken + 3.
+    {
+        let glyph = Rect::from_min_size(Pos2::new(right - 11., y - 4.5), Vec2::new(11., 9.));
+        editable_preview_glyph(painter, glyph, palette.tone(tone));
+        hover.push((glyph, EDITABLE_PREVIEW_MARK));
+    }
+    hover
+}
+/// A frame with a small square inside it, filling `rect`: a photo with an
+/// editable preview.
+fn editable_preview_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    painter.rect_stroke(
+        rect,
+        radius::SMALL,
+        egui::Stroke::new(1., color),
+        egui::StrokeKind::Inside,
+    );
+    let inner =
+        egui::Rect::from_min_size(rect.right_bottom() - Vec2::new(6., 5.5), Vec2::new(4., 3.5));
+    painter.rect_filled(inner, 0., color);
 }
 /// Lightroom's virtual copy badge: the image's lower left corner folded
 /// over. `background` is what shows behind the fold.
@@ -782,4 +852,162 @@ pub(in crate::app) fn photo_menu(
         });
     });
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The footer marks an editable preview, brighter while its original is
+    /// offline, and an offline original with "?", independently.
+    #[test]
+    fn footer_marks_editable_previews_and_offline_originals() {
+        let marks = |available, editable_preview, selected| {
+            presence_marks(
+                Presence {
+                    available,
+                    editable_preview,
+                },
+                selected,
+            )
+        };
+        let none = PresenceMarks {
+            editable_preview: None,
+            offline: false,
+        };
+        assert_eq!(marks(true, false, false), none);
+        assert_eq!(
+            marks(true, true, false),
+            PresenceMarks {
+                editable_preview: Some(Tone::FAINT),
+                offline: false,
+            }
+        );
+        assert_eq!(
+            marks(false, false, false),
+            PresenceMarks {
+                editable_preview: None,
+                offline: true,
+            }
+        );
+        assert_eq!(
+            marks(false, true, false),
+            PresenceMarks {
+                editable_preview: Some(Tone::SOFT),
+                offline: true,
+            }
+        );
+        // On a selected cell's lighter fill, the same marks in darker tones.
+        assert_eq!(marks(true, true, true).editable_preview, Some(Tone::HOVER));
+        assert_eq!(marks(false, true, true).editable_preview, Some(Tone::PANEL));
+    }
+
+    /// The editable preview glyph never covers the stars: in the narrowest cell,
+    /// an offline, flagged five-star photo's is left out, while a wider cell
+    /// has room for it.
+    #[test]
+    fn the_editable_preview_glyph_keeps_clear_of_the_stars() {
+        let photo = Photo {
+            flag: 1,
+            rating: 5,
+            ..Default::default()
+        };
+        let presence = Presence {
+            available: false,
+            editable_preview: true,
+        };
+        let footer = |width: f32| {
+            let ctx = egui::Context::default();
+            let mut marks = Vec::new();
+            let mut stars = None;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let cell =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, width)).shrink(1.);
+                let badges = Badges {
+                    quick: true,
+                    selected: false,
+                    presence,
+                    ink: Color32::GRAY,
+                };
+                let palette = theme::palette(ui.ctx());
+                marks = footer_badges(ui.painter(), &palette, cell, 20., &photo, badges);
+            });
+            out.textures_delta.clear();
+            for shape in out.shapes {
+                if let egui::Shape::Text(t) = shape.shape
+                    && t.galley.text() == "★★★★★"
+                {
+                    stars = Some(t.visual_bounding_rect());
+                }
+            }
+            (marks, stars.expect("the stars"))
+        };
+        let glyph = |marks: &[(egui::Rect, &str)]| {
+            marks
+                .iter()
+                .find(|(_, why)| *why == EDITABLE_PREVIEW_MARK)
+                .map(|(rect, _)| *rect)
+        };
+        // The thumbnail size slider's narrowest cell.
+        let (marks, stars) = footer(110.);
+        assert!(marks.iter().any(|(_, why)| *why == OFFLINE_MARK));
+        assert_eq!(glyph(&marks), None, "no room beside {stars:?}");
+        let (marks, stars) = footer(160.);
+        let glyph = glyph(&marks).expect("room for it");
+        assert!(glyph.left() > stars.right(), "{glyph:?} clear of {stars:?}");
+    }
+
+    /// Nor does it cover a virtual copy's name, centred in the same footer.
+    #[test]
+    fn the_editable_preview_glyph_keeps_clear_of_a_copy_name() {
+        let photo = Photo {
+            master: Some(crate::catalog::PhotoId(1)),
+            copy_name: "Black and White Version".into(),
+            ..Default::default()
+        };
+        let presence = Presence {
+            available: false,
+            editable_preview: true,
+        };
+        for width in [110., 140., 180., 240., 360.] {
+            let ctx = egui::Context::default();
+            let mut marks = Vec::new();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let cell =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, width)).shrink(1.);
+                let badges = Badges {
+                    quick: false,
+                    selected: false,
+                    presence,
+                    ink: Color32::GRAY,
+                };
+                let palette = theme::palette(ui.ctx());
+                marks = footer_badges(ui.painter(), &palette, cell, 20., &photo, badges);
+            });
+            out.textures_delta.clear();
+            // The name as drawn: clipped to its space.
+            let name = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == photo.copy_name => {
+                        Some(t.visual_bounding_rect().intersect(s.clip_rect))
+                    }
+                    _ => None,
+                })
+                .expect("the copy name");
+            if let Some((glyph, _)) = marks.iter().find(|(_, why)| *why == EDITABLE_PREVIEW_MARK) {
+                assert!(
+                    glyph.left() > name.right(),
+                    "at {width}: {glyph:?} clear of {name:?}"
+                );
+            }
+            if width >= 240. {
+                assert!(
+                    marks.iter().any(|(_, why)| *why == EDITABLE_PREVIEW_MARK),
+                    "at {width}, room for it"
+                );
+            }
+        }
+    }
 }

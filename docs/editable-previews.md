@@ -260,7 +260,7 @@ Automation and MCP get `build_editable_previews`.
 - Disabled with a reason: the demosaic choice, AI masks and AI Denoise
   (decision 4); HDR stays available, as the file keeps headroom.
 - Develop and the Loupe say "Editable Preview" or "Original"; the Library filter
-  gains "Has Editable Preview".
+  gains "Editable Previews".
 - When the original comes back, Develop uses it on the next open.
 
 Tests: save offline, reconnect the same file, the edit loads; reconnect a

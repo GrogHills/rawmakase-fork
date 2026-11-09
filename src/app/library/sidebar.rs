@@ -245,7 +245,7 @@ impl Library {
                     if (previews > 0 || self.filters.only_editable_previews)
                         && source_row(
                             ui,
-                            "Has Editable Preview",
+                            "Editable Previews",
                             previews,
                             self.filters.only_editable_previews,
                         )

@@ -428,7 +428,9 @@ fn a_worker_that_is_gone_clears_busy() {
     }
     assert!(!e.editable_builds.running());
     assert!(
-        e.messages.line().contains("stopped being built"),
+        e.messages
+            .line()
+            .contains("Building editable previews stopped unexpectedly"),
         "{}",
         e.messages.line()
     );
@@ -568,6 +570,88 @@ fn preferences_shows_what_they_take_and_discards_them_all() {
     e.discard_editable_previews(None).unwrap();
     assert_eq!(e.shown_editable_previews_size(), Some(0));
     assert!(files(&e).is_empty());
+}
+
+/// Preferences › Catalog shows how many photos have one beside their size, and
+/// Discard All… asks in place before discarding them.
+#[test]
+fn preferences_discard_all_asks_beside_the_size_then_discards() {
+    let (_dir, mut e, ids) = editor(&["a.ARW", "b.ARW"]);
+    e.build_editable_previews(&ids).unwrap();
+    settle(&mut e);
+    e.onboarding.visible = false;
+    e.open_preferences(crate::app::preferences::Tab::Catalog);
+    let ctx = e.context.clone();
+    let frame = |e: &mut Editor, events: Vec<egui::Event>| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600., 1000.),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| e.preferences_window(ui.ctx()));
+        out.textures_delta.clear();
+        out.shapes
+    };
+    // Scrolled down a step at a time until text `matches` is wholly in view
+    // and still: where it is.
+    let scroll_to = |e: &mut Editor, matches: &dyn Fn(&str) -> bool| {
+        let mut at = None;
+        let mut events = vec![];
+        for _ in 0..120 {
+            let shown = frame(e, std::mem::take(&mut events))
+                .into_iter()
+                .find_map(|s| match s.shape {
+                    egui::Shape::Text(t) if matches(t.galley.text()) => {
+                        let rect = t.visual_bounding_rect();
+                        s.clip_rect.contains_rect(rect).then(|| rect.center())
+                    }
+                    _ => None,
+                });
+            if let Some(pos) = shown {
+                if shown == at {
+                    return pos;
+                }
+                at = shown;
+                continue;
+            }
+            at = None;
+            events = vec![
+                egui::Event::PointerMoved(egui::pos2(800., 500.)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0., -40.),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+        }
+        panic!("not shown");
+    };
+    let click = |e: &mut Editor, label: &str| {
+        let pos = scroll_to(e, &|text| text == label);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(e, vec![egui::Event::PointerMoved(pos), button(true)]);
+        frame(e, vec![button(false)]);
+    };
+    scroll_to(&mut e, &|text| text.ends_with(" · 2 photos"));
+    click(&mut e, "Discard All…");
+    assert_eq!(e.asked_discard_all_offline(), Some(0));
+    scroll_to(&mut e, &|text| {
+        text == "Discard all editable previews? They can be built again while the originals are online."
+    });
+    assert!(!files(&e).is_empty(), "asking discards nothing");
+    click(&mut e, "Discard All");
+    assert_eq!(e.asked_discard_all_offline(), None);
+    assert!(files(&e).is_empty());
+    assert!(ids.iter().all(|id| recorded(&e, *id).is_none()));
 }
 
 /// A stale editable preview is discarded before it is built again, so a rebuild
@@ -818,7 +902,8 @@ fn discarding_an_offline_photo_s_from_the_menu_asks_first() {
     e.discard_editable_previews_from_menu(&[copy, d]);
     draw_offline_discard(&mut e, vec![]);
     let shapes = draw_offline_discard(&mut e, vec![]);
-    assert!(shown(&shapes, "This photo is offline."));
+    assert!(shown(&shapes, "This photo is offline, so"));
+    assert!(shown(&shapes, "Discard Editable Preview?"));
     draw_offline_discard(
         &mut e,
         vec![key(egui::Key::Escape, true), key(egui::Key::Escape, false)],
@@ -832,7 +917,7 @@ fn discarding_an_offline_photo_s_from_the_menu_asks_first() {
     ));
     draw_offline_discard(&mut e, vec![]);
     let shapes = draw_offline_discard(&mut e, vec![]);
-    assert!(shown(&shapes, "This photo is offline."));
+    assert!(shown(&shapes, "This photo is offline, so"));
     draw_offline_discard(
         &mut e,
         vec![key(egui::Key::Escape, true), key(egui::Key::Escape, false)],
@@ -846,7 +931,8 @@ fn discarding_an_offline_photo_s_from_the_menu_asks_first() {
     choose(&mut e, b);
     draw_offline_discard(&mut e, vec![]);
     let shapes = draw_offline_discard(&mut e, vec![]);
-    assert!(shown(&shapes, "1 of these photos is offline."));
+    assert!(shown(&shapes, "1 of these photos is offline, so"));
+    assert!(shown(&shapes, "Discard Editable Previews?"));
     draw_offline_discard(
         &mut e,
         vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)],

@@ -364,7 +364,7 @@ impl OpenedFrom {
     /// What opening from an editable preview means, for the badge and status line
     /// that say so.
     pub(crate) const EDITABLE_PREVIEW: &'static str = "Editable Preview";
-    pub(crate) const EDITABLE_PREVIEW_DETAIL: &'static str = "Editing its editable preview: the original is offline. Edits are saved for the original and render from it once it is back and the photo is opened again. AI masks, AI Denoise, Fit Camera Look and Export need the original.";
+    pub(crate) const EDITABLE_PREVIEW_DETAIL: &'static str = "The original is offline, so this is its editable preview.\nEdits are saved as usual; open the photo again once the original is back to see them on it.\nNeeds the original: AI masks, AI Denoise, Fit Camera Look, Export.";
     /// Whether the image opened is reduced and final: an editable preview.
     pub(crate) fn is_final_reduced(&self) -> bool {
         matches!(self, Self::EditablePreview(_))

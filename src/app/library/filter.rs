@@ -89,7 +89,7 @@ pub(super) struct Filters {
     /// Cmd+L: whether the bar's settings apply.
     pub enabled: bool,
     pub only_missing: bool,
-    /// Has Editable Preview: only photos with one (their masters', for virtual
+    /// Editable Previews: only photos with one (their masters', for virtual
     /// copies).
     pub only_editable_previews: bool,
     /// Previous Import: only the photos the last import added, in `members`.

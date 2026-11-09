@@ -566,7 +566,7 @@ impl Library {
             .photos_with_editable_previews()
             .unwrap_or_default();
     }
-    /// Turns Has Editable Preview on or off, for tests.
+    /// Turns the Editable Previews filter on or off, for tests.
     #[cfg(test)]
     pub(in crate::app) fn show_only_editable_previews(&mut self, on: bool) {
         self.filters.only_editable_previews = on;
