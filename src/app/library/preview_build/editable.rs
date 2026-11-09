@@ -900,7 +900,8 @@ impl Editor {
                     // Nothing more will finish; the progress went with it.
                     builds.builder = None;
                     builds.catalog = None;
-                    self.messages.fail("Editable previews stopped being built");
+                    self.messages
+                        .fail("Building editable previews stopped unexpectedly");
                     break;
                 }
             }
@@ -1019,12 +1020,17 @@ fn masters_of(library: &Library, ids: &[PhotoId]) -> BTreeSet<PhotoId> {
 /// `photos` photos, `offline` of them with their originals offline.
 fn offline_question(offline: usize, photos: usize) -> (String, String) {
     let line = match (offline, photos) {
-        (1, 1) => "This photo is offline. Its editable preview can't be built again until its original is back.".to_string(),
-        (1, _) => "1 of these photos is offline. Its editable preview can't be built again until its original is back.".to_string(),
-        (n, p) if n == p => "These photos are offline. Their editable previews can't be built again until the originals are back.".to_string(),
-        (n, _) => format!("{n} of these photos are offline. Their editable previews can't be built again until the originals are back."),
+        (1, 1) => "This photo is offline, so its editable preview can't be rebuilt until the original is back.".to_string(),
+        (1, _) => "1 of these photos is offline, so its editable preview can't be rebuilt until the original is back.".to_string(),
+        (n, p) if n == p => "These photos are offline, so their editable previews can't be rebuilt until the originals are back.".to_string(),
+        (n, _) => format!("{n} of these photos are offline, so their editable previews can't be rebuilt until the originals are back."),
     };
-    ("Discard editable previews anyway?".into(), line)
+    let title = if photos == 1 {
+        "Discard Editable Preview?"
+    } else {
+        "Discard Editable Previews?"
+    };
+    (title.into(), line)
 }
 
 /// "Discarded the editable previews of 3 photos".

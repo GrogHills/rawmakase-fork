@@ -249,10 +249,21 @@ pub(super) fn photo_cell(
         let badges = Badges {
             quick,
             selected,
-            available,
+            presence: Presence {
+                available,
+                editable_preview,
+            },
             ink,
         };
-        footer_badges(painter, &palette, cell, footer, photo, badges);
+        // Hover only, so a click on a mark still selects the photo.
+        for (rect, why) in footer_badges(painter, &palette, cell, footer, photo, badges) {
+            ui.interact(
+                rect,
+                egui::Id::new(("catalog-presence-mark", photo.id, why)),
+                Sense::hover(),
+            )
+            .on_hover_text(why);
+        }
     }
     let action = photo_menu(
         &response,
@@ -272,12 +283,38 @@ pub(super) fn photo_cell(
 struct Badges {
     quick: bool,
     selected: bool,
-    available: bool,
+    presence: Presence,
     /// The colour of the cell's text.
     ink: Color32,
 }
+/// The marks a cell's footer shows for where its photo is edited from.
+#[derive(Debug, PartialEq, Eq)]
+struct PresenceMarks {
+    /// The editable preview glyph's tone, when the photo has one: faint while
+    /// the original is online, bright while it is offline and Develop opens
+    /// the editable preview instead.
+    editable_preview: Option<Tone>,
+    /// The original is offline: "?".
+    offline: bool,
+}
+fn presence_marks(presence: Presence, selected: bool) -> PresenceMarks {
+    let tone = match (presence.available, selected) {
+        (true, true) => Tone::HOVER,
+        (true, false) => Tone::FAINT,
+        (false, true) => Tone::PANEL,
+        (false, false) => Tone::SOFT,
+    };
+    PresenceMarks {
+        editable_preview: presence.editable_preview.then_some(tone),
+        offline: !presence.available,
+    }
+}
+const OFFLINE_MARK: &str = "Offline: its original can't be found.";
+const EDITABLE_PREVIEW_MARK: &str =
+    "Has an editable preview: it can be edited while its original is offline.";
 /// The footer of a cell with extras: flag, stars, copy name, the Quick
-/// Collection marker and the offline mark.
+/// Collection marker, the offline mark and the editable preview glyph.
+/// Returns where the last two are, with what they mean, for hovering.
 fn footer_badges(
     painter: &egui::Painter,
     palette: &theme::Palette,
@@ -285,13 +322,13 @@ fn footer_badges(
     footer: f32,
     photo: &Photo,
     badges: Badges,
-) {
+) -> Vec<(egui::Rect, &'static str)> {
     use crate::app::library::photo_metadata::flag_icon;
     use egui::{Align2, FontId, Pos2, Rect};
     let Badges {
         quick,
         selected,
-        available,
+        presence,
         ink,
     } = badges;
     // Lightroom's Quick Collection marker, in the footer's right corner,
@@ -334,15 +371,40 @@ fn footer_badges(
             ))
             .galley(Pos2::new(left, y - galley.size().y / 2.), galley, ink);
     }
-    if !available {
-        painter.text(
-            Pos2::new(cell.right() - 24., y),
+    let marks = presence_marks(presence, selected);
+    let mut hover = Vec::new();
+    // Both right-aligned left of the Quick Collection marker, "?" nearest it.
+    let mut right = cell.right() - 24.;
+    if marks.offline {
+        let mark = painter.text(
+            Pos2::new(right, y),
             Align2::RIGHT_CENTER,
             "?",
             FontId::proportional(text::SMALL),
             Color32::from_rgb(210, 150, 60),
         );
+        hover.push((mark, OFFLINE_MARK));
+        right = mark.left() - 4.;
     }
+    if let Some(tone) = marks.editable_preview {
+        let glyph = Rect::from_min_size(Pos2::new(right - 11., y - 4.5), Vec2::new(11., 9.));
+        editable_preview_glyph(painter, glyph, palette.tone(tone));
+        hover.push((glyph, EDITABLE_PREVIEW_MARK));
+    }
+    hover
+}
+/// A frame with a small square inside it, filling `rect`: a photo with an
+/// editable preview.
+fn editable_preview_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    painter.rect_stroke(
+        rect,
+        radius::SMALL,
+        egui::Stroke::new(1., color),
+        egui::StrokeKind::Inside,
+    );
+    let inner =
+        egui::Rect::from_min_size(rect.right_bottom() - Vec2::new(6., 5.5), Vec2::new(4., 3.5));
+    painter.rect_filled(inner, 0., color);
 }
 /// Lightroom's virtual copy badge: the image's lower left corner folded
 /// over. `background` is what shows behind the fold.
@@ -782,4 +844,53 @@ pub(in crate::app) fn photo_menu(
         });
     });
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The footer marks an editable preview, brighter while its original is
+    /// offline, and an offline original with "?", independently.
+    #[test]
+    fn footer_marks_editable_previews_and_offline_originals() {
+        let marks = |available, editable_preview, selected| {
+            presence_marks(
+                Presence {
+                    available,
+                    editable_preview,
+                },
+                selected,
+            )
+        };
+        let none = PresenceMarks {
+            editable_preview: None,
+            offline: false,
+        };
+        assert_eq!(marks(true, false, false), none);
+        assert_eq!(
+            marks(true, true, false),
+            PresenceMarks {
+                editable_preview: Some(Tone::FAINT),
+                offline: false,
+            }
+        );
+        assert_eq!(
+            marks(false, false, false),
+            PresenceMarks {
+                editable_preview: None,
+                offline: true,
+            }
+        );
+        assert_eq!(
+            marks(false, true, false),
+            PresenceMarks {
+                editable_preview: Some(Tone::SOFT),
+                offline: true,
+            }
+        );
+        // On a selected cell's lighter fill, the same marks in darker tones.
+        assert_eq!(marks(true, true, true).editable_preview, Some(Tone::HOVER));
+        assert_eq!(marks(false, true, true).editable_preview, Some(Tone::PANEL));
+    }
 }

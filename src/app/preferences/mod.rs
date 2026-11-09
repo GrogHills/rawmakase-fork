@@ -487,51 +487,84 @@ impl Editor {
         });
     }
 
-    /// Preferences › Catalog › Editable previews: the precision they are built at,
-    /// what they take, and Discard All Editable Previews, confirmed first, since
+    /// Preferences › Catalog › Editable previews: what they are, the precision
+    /// they are built at, what they take, and Discard All, confirmed first, since
     /// none can be built again while its original is offline.
     fn editable_previews_block(&mut self, ui: &mut egui::Ui) {
         use crate::editable_preview::Precision;
         group(ui, "Editable previews");
-        let mut precision = self.editable_builds.precision;
-        form_row(ui, "Build", |ui| {
-            ui.radio_value(&mut precision, Precision::Lossless, "Lossless");
-            ui.radio_value(&mut precision, Precision::Smaller, "Smaller");
-        });
         form_row(ui, "", |ui| {
             hint(
                 ui,
-                "Lossless: about 16 MB each, every 16-bit code kept. Smaller: about 40% smaller; adds fine grain under strong edits.",
+                "Smaller copies kept beside the catalog, so photos can be edited while their originals are offline. Build them from a photo's menu › Previews.",
             );
         });
+        let mut precision = self.editable_builds.precision;
+        const REBUILD: &str = "To change one built already, discard it and build it again.";
+        form_row(ui, "Build", |ui| {
+            ui.radio_value(&mut precision, Precision::Lossless, "Lossless")
+                .on_hover_text(REBUILD);
+            ui.radio_value(&mut precision, Precision::Smaller, "Smaller")
+                .on_hover_text(REBUILD);
+        });
         form_row(ui, "", |ui| {
             hint(
                 ui,
-                "For editable previews built from now on. Those built already are kept as they are, and one of an unchanged original isn't built again: discard it, then build it, to change it.",
+                "Lossless: about 16 MB a photo. Smaller: about 9 MB; may add fine grain under strong edits. Applies to previews built from now on.",
             );
         });
         if precision != self.editable_builds.precision {
             self.editable_builds.precision = precision;
             let _ = self.save_session();
         }
-        let Some(size) = self
+        let Some((library, size)) = self
             .library
             .as_ref()
-            .and(self.preferences.usage.editable_previews)
+            .zip(self.preferences.usage.editable_previews)
         else {
             form_row(ui, "Size", |ui| value(ui, "–"));
             return;
         };
-        form_row(ui, "Size", |ui| value(ui, &bytes(size)));
-        let mut discard = false;
+        // Photos that can be edited offline, virtual copies included.
+        let photos = library.editable_preview_count();
+        let shown = match photos {
+            0 => bytes(size),
+            n => format!("{} · {}", bytes(size), plural(n, "photo", "photos")),
+        };
+        let asking = self.preferences.editable_discard;
         let mut ask = false;
-        if let Some(offline) = self.preferences.editable_discard {
+        form_row(ui, "Size", |ui| {
+            // Not truncated, so Discard All… stays beside it.
+            ui.label(egui::RichText::new(shown).color(theme::palette(ui.ctx()).tone(Tone::TEXT)));
+            if asking.is_none() {
+                ask = ui
+                    .add_enabled(
+                        size > 0 || self.editable_builds.running(),
+                        egui::Button::new("Discard All…"),
+                    )
+                    .clicked();
+            }
+        });
+        if ask {
+            self.ask_discard_all_editable_previews();
+        }
+        let mut discard = false;
+        if let Some(offline) = asking {
             let question = match offline {
-                0 => "Discard every editable preview of this catalog? Photos whose originals are offline can't have them built again until the originals are back.".to_string(),
-                1 => "Discard every editable preview of this catalog? 1 is of a photo whose original is offline, and can't be built again until its original is back.".to_string(),
-                n => format!("Discard every editable preview of this catalog? {n} are of photos whose originals are offline, and can't be built again until the originals are back."),
+                0 => "Discard all editable previews? They can be built again while the originals are online.".to_string(),
+                1 => "Discard all editable previews? 1 is of an offline photo and can't be rebuilt until its original is back.".to_string(),
+                n => format!("Discard all editable previews? {n} are of offline photos and can't be rebuilt until their originals are back."),
             };
-            form_row(ui, "", |ui| hint(ui, &question));
+            form_row(ui, "", |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(question)
+                            .size(text::LABEL)
+                            .color(theme::palette(ui.ctx()).tone(Tone::TEXT)),
+                    )
+                    .wrap(),
+                );
+            });
             form_row(ui, "", |ui| {
                 if ui.button("Discard All").clicked() {
                     discard = true;
@@ -541,25 +574,7 @@ impl Editor {
                     self.preferences.editable_discard = None;
                 }
             });
-        } else {
-            form_row(ui, "", |ui| {
-                ask = ui
-                    .add_enabled(
-                        size > 0 || self.editable_builds.running(),
-                        egui::Button::new("Discard All Editable Previews…"),
-                    )
-                    .clicked();
-            });
         }
-        if ask {
-            self.ask_discard_all_editable_previews();
-        }
-        form_row(ui, "", |ui| {
-            hint(
-                ui,
-                "Build them from a photo's menu, while its original is online: a smaller copy, kept beside the catalog, for editing the photo while its original is offline.",
-            );
-        });
         if discard {
             match self.discard_editable_previews(None) {
                 Ok(done) => self
@@ -1682,8 +1697,8 @@ mod tests {
         click(&mut e, "Smaller");
         assert_eq!(e.editable_builds.precision, Precision::Smaller);
         // Its cost and scope are said beside it.
-        assert!(shows(&mut e, "adds fine grain under strong edits"));
-        assert!(shows(&mut e, "For editable previews built from now on"));
+        assert!(shows(&mut e, "may add fine grain under strong edits"));
+        assert!(shows(&mut e, "Applies to previews built from now on"));
         assert!(saved());
         click(&mut e, "Lossless");
         assert_eq!(e.editable_builds.precision, Precision::Lossless);
