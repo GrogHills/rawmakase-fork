@@ -358,9 +358,10 @@ fn discarding_forgets_the_copies_and_hands_back_their_files() -> Result<()> {
     assert_eq!(files.len(), 1);
     assert!(files[0].starts_with(&format!("{}-", a.0)));
     assert_eq!(rows(&fx.cat)?, [b.0]);
-    // Hidden files (a write in progress) and folders are never orphans.
+    // Hidden files, a write in progress and folders are never orphans.
     let folder = fx.cat.editable_previews_folder();
-    std::fs::write(folder.join(".1-pending.dng.tmp"), b"")?;
+    std::fs::write(folder.join(".DS_Store"), b"")?;
+    std::fs::write(folder.join("rawmakase-a1b2c3.partial"), b"")?;
     std::fs::create_dir(folder.join("sub"))?;
     assert_eq!(fx.cat.editable_preview_orphans()?, [folder.join(&files[0])]);
     Ok(())

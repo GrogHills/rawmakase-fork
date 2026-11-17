@@ -89,8 +89,7 @@ pub fn file_name(master: PhotoId, original: &Identity) -> String {
 }
 
 /// Whether `name` is a single plain file name: not empty, not `.` or `..`,
-/// without a separator of any system, and not hidden (the writer's temporary
-/// files start with a dot).
+/// without a separator of any system, and not hidden.
 fn is_plain_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
@@ -261,8 +260,9 @@ impl Catalog {
     }
     /// The files in the copies folder no row names: copies of photos removed
     /// since (by this release, or an older one that doesn't know the table),
-    /// replaced or discarded copies whose deletion failed. Hidden files, the
-    /// writer's temporary ones, and folders are left out. Empty when there is
+    /// replaced or discarded copies whose deletion failed. Hidden files, files
+    /// still being written (`storage::staging_file`'s `.partial` ones) and
+    /// folders are left out. Empty when there is
     /// no copies folder.
     pub fn editable_preview_orphans(&self) -> Result<Vec<PathBuf>> {
         let folder = self.editable_previews_folder();
@@ -282,7 +282,11 @@ impl Catalog {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if is_plain_name(&name) && !named.contains(&name) && entry.file_type()?.is_file() {
+            if is_plain_name(&name)
+                && !name.ends_with(".partial")
+                && !named.contains(&name)
+                && entry.file_type()?.is_file()
+            {
                 orphans.push(entry.path());
             }
         }
