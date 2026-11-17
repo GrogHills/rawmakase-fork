@@ -33,6 +33,7 @@ mod descriptive;
 mod develop_history;
 mod edit_records;
 mod edit_rows;
+mod editable_previews;
 mod edits;
 mod export_catalog;
 pub mod file_ops;
@@ -67,6 +68,10 @@ pub use db::assert_shape as assert_sql_shape;
 pub use defaults::{CameraExifReader, ImportOptions, MetadataDefaults, NewPhotoDefaults};
 pub use descriptive::MetadataSnapshot;
 pub use develop_history::{HistoryUpdate, SavedHistory, SavedStep};
+pub use editable_previews::{
+    EditablePreview, RAWMAKASE_DNG, file_name as editable_preview_file_name,
+    folder as editable_previews_folder,
+};
 pub use edits::PreviewEdit;
 pub use edits::{EditChange, EditToClear, EditToSave};
 pub use export_catalog::{CatalogExport, ExportScope, ExportedFolders};
@@ -144,7 +149,8 @@ impl Catalog {
         // The schema is idempotent: a catalog from an earlier release gains the
         // tables added since.
         self.db.apply_schema()?;
-        locations::prepare(&mut self.db, &self.computer)
+        locations::prepare(&mut self.db, &self.computer)?;
+        editable_previews::repair(&mut self.db)
     }
     pub fn photos(&self) -> Result<Vec<Photo>> {
         row! {
@@ -336,6 +342,8 @@ mod collections_tests;
 mod descriptive_tests;
 #[cfg(test)]
 mod edit_rows_tests;
+#[cfg(test)]
+mod editable_previews_tests;
 #[cfg(test)]
 mod export_catalog_tests;
 #[cfg(test)]

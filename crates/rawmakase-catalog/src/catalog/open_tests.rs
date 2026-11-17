@@ -124,3 +124,57 @@ fn readying_waits_for_another_computers_write() -> Result<()> {
     Catalog::open_as(&path, &computer("linux"))?;
     Ok(())
 }
+
+/// A catalog with editable previews, all on masters, has nothing to repair
+/// and opens without a write lock, as any ready catalog does.
+#[test]
+fn a_catalog_whose_editable_previews_are_on_masters_opens_without_a_write_lock() -> Result<()> {
+    let (_dir, path) = ready()?;
+    let db = Connection::open(&path)?;
+    db.execute(
+        "INSERT INTO editable_previews(photo, file, format, original, built_at)
+         SELECT id, 'a.dng', 'rawmakase-dng-1', '{}', '2026-11-17 00:00:00' FROM photos",
+        [],
+    )?;
+    drop(db);
+    let other = writing(&path)?;
+    let catalog = Catalog::open_as(&path, &computer("mac"))?;
+    assert_eq!(catalog.photos()?.len(), 1);
+    drop(catalog);
+    other.execute_batch("ROLLBACK")?;
+    Ok(())
+}
+
+/// One left on a virtual copy, as an older release's promotion leaves it,
+/// needs moving: the open waits for the other writer, as readying does, and
+/// fails rather than going on with it misplaced.
+#[test]
+fn an_editable_preview_left_on_a_virtual_copy_is_moved_once_the_lock_is_free() -> Result<()> {
+    let (_dir, path) = ready()?;
+    let id: i64 = {
+        let catalog = Catalog::open_as(&path, &computer("mac"))?;
+        let master = catalog.photos()?[0].id;
+        drop(catalog);
+        let mut catalog = Catalog::open_as(&path, &computer("mac"))?;
+        catalog.create_virtual_copy(master)?.0
+    };
+    let db = Connection::open(&path)?;
+    db.execute(
+        "INSERT INTO editable_previews(photo, file, format, original, built_at)
+         VALUES (?, 'a.dng', 'rawmakase-dng-1', '{}', '2026-11-17 00:00:00')",
+        [id],
+    )?;
+    drop(db);
+    let other = writing(&path)?;
+    assert!(Catalog::open_as(&path, &computer("mac")).is_err());
+    other.execute_batch("ROLLBACK")?;
+    Catalog::open_as(&path, &computer("mac"))?;
+    let on: i64 = Connection::open(&path)?.query_row(
+        "SELECT e.photo FROM editable_previews e JOIN photos p ON p.id=e.photo
+         WHERE p.master_id IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_ne!(on, id);
+    Ok(())
+}
