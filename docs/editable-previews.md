@@ -1,7 +1,10 @@
 # Editable previews: plan
 
-Status: Plan (2026-11-17), not built. Scope agreed in #1022; this page answers
-the questions asked there before any code is written.
+Status: Plan (2026-11-17); stage 1 built, the library crates (the copy's file
+in `rawmakase-decode`, the table in `rawmakase-catalog`, the saving rule in
+`rawmakase-interop`). Stage 2, the app (Build and Discard, Develop opening a
+copy, thumbnails, the Library badge), is not built yet. Scope agreed in #1022;
+this page answers the questions asked there.
 
 ## Goal
 
@@ -71,6 +74,14 @@ struct. It holds:
 Without these, 5 of the 13 files rendered visibly differently from the
 original.
 
+As built, the record holds the original's other facts as its decode had them
+too (the make and model as RAWmakase names them, the colour matrices, white
+balance, crop and orientation among them), each by name. The standard tags
+carry the same facts for other DNG readers, but rounded to rationals, or as
+another reader names them, so RAWmakase opens the copy with the record's. A
+DNG with a transparency mask (a Lightroom panorama) isn't given a copy yet: the
+mask is at the original's size and version 1 has no place for it.
+
 Why in the file rather than a catalog column:
 
 - **One thing to carry.** A copy and its facts can't come apart in Export as
@@ -125,6 +136,13 @@ live in the data folder. A file is deleted after the transaction that drops its
 row commits. A file no row names, such as one left when an older release
 removed its photo, is deleted the next time Build or Discard runs on that
 catalog.
+
+As built, Discard and a rebuild hand back the files whose rows they dropped,
+for the caller to delete after the commit. Removing a photo drops its row
+through the cascade alone, in every removal path; its file is then one no row
+names, which `Catalog::editable_preview_orphans` lists for the caller to
+delete after the commit, or the next Build or Discard. Only a file catalog
+exists today, so the data-folder case has nothing to decide yet.
 
 ### 2. Caches
 
@@ -272,12 +290,23 @@ Tests:
 - They render from the original once it is back.
 - The caches (above) and the cut features (above).
 
-**Rendering:** an automated check in CI, on a small CC0 RAW committed under
-`tests/data`. Its copy is written and read back, and its renders are compared
+**Rendering:** an automated check in CI, on small RAWs committed to the
+repository. Its copy is written and read back, and its renders are compared
 with the original's, reduced, under the default recipe and at +4 and −3 EV. The
 bounds are set from the measured differences, not chosen to pass. Separately,
 the written DNG is checked to open as an ordinary linear DNG, with the record
 ignored.
+
+As built, the RAWs are two of the synthetic chart DNGs already committed under
+`tests/corpus/charts` (970 × 742 mosaics made by the repository's own
+generator, so no one else's rights are involved): no camera RAW larger than
+2560 px is small enough to commit. Their copies are reduced to 480 px instead,
+so they are reduced decodes as a camera's 2560 px copies are. Each render is
+compared with the reduced image itself, with no file in between (at most 0.11
+mean, 1.3 p99 ΔE2000, at +4 EV), and with the original rendered at the copy's
+size, where the copy may add little to what the reduction alone costs. The
+chart's flat, noiseless shadows show the 16-bit samples' steps at +4 EV more
+than a photo's noise lets them show, so its gap is larger than the 13 RAWs'.
 
 ## Ownership
 
