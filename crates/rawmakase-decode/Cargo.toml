@@ -44,6 +44,10 @@ tiff.workspace = true
 png = "0.18.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json.workspace = true
+# Editable previews: linear DNGs of lossless 16-bit JPEG XL tiles, in pure Rust;
+# the versions export writes JPEG XL with.
+zune-jpegxl = { version = "0.5.2", default-features = false, features = ["std", "threads"] }
+zune-core = { version = "0.5.3", default-features = false, features = ["std"] }
 # Decode fingerprints hash the unpacked sensor data.
 sha2.workspace = true
 tempfile.workspace = true
