@@ -15,6 +15,7 @@
 //! Adobe's original-size tags (51089–51091). RAWmakase's own facts are in
 //! DNGPrivateData ([`super::record`]).
 use anyhow::{Result, ensure};
+use rawmakase_cancel::Cancel;
 use rawmakase_model::camera_data::{CameraImage, Metadata};
 use rayon::prelude::*;
 
@@ -62,13 +63,19 @@ fn ascii(tag: u16, s: &str) -> Entry {
 fn bytes(tag: u16, v: &[u8]) -> Entry {
     Entry(tag, 1, v.len() as u32, v.to_vec())
 }
-/// Unsigned rationals over 2^24: 1 in 16 million, values up to 256.
+/// Unsigned rationals, each over the largest power of two up to 2^24 that keeps
+/// its numerator within 32 bits: 1 in 16 million below 256, and a crop size or a
+/// long focal length kept whole. Negative and non-finite values are 0.
 fn rationals(tag: u16, v: &[f64]) -> Entry {
-    let d = 1u32 << 24;
     let b = v
         .iter()
         .flat_map(|v| {
-            let n = (v.max(0.) * f64::from(d)).round().min(f64::from(u32::MAX)) as u32;
+            let v = if v.is_finite() { v.max(0.) } else { 0. };
+            let mut d = 1u32 << 24;
+            while d > 1 && v * f64::from(d) > f64::from(u32::MAX) {
+                d >>= 1;
+            }
+            let n = (v * f64::from(d)).round().min(f64::from(u32::MAX)) as u32;
             [n.to_le_bytes(), d.to_le_bytes()].concat()
         })
         .collect();
@@ -171,7 +178,12 @@ pub(super) fn white_balance(original: &Metadata) -> [f32; 3] {
 /// The DNG of `reduced` (a recovered image of the photo `original` describes,
 /// in its camera space, white balanced, 1 the sensor's white), with `private`
 /// as its DNGPrivateData.
-pub(super) fn file(reduced: &CameraImage, original: &Metadata, private: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn file(
+    reduced: &CameraImage,
+    original: &Metadata,
+    private: &[u8],
+    cancel: Cancel<'_>,
+) -> Result<Vec<u8>> {
     let (w, h) = (reduced.width, reduced.height);
     ensure!(
         w >= 2 && h >= 2 && reduced.pixels.len() == w as usize * h as usize,
@@ -187,7 +199,11 @@ pub(super) fn file(reduced: &CameraImage, original: &Metadata, private: &[u8]) -
     }
     let tiles: Vec<Vec<u8>> = boxes
         .par_iter()
-        .map(|b| tile(&codes, w, *b))
+        .map(|b| {
+            // Checked before each tile, so a cancelled build stops within one.
+            ensure!(!cancel.is_cancelled(), "Editable preview cancelled");
+            tile(&codes, w, *b)
+        })
         .collect::<Result<_>>()?;
     // The header, then the tiles, the EXIF IFD and IFD0.
     let mut file = b"II*\0\0\0\0\0".to_vec();
@@ -299,4 +315,60 @@ pub(super) fn file(reduced: &CameraImage, original: &Metadata, private: &[u8]) -
     file.extend(ifd(entries, ifd0_at)?);
     file[4..8].copy_from_slice(&ifd0_at.to_le_bytes());
     Ok(file)
+}
+
+#[cfg(test)]
+mod rational_tests {
+    use super::*;
+
+    /// What a rational entry's values read back as.
+    fn read(e: &Entry) -> Vec<f64> {
+        e.3.chunks(8)
+            .map(|c| {
+                let n = u32::from_le_bytes(c[..4].try_into().unwrap());
+                let d = u32::from_le_bytes(c[4..].try_into().unwrap());
+                f64::from(n) / f64::from(d)
+            })
+            .collect()
+    }
+
+    /// A cancel set while the tiles are being encoded stops the build at the
+    /// next tile, with nothing returned.
+    #[test]
+    fn a_cancelled_build_stops_before_encoding_its_tiles() {
+        let (width, height) = (600, 400);
+        let reduced = CameraImage {
+            recovered: Default::default(),
+            width,
+            height,
+            pixels: vec![[0.2, 0.3, 0.4]; (width * height) as usize],
+            metadata: Metadata {
+                width,
+                height,
+                wb: [2., 1., 1.5],
+                ..Default::default()
+            },
+            fast: true,
+            scale_factor: 1.,
+            scale_clipped: 0,
+            hdr: Default::default(),
+        };
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let built = file(&reduced, &reduced.metadata, b"", Cancel::new(&stop));
+        assert!(built.is_err());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        assert!(file(&reduced, &reduced.metadata, b"", Cancel::new(&stop)).is_ok());
+    }
+
+    /// Crop sizes and focal lengths above 256 keep their value; small ones keep
+    /// their precision.
+    #[test]
+    fn rationals_keep_large_values_and_small_ones_precise() {
+        let values = [2560., 1707., 6000., 600., 1. / 3., 0., -1., f64::NAN];
+        let back = read(&rationals(50720, &values));
+        for (v, b) in values.iter().zip(&back) {
+            let v = if v.is_finite() { v.max(0.) } else { 0. };
+            assert!((v - b).abs() <= v * 1e-7 + 1e-7, "{v} read back as {b}");
+        }
+    }
 }

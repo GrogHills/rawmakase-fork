@@ -114,6 +114,11 @@ fn build(
         original.hdr().is_none(),
         "An editable preview can't keep an HDR file's light"
     );
+    // Auto CA's measurement and the reduction below take no cancel: Auto CA's is
+    // the measurement every render of the photo shares, and both are a fraction
+    // of the decode before them. A cancel is honoured between stages and within
+    // highlight recovery and the tiles' encoding.
+    ensure!(!cancel.is_cancelled(), "Editable preview cancelled");
     rawmakase_model::lens::auto_ca::prime(original);
     let recovered = crate::develop::quality::recovered(original, cancel)?;
     ensure!(!cancel.is_cancelled(), "Editable preview cancelled");
@@ -126,7 +131,7 @@ fn build(
         default_look,
     )?
     .to_bytes()?;
-    dng::file(&reduced, &original.metadata, &private)
+    dng::file(&reduced, &original.metadata, &private, cancel)
 }
 
 /// The editable preview at `path`, opened as its photo: see [`EditablePreview`].

@@ -199,6 +199,20 @@ fn a_copy_is_an_ordinary_linear_dng_to_the_dng_reader() {
         let (m, o) = (&plain.metadata, &w.original.metadata);
         assert_eq!((m.width, m.height), (copy.image.width, copy.image.height));
         assert_eq!(m.flip, o.flip, "{name}");
+        // The default crop is read from the standard tags in the copy's pixels.
+        let scale = f64::from(m.width) / f64::from(o.width);
+        let scaled = |v: u32| (f64::from(v) * scale).round() as i64;
+        // An original without a default crop (0) is cropped to its whole frame.
+        let whole = |crop: u32, size: u32| if crop > 0 { crop } else { size };
+        for (read, original) in [
+            (m.crop_width, whole(o.crop_width, o.width)),
+            (m.crop_height, whole(o.crop_height, o.height)),
+        ] {
+            assert!(
+                (i64::from(read) - scaled(original)).abs() <= 1,
+                "{name}: crop {read} for {original} at {scale}"
+            );
+        }
         assert!(!plain.fast);
         let near = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-4);
         let normalised = |wb: [f32; 3]| wb.map(|v| v / wb[1]);
