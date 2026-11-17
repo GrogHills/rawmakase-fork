@@ -186,6 +186,24 @@ fn a_name_that_is_not_a_plain_file_name_is_refused_and_never_followed() -> Resul
     let folder = fx.cat.editable_previews_folder();
     assert_eq!(preview.path_in(&folder), None);
     assert_eq!(preview.usable(&folder, |_| Ok(())), None);
+    // Nor is it handed back for deletion, whether replaced or discarded.
+    assert_eq!(
+        fx.cat
+            .record_editable_preview(a, "a.dng", RAWMAKASE_DNG, &identity)?,
+        None
+    );
+    fx.cat.db_for_tests().execute(
+        "UPDATE editable_previews SET file='../victim.NEF' WHERE photo=?",
+        rusqlite::params![a.0],
+    )?;
+    assert_eq!(
+        fx.cat.discard_editable_previews(&[a])?,
+        Vec::<String>::new()
+    );
+    assert!(
+        fx.cat.editable_preview(a)?.is_none(),
+        "the row is forgotten"
+    );
     Ok(())
 }
 

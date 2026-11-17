@@ -155,8 +155,10 @@ impl Catalog {
     /// Records `file`, a copy in `format` of photo `id`'s original as the file
     /// `original` names, for `id`'s master, in place of any copy recorded
     /// before. Returns the earlier copy's file when it had another name, for the
-    /// caller to delete once this returns. Refused for a photo no longer in the
-    /// catalog or a name that isn't a plain file name.
+    /// caller to delete once this returns; never a name that isn't a plain file
+    /// name, so a damaged or hostile row can't send a deletion outside the copies
+    /// folder. Refused for a photo no longer in the catalog or a name that isn't
+    /// a plain file name.
     pub fn record_editable_preview(
         &mut self,
         id: PhotoId,
@@ -190,7 +192,7 @@ impl Catalog {
                 ),
                 &[&master, &file, &format, &original, &built_at],
             )?;
-            Ok(earlier.filter(|earlier| earlier != file))
+            Ok(earlier.filter(|earlier| earlier != file && is_plain_name(earlier)))
         })
     }
     /// Notes that photo `id`'s original is now the file `now` names: when that
@@ -228,7 +230,9 @@ impl Catalog {
     }
     /// Forgets the editable previews of photos `ids` (their masters', so a
     /// virtual copy's discards its master's) in one transaction. Returns their
-    /// files, for the caller to delete once this returns.
+    /// files, for the caller to delete once this returns; a recorded name that
+    /// isn't a plain file name is forgotten but never returned, as for
+    /// [`Catalog::record_editable_preview`].
     pub fn discard_editable_previews(&mut self, ids: &[PhotoId]) -> Result<Vec<String>> {
         self.db.write(|w| {
             let mut files = Vec::new();
@@ -247,7 +251,9 @@ impl Catalog {
                         sql!("DELETE FROM editable_previews WHERE photo=?"),
                         &[&master],
                     )?;
-                    files.push(file);
+                    if is_plain_name(&file) {
+                        files.push(file);
+                    }
                 }
             }
             Ok(files)
