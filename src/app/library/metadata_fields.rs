@@ -241,10 +241,7 @@ impl Library {
             return;
         }
         let read = self.session.catalog().descriptive_of(&targets);
-        let keywords: anyhow::Result<Vec<Vec<Keyword>>> = targets
-            .iter()
-            .map(|id| self.session.catalog().keywords(*id))
-            .collect();
+        let keywords = self.session.catalog().keywords_for_photos(&targets);
         let (read, keywords) = match (read, keywords) {
             (Ok(r), Ok(k)) => (r, k),
             (Err(e), _) | (_, Err(e)) => {
@@ -273,12 +270,16 @@ impl Library {
         }));
         f.location = Shared::of(all.iter().map(|d| d.location.clone()));
         let mut counts: std::collections::HashMap<i64, (Keyword, usize)> = Default::default();
-        for k in keywords.iter().flatten() {
-            counts.entry(k.id).or_insert_with(|| (k.clone(), 0)).1 += 1;
+        for id in &f.targets {
+            if let Some(kws) = keywords.get(id) {
+                for k in kws {
+                    counts.entry(k.id).or_insert_with(|| (k.clone(), 0)).1 += 1;
+                }
+            }
         }
         let mut counts: Vec<(Keyword, usize)> = counts.into_values().collect();
         counts.sort_by(|a, b| a.0.path.cmp(&b.0.path).then(a.0.id.cmp(&b.0.id)));
-        let n = keywords.len();
+        let n = f.targets.len();
         f.keywords = counts.into_iter().map(|(k, c)| (k, c == n)).collect();
         f.drafts = f.untouched();
         f.edited = Edited::default();

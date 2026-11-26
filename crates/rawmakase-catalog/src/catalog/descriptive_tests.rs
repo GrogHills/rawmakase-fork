@@ -392,3 +392,69 @@ fn a_photo_removed_by_an_older_release_takes_its_rows_and_a_reused_id_has_none()
     assert_eq!(cat.descriptive(copy)?, Descriptive::default());
     Ok(())
 }
+
+#[test]
+fn keywords_for_photos_matches_single_photo_keywords() -> Result<()> {
+    let (_dir, mut cat, ids) = catalog(3)?;
+    assert!(cat.keywords_for_photos(&[])?.is_empty());
+
+    // Hidden Lightroom root under which top-level keywords sit.
+    cat.db_mut_for_tests().execute_batch(
+        "INSERT INTO keywords(id, name, parent) VALUES (1, '', NULL);
+         INSERT INTO keywords(id, name, parent) VALUES (2, 'Places', 1);
+         INSERT INTO keywords(id, name, parent) VALUES (3, 'Poland', 2);
+         INSERT INTO keywords(id, name, parent) VALUES (4, 'Kraków', 3);
+         INSERT INTO keywords(id, name, parent) VALUES (5, 'Private', NULL);
+         INSERT INTO keyword_export(keyword, include, parents) VALUES (3, 0, 1), (5, 1, 0);",
+    )?;
+    // Photo 0 has nested + non-exported parent + root; photo 1 has none; photo 2 has Private.
+    cat.add_keyword(&[ids[0]], 4)?;
+    cat.add_keyword(&[ids[0]], 1)?;
+    cat.add_keyword(&[ids[0]], 5)?;
+    cat.add_keyword(&[ids[2]], 5)?;
+
+    let batch = cat.keywords_for_photos(&[ids[0], ids[1], ids[2], ids[0]])?;
+    assert_eq!(batch.len(), 3);
+    for &id in &ids {
+        assert_eq!(batch[&id], cat.keywords(id)?);
+    }
+    assert!(batch[&ids[1]].is_empty());
+    assert_eq!(
+        batch[&ids[0]]
+            .iter()
+            .map(|k| (&k.path, &k.exported))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                &vec!["Places".into(), "Poland".into(), "Kraków".into()],
+                &vec![true, false, true],
+            ),
+            (&vec!["Private".into()], &vec![true]),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn keywords_for_photos_rejects_cycles() -> Result<()> {
+    let (_dir, mut cat, ids) = catalog(1)?;
+    cat.db_mut_for_tests()
+        .execute_batch("INSERT INTO keywords(id, name, parent) VALUES (10, 'Loop', 10);")?;
+    cat.add_keyword(&[ids[0]], 10)?;
+    assert!(cat.keywords_for_photos(&ids).is_err());
+    Ok(())
+}
+
+#[test]
+fn keywords_for_photos_skips_unrelated_hierarchy_rows_when_untagged() -> Result<()> {
+    let (_dir, cat, ids) = catalog(2)?;
+    // Poison an unrelated keyword row with a cycle that only fails if read.
+    cat.db_for_tests().execute_batch(
+        "INSERT INTO keywords(id, name, parent) VALUES (10, 'Cyclic', 10);
+         INSERT INTO keywords(id, name, parent) VALUES (11, 'Extra', NULL);",
+    )?;
+    let empty = cat.keywords_for_photos(&[ids[0]])?;
+    assert_eq!(empty.len(), 1);
+    assert!(empty[&ids[0]].is_empty());
+    Ok(())
+}
