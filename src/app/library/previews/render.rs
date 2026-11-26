@@ -54,13 +54,15 @@ pub(super) fn finished_entry(
 /// Whether `source` renders AI Denoise and the cache tags a preview of `source` at `path`
 /// may be kept under, in the order looked for: the plain render of an edit with AI Denoise
 /// only while no finished result is there to render from instead. An offline photo shows
-/// whichever it has.
+/// whichever it has. When `renders_ai` is already known, skips re-parsing `source`.
 pub(super) fn preview_tags(
     path: &Path,
     source: &EditSource,
+    renders_ai: Option<bool>,
     ai: Option<&AiCache>,
 ) -> (bool, Vec<String>) {
-    if !source.renders_ai() {
+    let renders_ai = renders_ai.unwrap_or_else(|| source.renders_ai());
+    if !renders_ai {
         return (false, vec![source.preview_tag(PreviewAi::Off)]);
     }
     let mut tags = vec![source.preview_tag(PreviewAi::Finished)];

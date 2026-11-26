@@ -284,6 +284,8 @@ enum Step {
     /// Answer without rendering: the photo is out of view, or was asked for
     /// ahead and the pace dropped.
     Skip(PhotoId, u64),
+    /// Classify whether an offscreen job enables AI Denoise before any file I/O.
+    Classify(usize),
     /// Ask the cache, then render on a miss when `render` (a free slot).
     Look(usize, bool),
     Render(usize),
@@ -345,6 +347,7 @@ pub(super) fn spawn_edited_with_ai(
                 Step::Exit => break,
                 Step::Skip(id, ticket) => renders.results.send(EditResult::Skipped(id, ticket)),
                 Step::Store(path, tag, stamp, image) => renders.store(&path, &tag, &stamp, &image),
+                Step::Classify(index) => renders.classify(index),
                 Step::Look(index, render) => renders.look(index, render),
                 Step::Render(index) => renders.start(index),
             }
@@ -412,12 +415,30 @@ impl Renders {
             Err(_) => reopen(&self.cache, &self.cache_path),
         }
     }
+    /// Classifies whether the queued render at `index` enables AI Denoise,
+    /// outside `State`'s mutex and without reading the photo from disk.
+    fn classify(&self, index: usize) {
+        let source = {
+            let state = self.results.shared.lock();
+            if state.closed {
+                return;
+            }
+            match &state.jobs[index].job {
+                EditJob::Render { source, .. } => source.clone(),
+                EditJob::Store { .. } => unreachable!("stores are already classified"),
+            }
+        };
+        let renders_ai = source.renders_ai();
+        let mut state = self.results.shared.lock();
+        state.jobs[index].renders_ai = Some(renders_ai);
+    }
     /// Answers the job at `index` from the cache, else renders it when
     /// `render`, else marks it to wait for a render.
     fn look(&self, index: usize, render: bool) {
-        let (id, ticket, path, source, ahead, ai) = {
+        let (id, ticket, path, source, ahead, renders_ai, ai) = {
             let state = self.results.shared.lock();
-            match &state.jobs[index].job {
+            let job = &state.jobs[index];
+            match &job.job {
                 EditJob::Render {
                     id,
                     ticket,
@@ -430,12 +451,13 @@ impl Renders {
                     path.clone(),
                     source.clone(),
                     *ahead,
+                    job.renders_ai,
                     state.ai.clone(),
                 ),
                 EditJob::Store { .. } => unreachable!("stores are not looked up"),
             }
         };
-        let (renders_ai, tags) = preview_tags(&path, &source, ai.as_ref());
+        let (renders_ai, tags) = preview_tags(&path, &source, renders_ai, ai.as_ref());
         let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let cache = cache(&self.cache);
             let cache = cache.as_ref()?;
@@ -693,11 +715,8 @@ fn next_step(shared: &Shared, wanted: &Wanted, full_renders: usize) -> Step {
         // Full-size AI decodes stay bounded in the scheduler so pool threads never
         // wait on a gate while nested Rayon work may be running inside the pool.
         let ai_running = state.running.iter().filter(|r| r.ai).count();
-        let ai_allowed = |q: &Queued| {
-            ai_running < MAX_CONCURRENT_AI_RENDERS
-                || state.ai.is_none()
-                || q.renders_ai != Some(true)
-        };
+        let ai_limited = state.ai.is_some() && ai_running >= MAX_CONCURRENT_AI_RENDERS;
+        let ai_allowed = |q: &Queued| !ai_limited || q.renders_ai != Some(true);
         // Photos shown, the latest first: from the cache whether or not a
         // render could start, rendered when one can.
         if let Some(index) = state.jobs.iter().rposition(|q| visible(q) && !q.missed) {
@@ -719,7 +738,10 @@ fn next_step(shared: &Shared, wanted: &Wanted, full_renders: usize) -> Step {
                 .iter()
                 .position(|q| !visible(q) && !rendering(q) && ai_allowed(q))
             {
-                return if state.jobs[index].missed {
+                let job = &state.jobs[index];
+                return if ai_limited && job.renders_ai.is_none() {
+                    Step::Classify(index)
+                } else if job.missed {
                     Step::Render(index)
                 } else {
                     Step::Look(index, true)
