@@ -118,10 +118,22 @@ pub(super) fn scene_color(
 /// tone stage's, as Camera Raw's does not follow the camera's baseline exposure.
 pub(super) fn exposure_stage(color: [f32; 3], lut: &CurveSet, local: Option<Local>) -> [f32; 3] {
     let exposure = local.map_or(0., |l| l.delta[slot::EXPOSURE]);
-    let mut rgb = mul(TO_2020, color).map(|v| v * lut.exposure_gain * exposure.exp2());
-    if let Some(l) = local {
+    let local_gain = if exposure == 0. { 1. } else { exposure.exp2() };
+    let mut rgb = mul(TO_2020, color).map(|v| {
+        if exposure == 0. {
+            v * lut.exposure_gain
+        } else {
+            v * lut.exposure_gain * local_gain
+        }
+    });
+    if let Some(l) = local
+        && l.delta[slot::COLOR..slot::COLOR + 3] != [0.; 3]
+    {
         for (c, v) in rgb.iter_mut().enumerate() {
-            *v *= l.delta[slot::COLOR + c].exp2();
+            let d = l.delta[slot::COLOR + c];
+            if d != 0. {
+                *v *= d.exp2();
+            }
         }
     }
     mul(crate::camera_profiles::RGB_TO_PRO, mul(FROM_2020, rgb))
@@ -263,23 +275,23 @@ pub(super) fn color_stage(
     // Raw 18.7 applies it (also after the user's tone curves and Saturation).
     let rgb = lut.rgb_table.as_ref().map_or(rgb, |t| t.apply(rgb));
     let rgb = lut.grade.as_ref().map_or(rgb, |g| g.apply(rgb));
+    let local_hs = local.is_some_and(|d| d[slot::HUE] != 0. || d[slot::SATURATION] != 0.);
     let mut lab = srgb_to_lab(rgb);
-    if let Some(d) = local {
+    if local_hs && let Some(d) = local {
         lab = local::hue_saturation(d, lab);
     }
     if lut.output == PixelOutput::ColorInput {
         return lab;
     }
+    lab[0] = lab[0].clamp(0., 1.);
     if lut.color_adjustments {
         // HSL, Saturation and Vibrance render in the measured color mixer; Defringe
         // and the black & white mix work here, on the color's Oklab hue.
-        let chroma = lab[1].hypot(lab[2]);
-        let hue = lab[2].atan2(lab[1]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
-        let angle = hue * std::f32::consts::TAU;
-        lab[0] = lab[0].clamp(0., 1.);
-        lab[1] = angle.cos() * chroma;
-        lab[2] = angle.sin() * chroma;
-        lab = r.effects.defringe_color(lab, hue);
+        if r.effects.defringe != [0.; 2] {
+            let hue =
+                lab[2].atan2(lab[1]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+            lab = r.effects.defringe_color(lab, hue);
+        }
         // `gray_grid` is there for black & white renders.
         if let Some(grid) = &lut.gray_grid {
             // The gray's Oklab lightness is the cube root of its luminance.
@@ -289,9 +301,6 @@ pub(super) fn color_stage(
             lab[1] = 0.;
             lab[2] = 0.;
         }
-    } else {
-        // Identity color controls need no hue angle or trigonometry.
-        lab[0] = lab[0].clamp(0., 1.);
     }
     let out = finish_color_in(lab, lut.space);
     // Visualize Range grays what the swatch leaves out after every color control, so

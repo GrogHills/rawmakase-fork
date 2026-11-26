@@ -31,19 +31,38 @@ impl LuminanceDenoise {
 
     pub(crate) fn apply(&self, im: &CameraImage, cancel: Cancel<'_>) -> Result<CameraImage> {
         check(cancel)?;
-        let plane = Plane {
-            w: im.width as usize,
-            h: im.height as usize,
-            data: im.pixels.par_iter().map(|p| luma(*p)).collect(),
-        };
-        // Camera pixels carry the as-shot WB. Exclude near-clipped flats from the
-        // estimate, where clipping suppresses noise without making the capture clean.
-        let white = luma(im.metadata.wb.map(|v| v.max(0.001))) * 0.97;
-        let offset = photo_level_offset(im);
-        let filtered = self.filter(&plane, 0, offset, 0., white, cancel)?;
-        let mut out = im.clone();
-        out.recovered = Default::default();
-        out.pixels
+        let (plane, filtered) = self.filtered_luma(im, cancel)?;
+        let pixels = im
+            .pixels
+            .par_iter()
+            .zip(plane.data.par_iter().zip(filtered.data.par_iter()))
+            .map(|(p, (&orig, &filt))| {
+                let delta = filt - orig;
+                if delta != 0. {
+                    p.map(|v| (v.max(0.).sqrt() + delta).max(0.).powi(2))
+                } else {
+                    *p
+                }
+            })
+            .collect();
+        check(cancel)?;
+        Ok(CameraImage {
+            width: im.width,
+            height: im.height,
+            recovered: Default::default(),
+            pixels,
+            metadata: im.metadata.clone(),
+            fast: im.fast,
+            scale_factor: im.scale_factor,
+            scale_clipped: im.scale_clipped,
+            hdr: Default::default(),
+        })
+    }
+
+    pub(crate) fn apply_in_place(&self, im: &mut CameraImage, cancel: Cancel<'_>) -> Result<()> {
+        check(cancel)?;
+        let (plane, filtered) = self.filtered_luma(im, cancel)?;
+        im.pixels
             .par_chunks_mut(1024)
             .enumerate()
             .for_each(|(chunk, pixels)| {
@@ -60,8 +79,21 @@ impl LuminanceDenoise {
                     }
                 }
             });
-        check(cancel)?;
-        Ok(out)
+        check(cancel)
+    }
+
+    fn filtered_luma(&self, im: &CameraImage, cancel: Cancel<'_>) -> Result<(Plane, Plane)> {
+        let plane = Plane {
+            w: im.width as usize,
+            h: im.height as usize,
+            data: im.pixels.par_iter().map(|p| luma(*p)).collect(),
+        };
+        // Camera pixels carry the as-shot WB. Exclude near-clipped flats from the
+        // estimate, where clipping suppresses noise without making the capture clean.
+        let white = luma(im.metadata.wb.map(|v| v.max(0.001))) * 0.97;
+        let offset = photo_level_offset(im);
+        let filtered = self.filter(&plane, 0, offset, 0., white, cancel)?;
+        Ok((plane, filtered))
     }
 
     /// Filters `plane` as band `level`, recursing to the coarser ones; `offset` is the

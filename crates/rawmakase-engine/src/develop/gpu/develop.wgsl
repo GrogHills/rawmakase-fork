@@ -1044,17 +1044,14 @@ fn defringe(lab_in: vec3<f32>, h: f32) -> vec3<f32> {
     }
     return lab;
 }
-/// Oklab color controls after the measured mixer: hue angle round trip, Defringe and
-/// Monochrome.
+/// Oklab color controls after the measured mixer: Defringe and Monochrome.
 fn adjust(lab_in: vec3<f32>) -> vec3<f32> {
     var lab = lab_in;
-    let chroma = length(lab.yz);
-    let hue = rem_euclid(atan2(lab.z, lab.y), TAU) / TAU;
-    let angle = hue * TAU;
     lab.x = clamp(lab.x, 0.0, 1.0);
-    lab.y = cos(angle) * chroma;
-    lab.z = sin(angle) * chroma;
-    lab = defringe(lab, hue);
+    if p(P_DEFRINGE) > 0.0 || p(P_DEFRINGE + 1u) > 0.0 {
+        let hue = rem_euclid(atan2(lab.z, lab.y), TAU) / TAU;
+        lab = defringe(lab, hue);
+    }
     // Black & white renders have the mix's grid.
     if offset(P_GRAY_GRID) >= 0 {
         // `black_white::gray`: the chart tables scale the color to its gray.
@@ -1181,21 +1178,27 @@ fn process_pixel(i: u32, pos: vec2<f32>) -> vec3<f32> {
     if V_COLOR && offset(P_GRADE) >= 0 {
         rgb = grade(rgb);
     }
-    var lab = srgb_to_lab(rgb);
-    if (V_MASKS && masked) && (delta[L_HUE] != 0.0 || delta[L_SATURATION] != 0.0) {
-        let angle = radians(delta[L_HUE]);
-        let k = max(1.0 + delta[L_SATURATION], 0.0);
-        let a = lab.y;
-        let b = lab.z;
-        lab.y = (a * cos(angle) - b * sin(angle)) * k;
-        lab.z = (a * sin(angle) + b * cos(angle)) * k;
+    let local_hs = (V_MASKS && masked) && (delta[L_HUE] != 0.0 || delta[L_SATURATION] != 0.0);
+    let needs_lab = local_hs
+        || (V_COLOR && p(P_ADJUST) != 0.0)
+        || !(all(rgb >= vec3(0.0)) && all(rgb <= vec3(1.0)));
+    if needs_lab {
+        var lab = srgb_to_lab(rgb);
+        if local_hs {
+            let angle = radians(delta[L_HUE]);
+            let k = max(1.0 + delta[L_SATURATION], 0.0);
+            let a = lab.y;
+            let b = lab.z;
+            lab.y = (a * cos(angle) - b * sin(angle)) * k;
+            lab.z = (a * sin(angle) + b * cos(angle)) * k;
+        }
+        if V_COLOR && p(P_ADJUST) != 0.0 {
+            lab = adjust(lab);
+        } else {
+            lab.x = clamp(lab.x, 0.0, 1.0);
+        }
+        rgb = lab_to_srgb(lab);
     }
-    if V_COLOR && p(P_ADJUST) != 0.0 {
-        lab = adjust(lab);
-    } else {
-        lab.x = clamp(lab.x, 0.0, 1.0);
-    }
-    rgb = lab_to_srgb(lab);
     // Each channel clipped on its own, as Camera Raw does.
     var out: vec3<f32>;
     for (var k = 0; k < 3; k++) {

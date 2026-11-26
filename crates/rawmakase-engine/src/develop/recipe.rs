@@ -76,9 +76,15 @@ impl Denoise {
         anyhow::ensure!(!cancel.is_cancelled(), "Render superseded");
         let chroma = self.chroma.map(|d| d.apply(&base, cancel)).transpose()?;
         if let Some(luminance) = self.luminance {
-            Ok(Arc::new(
-                luminance.apply(chroma.as_ref().unwrap_or(&base), cancel)?,
-            ))
+            let mut image = match chroma {
+                Some(image) => image,
+                None => match Arc::try_unwrap(base) {
+                    Ok(image) => image,
+                    Err(shared) => return Ok(Arc::new(luminance.apply(&shared, cancel)?)),
+                },
+            };
+            luminance.apply_in_place(&mut image, cancel)?;
+            Ok(Arc::new(image))
         } else {
             Ok(chroma.map(Arc::new).unwrap_or(base))
         }

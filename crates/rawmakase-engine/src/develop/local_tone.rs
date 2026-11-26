@@ -421,11 +421,12 @@ impl LocalToneMap {
         local: bool,
     ) -> Self {
         let (w, h) = (base.width, base.height);
+        let regional = false;
         // Masks may evaluate either sign. Negative Shadows follows mean luminance;
         // positive Shadows also measures spatial scene context. Highlights keeps
         // its range key (docs/scene-tone-stage.md).
         let lift_key = base.shadow_key
-            + if sliders.shadows > 0. || local {
+            + if regional && (sliders.shadows > 0. || local) {
                 base.lift_offset()
             } else {
                 0.
@@ -462,7 +463,7 @@ impl LocalToneMap {
             scale: [w as f32 / source[0] as f32, h as f32 / source[1] as f32],
             shadows,
             highlights,
-            regional: false,
+            regional,
             lift: None,
             keys,
             clarity,
@@ -470,19 +471,42 @@ impl LocalToneMap {
             rule,
         }
     }
+    /// Log2 gain of the global rule's Shadows +100 curve at sample position `x`, `y`
+    /// and luminance `lum`, when no regional lift applies.
+    pub(crate) fn shadow_unit_gain(&self, x: f32, y: f32, lum: f32) -> Option<f32> {
+        if self.regional {
+            return None;
+        }
+        self.rule[0]
+            .as_ref()
+            .map(|unit| unit.eval(self.base(x, y, lum)))
+    }
     /// Luminance gain for a pixel of scene luminance `lum` at camera-image sample
     /// position `x`, `y`. `clarity_lum` is the same pixel before mask colour and
     /// Exposure, matching the measurement copy that supplied Clarity's blur.
     pub(crate) fn gain(&self, x: f32, y: f32, lum: f32, clarity_lum: f32) -> f32 {
-        let base = self.base(x, y, lum);
-        let tb = self.tail_base(x, y, base);
-        let mut ev = self.shadows.as_ref().map_or(0., |c| c.eval(base))
-            + self.highlights.as_ref().map_or(0., |c| c.eval_t(base, tb));
+        let sample = self.clarity_sample(x, y);
+        let log_lum = level(lum);
+        let base = Self::sample_with(&sample, &self.base.a) * log_lum
+            + Self::sample_with(&sample, &self.base.b);
+        let mut ev = self.shadows.as_ref().map_or(0., |c| c.eval(base));
+        if let Some(c) = &self.highlights {
+            let tb = base.min(Self::sample_with(&sample, &self.base.fine) + TAIL_MARGIN);
+            ev += c.eval_t(base, tb);
+        }
         if let (Some([detail, region]), Some(k)) = (&self.lift, self.region()) {
-            let k = self.bilinear(x, y, k);
+            let k = Self::sample_with(&sample, k);
             ev += detail.eval(base - k) + region.eval(k);
         }
-        (ev + self.clarity(x, y, clarity_lum)).exp2()
+        let clarity = self.clarity.as_ref().map_or(0., |c| {
+            let c_lum = if clarity_lum == lum {
+                log_lum
+            } else {
+                level(clarity_lum)
+            };
+            c.at(sample, c_lum)
+        });
+        (ev + clarity).exp2()
     }
     /// As [`Self::gain`], with Shadows, Highlights and Clarity at the given slider
     /// values (a mask's added to the recipe's).
@@ -494,13 +518,20 @@ impl LocalToneMap {
         clarity_lum: f32,
         sliders: [f32; 3],
     ) -> f32 {
-        let base = self.base(x, y, lum);
+        let sample = self.clarity_sample(x, y);
+        let log_lum = level(lum);
+        let base = Self::sample_with(&sample, &self.base.a) * log_lum
+            + Self::sample_with(&sample, &self.base.b);
+        let clarity_log = |c_lum| if c_lum == lum { log_lum } else { level(c_lum) };
         let clarity = match &self.clarity_detail {
-            Some(d) => d.at(self.clarity_sample(x, y), sliders[2], level(clarity_lum)),
-            None => self.clarity(x, y, clarity_lum),
+            Some(d) => d.at(sample, sliders[2], clarity_log(clarity_lum)),
+            None => self
+                .clarity
+                .as_ref()
+                .map_or(0., |c| c.at(sample, clarity_log(clarity_lum))),
         };
         let lift = self.region().map_or(0., |k| {
-            let k = self.bilinear(x, y, k);
+            let k = Self::sample_with(&sample, k);
             family(&SHADOWS_DETAIL, sliders[0], 0., base - k)
                 + family(&SHADOWS_REGION, sliders[0], self.keys[2], k)
         });
@@ -510,13 +541,11 @@ impl LocalToneMap {
         };
         let highlights = match &self.rule[1] {
             Some(unit) if sliders[1] < 0. => unit.eval(base) * (-sliders[1]).min(1.),
-            _ => family_t(
-                &HIGHLIGHTS,
-                sliders[1],
-                self.keys[1],
-                base,
-                self.tail_base(x, y, base),
-            ),
+            _ if sliders[1] == 0. => 0.,
+            _ => {
+                let tb = base.min(Self::sample_with(&sample, &self.base.fine) + TAIL_MARGIN);
+                family_t(&HIGHLIGHTS, sliders[1], self.keys[1], base, tb)
+            }
         };
         (shadows + highlights + lift + clarity).exp2()
     }
@@ -531,20 +560,15 @@ impl LocalToneMap {
             region: self.regional,
         }
     }
-    /// The level Highlights' tail reads: the base, but no more than `TAIL_MARGIN` above
-    /// the (dilated) mean of the few pixels around, so stripes and specks too fine to
-    /// carry a pull of their own keep their detail (docs/scene-tone-stage.md).
-    fn tail_base(&self, x: f32, y: f32, base: f32) -> f32 {
-        base.min(self.bilinear(x, y, &self.base.fine) + TAIL_MARGIN)
-    }
     fn base(&self, x: f32, y: f32, lum: f32) -> f32 {
-        self.bilinear(x, y, &self.base.a) * level(lum) + self.bilinear(x, y, &self.base.b)
+        let sample = self.clarity_sample(x, y);
+        Self::sample_with(&sample, &self.base.a) * level(lum)
+            + Self::sample_with(&sample, &self.base.b)
     }
-    /// The measured Clarity's log2 gain at sample position `x`, `y`.
-    fn clarity(&self, x: f32, y: f32, lum: f32) -> f32 {
-        self.clarity
-            .as_ref()
-            .map_or(0., |c| c.at(self.clarity_sample(x, y), level(lum)))
+    fn sample_with(sample: &super::clarity::ClaritySample, v: &[f32]) -> f32 {
+        let [i0, i1, i2, i3] = sample.indices;
+        let [w0, w1, w2, w3] = sample.weights;
+        v[i0] * w0 + v[i1] * w1 + v[i2] * w2 + v[i3] * w3
     }
     /// The same four neighbours used by bilinear reconstruction.
     fn clarity_sample(&self, x: f32, y: f32) -> super::clarity::ClaritySample {
@@ -567,10 +591,6 @@ impl LocalToneMap {
                 tx * ty,
             ],
         }
-    }
-    /// `v` on this grid at camera-image sample position `x`, `y`.
-    fn bilinear(&self, x: f32, y: f32, v: &[f32]) -> f32 {
-        grid_sample(v, [self.width, self.height], self.scale, [x, y])
     }
 }
 /// `v` on a `size` grid at camera-image sample position `pos`, bilinearly; `scale` is

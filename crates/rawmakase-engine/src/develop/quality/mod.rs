@@ -54,51 +54,125 @@ impl Output {
     }
 }
 pub fn resize(image: Rendered, max_edge: u32) -> Rendered {
-    let mut out = resize_unbounded(image, max_edge);
-    for p in &mut out.pixels {
-        *p = p.map(|v| v.clamp(0., 1.));
-    }
-    out
+    resize_inner(image, max_edge, true)
 }
 /// [`resize`] without clipping at 1: for an HDR master's encoded values, which its
-/// caller bounds. `image`'s resize clips float samples to 0–1, so values above 1 are
-/// scaled into that range first, with room for Lanczos's overshoot, and back after;
-/// values at most 1 (every SDR render's) are resized as they are.
+/// caller bounds.
 pub(crate) fn resize_unbounded(image: Rendered, max_edge: u32) -> Rendered {
+    resize_inner(image, max_edge, false)
+}
+
+fn sinc(t: f32) -> f32 {
+    if t == 0. {
+        1.
+    } else {
+        let a = t * std::f32::consts::PI;
+        a.sin() / a
+    }
+}
+
+fn lanczos_taps(input: usize, output: usize) -> (Vec<(usize, usize, usize)>, Vec<f32>) {
+    let ratio = input as f32 / output as f32;
+    let scale = ratio.max(1.);
+    let support = 3. * scale;
+    let max_taps = (2. * support).ceil() as usize + 2;
+    let mut spans = Vec::with_capacity(output);
+    let mut weights = Vec::with_capacity(output * max_taps);
+    for out in 0..output {
+        let center = (out as f32 + 0.5) * ratio;
+        let start = ((center - support).floor() as isize).clamp(0, input as isize - 1) as usize;
+        let end =
+            ((center + support).ceil() as isize).clamp(start as isize + 1, input as isize) as usize;
+        let w_start = weights.len();
+        let center = center - 0.5;
+        let mut sum = 0.;
+        for i in start..end {
+            let v = (i as f32 - center) / scale;
+            let w = if v.abs() < 3. {
+                sinc(v) * sinc(v / 3.)
+            } else {
+                0.
+            };
+            weights.push(w);
+            sum += w;
+        }
+        let len = end - start;
+        for w in &mut weights[w_start..w_start + len] {
+            *w /= sum;
+        }
+        spans.push((start, w_start, len));
+    }
+    (spans, weights)
+}
+
+fn resize_inner(mut image: Rendered, max_edge: u32, clamp01: bool) -> Rendered {
     if max_edge == 0 || image.width.max(image.height) <= max_edge {
+        if clamp01 {
+            image.pixels.par_iter_mut().for_each(|p| {
+                *p = p.map(|v| v.clamp(0., 1.));
+            });
+        }
         return image;
     }
     let (w, h) = output_size(image.width, image.height, max_edge);
-    let top = image.pixels.iter().flatten().copied().fold(0f32, f32::max);
-    let scale = if top > 1. { 2. * top } else { 1. };
-    let buffer = image::Rgb32FImage::from_raw(
-        image.width,
-        image.height,
-        image
-            .pixels
-            .into_iter()
-            .flatten()
-            .map(|v| if scale == 1. { v } else { v / scale })
-            .collect(),
-    )
-    .unwrap();
-    let buffer = image::imageops::resize(&buffer, w, h, image::imageops::FilterType::Lanczos3);
+    if (w, h) == (image.width, image.height) {
+        if clamp01 {
+            image.pixels.par_iter_mut().for_each(|p| {
+                *p = p.map(|v| v.clamp(0., 1.));
+            });
+        }
+        return image;
+    }
+    let (sw, sh) = (image.width as usize, image.height as usize);
+    let (dw, dh) = (w as usize, h as usize);
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || image.pixels.len() != sw * sh {
+        return Rendered {
+            width: w,
+            height: h,
+            pixels: Vec::new(),
+        };
+    }
+    let ((y_spans, y_weights), (x_spans, x_weights)) =
+        rayon::join(|| lanczos_taps(sh, dh), || lanczos_taps(sw, dw));
+    // Vertical pass first (matching `image`'s pass order) into `sw × dh`, reading rows sequentially.
+    let mut tmp = vec![[0f32; 3]; sw * dh];
+    tmp.par_chunks_mut(sw).enumerate().for_each(|(y, dst_row)| {
+        let (start, w_start, len) = y_spans[y];
+        let row_weights = &y_weights[w_start..w_start + len];
+        for (k, &weight) in row_weights.iter().enumerate() {
+            let src_row = &image.pixels[(start + k) * sw..(start + k + 1) * sw];
+            for (dst, src) in dst_row.iter_mut().zip(src_row) {
+                dst[0] += src[0] * weight;
+                dst[1] += src[1] * weight;
+                dst[2] += src[2] * weight;
+            }
+        }
+    });
+    // Horizontal pass into `dw × dh`, fusing `[0, 1]` clamp when requested.
+    let mut pixels = vec![[0f32; 3]; dw * dh];
+    pixels
+        .par_chunks_mut(dw)
+        .zip(tmp.par_chunks(sw))
+        .for_each(|(dst_row, src_row)| {
+            for (x, &(start, w_start, len)) in x_spans.iter().enumerate() {
+                let col_weights = &x_weights[w_start..w_start + len];
+                let mut sum = [0f32; 3];
+                for (src, &weight) in src_row[start..start + len].iter().zip(col_weights) {
+                    sum[0] += src[0] * weight;
+                    sum[1] += src[1] * weight;
+                    sum[2] += src[2] * weight;
+                }
+                dst_row[x] = if clamp01 {
+                    sum.map(|v| v.clamp(0., 1.))
+                } else {
+                    sum
+                };
+            }
+        });
     Rendered {
         width: w,
         height: h,
-        pixels: buffer
-            .into_raw()
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|p| {
-                if scale == 1. {
-                    [p[0], p[1], p[2]]
-                } else {
-                    [p[0] * scale, p[1] * scale, p[2] * scale]
-                }
-            })
-            .collect(),
+        pixels,
     }
 }
 
@@ -279,6 +353,59 @@ pub(super) mod tests {
         for (a, b) in im.pixels.iter().zip(before) {
             for c in 0..3 {
                 assert!((a[c] - b[c]).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn lanczos_resize_matches_image_crate_across_dimensions() {
+        for (w, h) in [(97u32, 63u32), (1, 33), (33, 1), (1, 1), (157, 103)] {
+            let src = Rendered {
+                width: w,
+                height: h,
+                pixels: (0..w * h)
+                    .map(|i| {
+                        let x = (i % w) as f32 / w as f32;
+                        let y = (i / w) as f32 / h as f32;
+                        [x, y, if i % 7 < 3 { 0.03 } else { 0.96 }]
+                    })
+                    .collect(),
+            };
+            for max_edge in [0u32, 1, 17, 48, 90] {
+                let actual = resize(src.clone(), max_edge);
+                let (ow, oh) = output_size(w, h, max_edge);
+                assert_eq!((actual.width, actual.height), (ow, oh));
+                let expected = if max_edge == 0 || w.max(h) <= max_edge {
+                    src.pixels.clone()
+                } else {
+                    let buf = image::Rgb32FImage::from_raw(
+                        w,
+                        h,
+                        src.pixels.iter().flatten().copied().collect(),
+                    )
+                    .unwrap();
+                    let resized = image::imageops::resize(
+                        &buf,
+                        ow,
+                        oh,
+                        image::imageops::FilterType::Lanczos3,
+                    );
+                    resized
+                        .into_raw()
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .map(|p| p.map(|v| v.clamp(0., 1.)))
+                        .collect()
+                };
+                let max_err = actual
+                    .pixels
+                    .iter()
+                    .flatten()
+                    .zip(expected.iter().flatten())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(max_err < 1e-5, "{w}x{h} edge={max_edge}: {max_err}");
             }
         }
     }

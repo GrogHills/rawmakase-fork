@@ -19,6 +19,7 @@
 //! (diagnostics; `scene-tone-rule.py taps` trains on those maps).
 use super::local_tone::{Curve, blur};
 use super::local_tone_rule_data::{B1, B2, B3, FEATURES, HIDDEN, MEMBERS, MU, SD, W1, W2, W3};
+use rayon::prelude::*;
 
 /// Radius (map pixels) of the mean whose residual measures texture.
 const TEXTURE_RADIUS: usize = 2;
@@ -40,8 +41,30 @@ const LEVEL_WINDOW: f32 = 0.5;
 const TEX_AT_CLAMP: f32 = 1.0;
 const LEVEL_MIN: usize = 50;
 
-/// Histogram statistics of a photo's base levels (its measurement copy).
+/// Histogram statistics and ensemble curves of a photo's base levels (its measurement
+/// copy). Temporary sorted/residual arrays are dropped inside [`RuleStats::new`].
 pub(super) struct RuleStats {
+    top: f32,
+    bot: f32,
+    mean: f32,
+    q10: f32,
+    q25: f32,
+    q50: f32,
+    q75: f32,
+    q90: f32,
+    tex: f32,
+    tex_top: f32,
+    n: usize,
+    /// The curves' extent and the ensemble's gains at [`LEVELS`] levels across it,
+    /// computed once per map: the per-level medians are the costly part, and both
+    /// controls' curves read the same table.
+    lo: f32,
+    hi: f32,
+    gains: [[f32; 2]; LEVELS],
+}
+/// Temporary builder state holding the sorted base levels and per-level residual arrays
+/// while [`RuleStats::new`] evaluates the 48 rule gains.
+struct RuleBuilder {
     sorted: Vec<f32>,
     top: f32,
     bot: f32,
@@ -62,12 +85,6 @@ pub(super) struct RuleStats {
     coarse_by_level: Vec<f32>,
     fine_median: f32,
     coarse_median: f32,
-    /// The curves' extent and the ensemble's gains at [`LEVELS`] levels across it,
-    /// computed once per map: the per-level medians are the costly part, and both
-    /// controls' curves read the same table.
-    lo: f32,
-    hi: f32,
-    gains: [[f32; 2]; LEVELS],
 }
 /// Levels at which the curves sample the rule.
 const LEVELS: usize = 48;
@@ -120,7 +137,7 @@ impl RuleStats {
             .collect();
         let fine_median = median(&fine_by_level);
         let coarse_median = median(&coarse_by_level);
-        let mut stats = Self {
+        let builder = RuleBuilder {
             top,
             bot: q(0.001),
             mean,
@@ -138,16 +155,77 @@ impl RuleStats {
             coarse_by_level,
             fine_median,
             coarse_median,
-            lo: 0.,
-            hi: 0.,
-            gains: [[0.; 2]; LEVELS],
         };
-        stats.lo = stats.bot - 1.;
-        stats.hi = stats.top + 1.;
-        let step = (stats.hi - stats.lo) / LEVELS as f32;
-        stats.gains = std::array::from_fn(|i| stats.gain(stats.lo + (i as f32 + 0.5) * step));
-        stats
+        let lo = builder.bot - 1.;
+        let hi = builder.top + 1.;
+        let step = (hi - lo) / LEVELS as f32;
+        let mut gains = [[0.; 2]; LEVELS];
+        gains.par_iter_mut().enumerate().for_each(|(i, g)| {
+            *g = builder.gain(lo + (i as f32 + 0.5) * step);
+        });
+        Self {
+            top: builder.top,
+            bot: builder.bot,
+            mean: builder.mean,
+            q10: builder.q10,
+            q25: builder.q25,
+            q50: builder.q50,
+            q75: builder.q75,
+            q90: builder.q90,
+            tex: builder.tex,
+            tex_top: builder.tex_top,
+            n,
+            lo,
+            hi,
+            gains,
+        }
     }
+    /// The curve of one control at full strength (Shadows +100 when `shadows`, else
+    /// Highlights −100) over the photo's base levels, as [`Curve`] reads it: absolute
+    /// levels (key 0) from a stop below the bottom to a stop above the top, held
+    /// outside. Shadows lifts nothing above the top and Highlights pulls nothing below
+    /// the bottom, so holding the ends extends the rule as the mosaics measured it.
+    pub(super) fn curve(&self, shadows: bool) -> Curve {
+        let (lo, hi) = (self.lo, self.hi);
+        let step = (hi - lo) / LEVELS as f32;
+        let mut table: [f32; LEVELS] = std::array::from_fn(|i| {
+            let g = self.gains[i];
+            if shadows { g[0].max(0.) } else { g[1].min(0.) }
+        });
+        monotone(&mut table, step);
+        if let Ok(path) = std::env::var("RAWMAKASE_RULE_DUMP") {
+            // Diagnostics: the statistics and curve, one JSON line per curve.
+            let line = format!(
+                "{{\"shadows\":{shadows},\"top\":{},\"bot\":{},\"mean\":{},\"q\":[{},{},{},{},{}],\"tex\":{},\"tex_top\":{},\"n\":{},\"lo\":{lo},\"hi\":{hi},\"table\":{:?}}}\n",
+                self.top,
+                self.bot,
+                self.mean,
+                self.q10,
+                self.q25,
+                self.q50,
+                self.q75,
+                self.q90,
+                self.tex,
+                self.tex_top,
+                self.n,
+                table
+            );
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        }
+        Curve {
+            key: 0.,
+            lo,
+            hi,
+            table,
+            tail: 0.,
+        }
+    }
+}
+impl RuleBuilder {
     /// Fine and coarse texture of the pixels within [`LEVEL_WINDOW`] of base level `x`.
     fn texture_at(&self, x: f32) -> (f32, f32) {
         let lo = self.sorted.partition_point(|v| *v < x - LEVEL_WINDOW);
@@ -232,50 +310,6 @@ impl RuleStats {
             }
         }
         sum.map(|v| v / MEMBERS as f32)
-    }
-    /// The curve of one control at full strength (Shadows +100 when `shadows`, else
-    /// Highlights −100) over the photo's base levels, as [`Curve`] reads it: absolute
-    /// levels (key 0) from a stop below the bottom to a stop above the top, held
-    /// outside. Shadows lifts nothing above the top and Highlights pulls nothing below
-    /// the bottom, so holding the ends extends the rule as the mosaics measured it.
-    pub(super) fn curve(&self, shadows: bool) -> Curve {
-        let (lo, hi) = (self.lo, self.hi);
-        let step = (hi - lo) / LEVELS as f32;
-        let mut table: [f32; LEVELS] = std::array::from_fn(|i| {
-            let g = self.gains[i];
-            if shadows { g[0].max(0.) } else { g[1].min(0.) }
-        });
-        monotone(&mut table, step);
-        if let Ok(path) = std::env::var("RAWMAKASE_RULE_DUMP") {
-            // Diagnostics: the statistics and curve, one JSON line per curve.
-            let line = format!(
-                "{{\"shadows\":{shadows},\"top\":{},\"bot\":{},\"mean\":{},\"q\":[{},{},{},{},{}],\"tex\":{},\"tex_top\":{},\"n\":{},\"lo\":{lo},\"hi\":{hi},\"table\":{:?}}}\n",
-                self.top,
-                self.bot,
-                self.mean,
-                self.q10,
-                self.q25,
-                self.q50,
-                self.q75,
-                self.q90,
-                self.tex,
-                self.tex_top,
-                self.sorted.len(),
-                table
-            );
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-        }
-        Curve {
-            key: 0.,
-            lo,
-            hi,
-            table,
-            tail: 0.,
-        }
     }
 }
 /// Projects the output log luminance (level + gain) of a 48-column table with columns

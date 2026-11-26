@@ -136,6 +136,10 @@ pub(super) struct Presenter {
     histogram: wgpu::Buffer,
     histogram_staging: wgpu::Buffer,
     scratch: Option<wgpu::Buffer>,
+    /// Reusable `PresentParams` uniform slots (one per pass recorded into the same
+    /// `CommandEncoder`, so `queue.write_buffer` never overwrites an earlier pass).
+    params: [wgpu::Buffer; 3],
+    weights: Option<wgpu::Buffer>,
     lut: Option<(Arc<MonitorLut>, wgpu::Buffer)>,
     no_lut: wgpu::Buffer,
     targets: Vec<Target>,
@@ -201,26 +205,44 @@ impl Presenter {
                 write_texture(1),
             ],
         });
-        let pipeline = |source: &str, layout: &wgpu::BindGroupLayout, entry: &str| {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(entry),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            });
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(entry),
-                bind_group_layouts: &[Some(layout)],
-                immediate_size: 0,
-            });
+        let present_source = PostCropVignette::wgsl_tone() + include_str!("present.wgsl");
+        let present_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Present"),
+            source: wgpu::ShaderSource::Wgsl(present_source.into()),
+        });
+        let present_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Present"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let present_pipeline = |entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
-                layout: Some(&pipeline_layout),
-                module: &module,
+                layout: Some(&present_layout),
+                module: &present_module,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
             })
         };
-        let present = PostCropVignette::wgsl_tone() + include_str!("present.wgsl");
+        let reduce_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("reduce"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("reduce.wgsl").into()),
+        });
+        let reduce_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("reduce"),
+                bind_group_layouts: &[Some(&reduce_layout)],
+                immediate_size: 0,
+            });
+        let reduce = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("reduce"),
+            layout: Some(&reduce_pipeline_layout),
+            module: &reduce_module,
+            entry_point: Some("reduce"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let histogram = |label, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -230,9 +252,8 @@ impl Presenter {
             })
         };
         Self {
-            pipelines: ["blur_horizontal", "sharpen", "present"]
-                .map(|entry| pipeline(&present, &layout, entry)),
-            reduce: pipeline(include_str!("reduce.wgsl"), &reduce_layout, "reduce"),
+            pipelines: ["blur_horizontal", "sharpen", "present"].map(present_pipeline),
+            reduce,
             layout,
             reduce_layout,
             histogram: histogram(
@@ -246,6 +267,15 @@ impl Presenter {
                 wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             ),
             scratch: None,
+            params: std::array::from_fn(|_| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Present parameters"),
+                    size: std::mem::size_of::<PresentParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            }),
+            weights: None,
             lut: None,
             no_lut: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("No monitor profile"),
@@ -404,11 +434,23 @@ impl Processor {
         } else {
             (0, vec![1.])
         };
-        let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Sharpening weights"),
-            contents: bytemuck::cast_slice(&weights),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let weights_bytes = bytemuck::cast_slice::<f32, u8>(&weights);
+        let weights_size = (weights_bytes.len() as u64).max(16);
+        if presenter
+            .weights
+            .as_ref()
+            .is_none_or(|b| b.size() < weights_size)
+        {
+            presenter.weights = None;
+            presenter.weights = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Sharpening weights"),
+                size: weights_size.next_power_of_two(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let weights = presenter.weights.as_ref().unwrap().clone();
+        self.queue.write_buffer(&weights, 0, weights_bytes);
         let lut = match &display.monitor {
             Some(lut) => {
                 if !presenter
@@ -432,7 +474,9 @@ impl Processor {
         let [cx, cy, cw, ch] = finish.crop;
         let vignette = PostCropVignette::new(e, finish.full);
         let grain = GrainField::new(e, finish.full[0].max(finish.full[1]) as f32 / finish.scale);
-        let parameters = |shown: bool| -> wgpu::Buffer {
+        let queue = &self.queue;
+        let param_buffers = presenter.params.clone();
+        let write_params = |uniform: &wgpu::Buffer, shown: bool| {
             let values = PresentParams {
                 width,
                 height,
@@ -478,11 +522,7 @@ impl Processor {
                 grain_fine: grain.fine,
                 ..Default::default()
             };
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Present parameters"),
-                contents: bytemuck::bytes_of(&values),
-                usage: wgpu::BufferUsages::UNIFORM,
-            })
+            queue.write_buffer(uniform, 0, bytemuck::bytes_of(&values));
         };
         let lut = lut.unwrap_or_else(|| presenter.no_lut.clone());
         let scratch = presenter.scratch.clone().unwrap();
@@ -493,11 +533,12 @@ impl Processor {
         // counts towards the histogram and carries the overlay and monitor profile.
         let record = |encoder: &mut wgpu::CommandEncoder,
                       view: &wgpu::TextureView,
+                      uniform: &wgpu::Buffer,
                       shown: bool,
                       pipelines: &[&wgpu::ComputePipeline],
                       [x, y]: [u32; 2]| {
-            let uniform = parameters(shown);
-            let buffers = [&pixels, &scratch, &weights, &uniform, &lut, &histogram];
+            write_params(uniform, shown);
+            let buffers = [&pixels, &scratch, &weights, uniform, &lut, &histogram];
             let mut entries: Vec<_> = buffers
                 .into_iter()
                 .enumerate()
@@ -532,6 +573,7 @@ impl Processor {
             record(
                 &mut encoder,
                 &view,
+                &param_buffers[0],
                 true,
                 &[&blur, &sharpening],
                 [width, height],
@@ -549,6 +591,7 @@ impl Processor {
             record(
                 &mut encoder,
                 &view,
+                &param_buffers[1],
                 false,
                 &[&present],
                 [cw.div_ceil(4), ch.div_ceil(4)],
@@ -559,6 +602,7 @@ impl Processor {
         record(
             &mut encoder,
             &view,
+            &param_buffers[2],
             true,
             &[&present],
             [cw.div_ceil(4), ch.div_ceil(4)],
