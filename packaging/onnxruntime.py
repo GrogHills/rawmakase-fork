@@ -17,6 +17,7 @@ does not match its pin is always an error.
 """
 import argparse
 import hashlib
+import http.client
 import io
 import os
 from pathlib import Path
@@ -146,7 +147,7 @@ def fetch(platform, arch, output, notices):
         raise SystemExit(f"No ONNX Runtime {VERSION} for {platform} {arch}")
     try:
         files = from_archive(platform, arch)
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+    except (urllib.error.URLError, http.client.IncompleteRead, TimeoutError, ConnectionError) as error:
         print(f"{archive}: {error}; using the NuGet package", file=sys.stderr)
         files = from_nuget(platform, arch)
     output.mkdir(parents=True, exist_ok=True)

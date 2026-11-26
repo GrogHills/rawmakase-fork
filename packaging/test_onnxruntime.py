@@ -1,5 +1,6 @@
 import contextlib
 import hashlib
+import http.client
 import io
 from pathlib import Path
 import shutil
@@ -121,6 +122,37 @@ class FetchTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "SHA-256"):
                 onnxruntime.fetch("macos", "arm64", self.root / "out", self.root / "notices")
         self.assertEqual(urlopen.call_count, 1)
+
+    def test_an_interrupted_release_falls_back_to_nuget(self):
+        package = nupkg(nuget_files())
+        asset = ("macos", "arm64")
+        member, _ = onnxruntime.NUGET_LIBRARIES[asset]
+        requested = []
+
+        class Interrupted:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                raise http.client.IncompleteRead(b"part", 10)
+
+        def urlopen(url, timeout):
+            requested.append(url)
+            if url == onnxruntime.NUGET:
+                return io.BytesIO(package)
+            return Interrupted()
+
+        with patch.object(onnxruntime, "NUGET_SHA256", hashlib.sha256(package).hexdigest()), \
+                patch.dict(onnxruntime.NUGET_LIBRARIES, {asset: (member, hashlib.sha256(b"library").hexdigest())}), \
+                patch("onnxruntime.urllib.request.urlopen", side_effect=urlopen), \
+                contextlib.redirect_stderr(io.StringIO()):
+            library = onnxruntime.fetch("macos", "arm64", self.root / "out", self.root / "notices")
+        self.assertEqual(requested[-1], onnxruntime.NUGET)
+        self.assertEqual(library.name, "libonnxruntime.dylib")
+        self.assertEqual(library.read_bytes(), b"library")
 
     def test_a_cached_package_is_used_and_a_bad_download_is_not_cached(self):
         cache = self.root / "cache"
