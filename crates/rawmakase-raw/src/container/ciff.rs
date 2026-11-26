@@ -13,7 +13,7 @@ use crate::captured::{CaptureDates, exif_date};
 use crate::codec::crw;
 use crate::error::{Error, Result, corrupt};
 use crate::info::{Cfa, RawInfo};
-use crate::io::Pieces;
+use crate::io::{Order, Pieces};
 use crate::sensor::Sensor;
 use crate::variant::{Plan, Variant};
 use rawmakase_cancel::Cancel;
@@ -36,21 +36,26 @@ const MAX_NAME: usize = 64;
 const FOUR_COLOUR: &[&str] = &["PowerShot G1", "PowerShot Pro70", "PowerShot Pro90 IS"];
 
 /// Whether `bytes` is a CIFF file: "II", the header's length, "HEAPCCDR".
-pub(crate) fn is_ciff(bytes: &[u8]) -> bool {
-    bytes.get(..2) == Some(b"II") && bytes.get(6..14) == Some(b"HEAPCCDR")
+pub(crate) fn is_ciff<'a>(bytes: impl Into<crate::io::Source<'a>>) -> bool {
+    let bytes = bytes.into();
+    bytes.starts_with(b"II") && bytes.starts_with_at(6, b"HEAPCCDR")
 }
 
 /// The records of a CIFF file by their ID (data format and index), the first
 /// of each ID found depth first: where each value is in the file (in its
 /// block, or in its directory entry).
 struct Records<'a> {
-    bytes: &'a [u8],
-    records: Vec<(u16, Range<usize>)>,
+    bytes: crate::io::Source<'a>,
+    records: Vec<(u16, Range<u64>)>,
 }
 
 impl<'a> Records<'a> {
-    fn parse(bytes: &'a [u8]) -> Result<Self> {
-        let header = u32_at(bytes, 2).ok_or_else(|| corrupt("CRW header"))? as usize;
+    fn parse(bytes: crate::io::Source<'a>) -> Result<Self> {
+        let header = u64::from(
+            bytes
+                .u32(Order::Little, 2)
+                .ok_or_else(|| corrupt("CRW header"))?,
+        );
         let mut r = Records {
             bytes,
             records: Vec::new(),
@@ -62,23 +67,29 @@ impl<'a> Records<'a> {
         Ok(r)
     }
 
-    fn block(&mut self, block: Range<usize>, depth: u32) -> Result<()> {
+    fn block(&mut self, block: Range<u64>, depth: u32) -> Result<()> {
         if depth > MAX_DEPTH || block.end < block.start + 6 {
             return Err(corrupt("CRW directory"));
         }
         let start = block.start;
         let dir = start
-            .checked_add(
-                u32_at(self.bytes, block.end - 4).ok_or_else(|| corrupt("CRW directory"))? as usize,
-            )
+            .checked_add(u64::from(
+                self.bytes
+                    .u32(Order::Little, block.end - 4)
+                    .ok_or_else(|| corrupt("CRW directory"))?,
+            ))
             .filter(|&d| d < block.end)
             .ok_or_else(|| corrupt("CRW directory"))?;
-        let count = usize::from(u16_at(self.bytes, dir).ok_or_else(|| corrupt("CRW directory"))?);
+        let count = usize::from(
+            self.bytes
+                .u16(Order::Little, dir)
+                .ok_or_else(|| corrupt("CRW directory"))?,
+        );
         for i in 0..count {
-            let at = dir + 2 + 10 * i;
+            let at = dir + 2 + 10 * (i as u64);
             let entry = self
                 .bytes
-                .get(at..at + 10)
+                .array::<10>(at)
                 .filter(|_| at + 10 <= block.end)
                 .ok_or_else(|| corrupt("CRW directory entry"))?;
             if self.records.len() >= MAX_RECORDS {
@@ -88,8 +99,8 @@ impl<'a> Records<'a> {
             let id = tag & 0x3fff;
             match tag & 0xc000 {
                 0x0000 => {
-                    let size = u32_at(entry, 2).unwrap_or(0) as usize;
-                    let offset = u32_at(entry, 6).unwrap_or(0) as usize;
+                    let size = u64::from(u32_at(&entry, 2).unwrap_or(0));
+                    let offset = u64::from(u32_at(&entry, 6).unwrap_or(0));
                     let range = start
                         .checked_add(offset)
                         .and_then(|s| Some(s..s.checked_add(size)?))
@@ -110,11 +121,13 @@ impl<'a> Records<'a> {
         Ok(())
     }
 
-    fn get(&self, id: u16) -> Option<&'a [u8]> {
-        self.bytes.get(self.range(id)?)
+    fn get_upto(&self, id: u16, max: u64) -> Option<std::borrow::Cow<'a, [u8]>> {
+        let range = self.range(id)?;
+        let len = (range.end - range.start).min(max);
+        self.bytes.get(range.start, len)
     }
 
-    fn range(&self, id: u16) -> Option<Range<usize>> {
+    fn range(&self, id: u16) -> Option<Range<u64>> {
         self.records
             .iter()
             .find(|(i, _)| *i == id)
@@ -125,7 +138,8 @@ impl<'a> Records<'a> {
     /// reads): a record is as long as the file says, so it is never copied
     /// whole.
     fn words(&self, id: u16, n: usize) -> Vec<u16> {
-        self.get(id)
+        let take = n.min(MAX_FIELDS) * 2;
+        self.get_upto(id, take as u64)
             .map(|b| {
                 b.as_chunks::<2>()
                     .0
@@ -139,7 +153,8 @@ impl<'a> Records<'a> {
 
     /// A record's first `n` 32-bit words at most.
     fn longs(&self, id: u16, n: usize) -> Vec<u32> {
-        self.get(id)
+        let take = n.min(MAX_FIELDS) * 4;
+        self.get_upto(id, take as u64)
             .map(|b| {
                 b.as_chunks::<4>()
                     .0
@@ -250,11 +265,13 @@ fn parts(raw: &[u8], samples: usize) -> (Option<&[u8]>, &[u8]) {
 }
 
 /// Reads a CRW's header facts.
-pub(crate) fn open(bytes: &[u8]) -> Result<RawInfo> {
+pub(crate) fn open(bytes: crate::io::Source<'_>) -> Result<RawInfo> {
     let r = Records::parse(bytes)?;
-    let raw = r
+    let raw_range = r
         .range(0x2005)
         .ok_or_else(|| Error::Unsupported("CRW without raw data".into()))?;
+    let raw = usize::try_from(raw_range.start).map_err(|_| Error::TooLarge("CRW size"))?
+        ..usize::try_from(raw_range.end).map_err(|_| Error::TooLarge("CRW size"))?;
     let sensor = r.words(0x1031, 9);
     let [width, height] = match sensor.as_slice() {
         [_, w, h, ..] => [u32::from(*w), u32::from(*h)],
@@ -266,7 +283,8 @@ pub(crate) fn open(bytes: &[u8]) -> Result<RawInfo> {
         .first()
         .ok_or_else(|| Error::Unsupported("CRW without a decoder table".into()))?;
     let mut info = crate::info::base(Variant::CrwCompressed);
-    let names = r.get(0x080a).unwrap_or(&[]);
+    let names_buf = r.get_upto(0x080a, (MAX_NAME * 2 + 2) as u64);
+    let names = names_buf.as_deref().unwrap_or(&[]);
     let mut names = names.split(|&b| b == 0).map(|s| {
         String::from_utf8_lossy(&s[..s.len().min(MAX_NAME)])
             .trim()
@@ -319,7 +337,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<RawInfo> {
         &r.words(0x102c, 54),
         // ColorInfo1's levels, of the records of 2048 bytes only (plain
         // levels; our measurements).
-        &if r.get(0x0032).is_some_and(|b| b.len() == 2048) {
+        &if r.range(0x0032).is_some_and(|b| b.end - b.start == 2048) {
             r.words(0x0032, 52)
         } else {
             Vec::new()
@@ -328,8 +346,8 @@ pub(crate) fn open(bytes: &[u8]) -> Result<RawInfo> {
     for id in [0x2007, 0x2008] {
         if let Some(range) = r.range(id) {
             info.previews.push(crate::preview::Candidate {
-                offset: range.start as u64,
-                len: range.len() as u64,
+                offset: range.start,
+                len: range.end - range.start,
                 pixels: 0,
             });
         }

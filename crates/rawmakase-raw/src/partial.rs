@@ -2,16 +2,16 @@
 //! for files on network volumes, where reading the whole file to show its
 //! preview costs most of the time.
 //!
-//! The readers stay as they are. They are given a buffer the file's size in
-//! which only the parts read from the file are filled: its start and end,
-//! where the containers keep their directories and boxes, then the start of
-//! each preview candidate (whose header says its size) and the chosen
-//! preview whole. A reader that needed a part not read finds zeros there and
-//! gives up, finds no preview, or finds fewer candidates. Giving up or finding
-//! no preview is `None`, and the caller reads the whole file as before. Fewer
-//! candidates can't be told from the file's own, so only formats compared with
-//! whole-file reads are read this way ([`checked`]), and a preview smaller
-//! than the one asked for is `None` too.
+//! The readers stay as they are. They are given a sparse view over the file's
+//! length in which only the parts read from the file are allocated and held:
+//! its start and end, where the containers keep their directories and boxes,
+//! then the start of each preview candidate (whose header says its size) and
+//! the chosen preview whole. A reader that needed a part not read finds zeros
+//! there and gives up, finds no preview, or finds fewer candidates. Giving up or
+//! finding no preview is `None`, and the caller reads the whole file as before.
+//! Fewer candidates can't be told from the file's own, so only formats
+//! compared with whole-file reads are read this way ([`checked`]), and a preview
+//! smaller than the one asked for is `None` too.
 use crate::Variant;
 use crate::info::RawInfo;
 use std::io::{Read, Seek, SeekFrom};
@@ -113,7 +113,7 @@ fn in_pieces(
     let mut f = Sparse::new(file)?;
     f.fill(0, HEAD)?;
     f.fill(f.len().saturating_sub(TAIL), TAIL)?;
-    let info = crate::variant::open(&f.bytes).ok()?;
+    let info = crate::variant::open_source(f.source()).ok()?;
     if !allow(info.variant) {
         return None;
     }
@@ -128,8 +128,8 @@ fn in_pieces(
         // looked for in the part read alone, so that a frame header cut short
         // isn't completed with zeros.
         let mut read = c.len.min(CANDIDATE_HEAD);
-        while crate::preview::is_jpeg(&f.bytes, c.offset)
-            && crate::preview::jpeg_size(&f.bytes, c.offset, read).is_none()
+        while crate::preview::is_jpeg(f.source(), c.offset)
+            && crate::preview::jpeg_size(f.source(), c.offset, read).is_none()
         {
             if read >= c.len {
                 // Read whole without a frame: the readers see the same
@@ -150,27 +150,26 @@ fn in_pieces(
     // from the directories already read; should they differ, a reader used
     // what wasn't read.
     let first: Vec<_> = info.previews.iter().map(|c| (c.offset, c.len)).collect();
-    let info = crate::variant::open(&f.bytes).ok()?;
+    let info = crate::variant::open_source(f.source()).ok()?;
     if !allow(info.variant) || !info.previews.iter().map(|c| (c.offset, c.len)).eq(first) {
         return None;
     }
-    let (at, len) = crate::preview::find_reaching(&info, &f.bytes, edge).ok()?;
+    let (at, len) = crate::preview::find_reaching(&info, f.source(), edge).ok()?;
     f.fill(at, len)?;
-    let preview = crate::embedded(&f.bytes, (at, len)).ok()?.into_owned();
+    let preview = crate::embedded_source(f.source(), (at, len))
+        .ok()?
+        .into_owned();
     Some(PartialPreview {
         info,
         preview,
-        read: f.read,
+        read: f.read(),
     })
 }
 
-/// A buffer the size of the file, filled where the file has been read.
+/// On-demand sparse chunks read from `file` without allocating `file.len()`.
 struct Sparse<'r, R: Read + Seek> {
     file: &'r mut R,
-    bytes: Vec<u8>,
-    /// The ranges read, as start and end, sorted and apart.
-    filled: Vec<(u64, u64)>,
-    read: u64,
+    data: crate::io::SparseData,
 }
 
 impl<'r, R: Read + Seek> Sparse<'r, R> {
@@ -179,69 +178,28 @@ impl<'r, R: Read + Seek> Sparse<'r, R> {
         if len == 0 || len > MAX_FILE {
             return None;
         }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(usize::try_from(len).ok()?).ok()?;
-        bytes.resize(usize::try_from(len).ok()?, 0);
         Some(Self {
             file,
-            bytes,
-            filled: Vec::new(),
-            read: 0,
+            data: crate::io::SparseData::new(len),
         })
     }
     fn len(&self) -> u64 {
-        self.bytes.len() as u64
+        self.data.len()
+    }
+    fn read(&self) -> u64 {
+        self.data.read()
+    }
+    fn source(&self) -> crate::io::Source<'_> {
+        crate::io::Source::Sparse {
+            data: &self.data,
+            base: 0,
+            len: self.data.len(),
+        }
     }
     /// Reads `len` bytes at `at`, fewer where the file ends sooner, skipping
     /// what has been read already.
     fn fill(&mut self, at: u64, len: u64) -> Option<()> {
-        let end = at.saturating_add(len).min(self.len());
-        let start = at.min(end);
-        for (from, to) in self.gaps(start, end) {
-            self.file.seek(SeekFrom::Start(from)).ok()?;
-            let range = usize::try_from(from).ok()?..usize::try_from(to).ok()?;
-            self.file.read_exact(&mut self.bytes[range]).ok()?;
-            self.read += to - from;
-        }
-        self.mark(start, end);
-        Some(())
-    }
-    /// The parts of `start..end` not read yet.
-    fn gaps(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        let mut gaps = Vec::new();
-        let mut at = start;
-        for &(s, e) in &self.filled {
-            if e <= at {
-                continue;
-            }
-            if s >= end {
-                break;
-            }
-            if s > at {
-                gaps.push((at, s));
-            }
-            at = at.max(e);
-        }
-        if at < end {
-            gaps.push((at, end));
-        }
-        gaps
-    }
-    /// Records `start..end` as read.
-    fn mark(&mut self, start: u64, end: u64) {
-        if start >= end {
-            return;
-        }
-        self.filled.push((start, end));
-        self.filled.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.filled.len());
-        for &(s, e) in &self.filled {
-            match merged.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
-            }
-        }
-        self.filled = merged;
+        self.data.fill(self.file, at, len)
     }
 }
 

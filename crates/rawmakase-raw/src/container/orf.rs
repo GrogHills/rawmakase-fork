@@ -46,8 +46,11 @@ pub(crate) struct OrfPlan {
 }
 
 /// Whether the TIFF `t` is an Olympus or OM Digital Solutions RAW.
-pub(crate) fn is_orf(bytes: &[u8], t: &TiffFile) -> bool {
-    if matches!(bytes.get(..4), Some(b"IIRO" | b"IIRS" | b"MMOR")) {
+pub(crate) fn is_orf(bytes: crate::io::Source<'_>, t: &TiffFile) -> bool {
+    if matches!(
+        bytes.array::<4>(0).as_ref(),
+        Some(b"IIRO" | b"IIRS" | b"MMOR")
+    ) {
         return true;
     }
     let make = t.text_upto(&t.ifds[0], 271, NAME_MAX).unwrap_or_default();
@@ -157,7 +160,7 @@ pub(crate) fn open(t: TiffFile) -> Result<RawInfo> {
         }
     }
     if let Coding::Fields(p) = coding
-        && let Some(jpeg) = trailing_jpeg(t.bytes.data, offset, p, width, height)
+        && let Some(jpeg) = trailing_jpeg(t.data, offset, p, width, height)
     {
         info.previews.push(crate::preview::Candidate {
             offset: t.base + jpeg.0,
@@ -243,7 +246,7 @@ fn aspect([left, top, width, height]: [u32; 4], [across, down]: [u32; 2]) -> Opt
 /// next 2 KiB boundary after the odd rows' field (our measurements), to the
 /// end of the file. `(offset, length)` from the TIFF header.
 fn trailing_jpeg(
-    tiff: &[u8],
+    tiff: crate::io::Source<'_>,
     offset: u32,
     p: Packing,
     width: u32,
@@ -254,7 +257,7 @@ fn trailing_jpeg(
     let second = (even * stride).next_multiple_of(2048);
     let end = u64::from(offset) + second + u64::from(height / 2) * stride;
     let at = end.next_multiple_of(2048);
-    let len = (tiff.len() as u64).checked_sub(at)?;
+    let len = tiff.len().checked_sub(at)?;
     crate::preview::is_jpeg(tiff, at).then_some((at, len))
 }
 
