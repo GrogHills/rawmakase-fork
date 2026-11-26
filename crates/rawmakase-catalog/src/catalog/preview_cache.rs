@@ -1590,7 +1590,12 @@ mod tests {
             StoreOutcome::Stored
         );
         cache.store_sized_jpeg(&raw, "edit", PreviewKind::Standard, &stamp, 2048, &sized)?;
-        std::fs::write(&raw, b"rewritten later on disk")?;
+        let modified = std::fs::metadata(&raw)?.modified()?;
+        std::fs::write(&raw, b"rewritten later on disk with new length")?;
+        std::fs::File::options()
+            .write(true)
+            .open(&raw)?
+            .set_modified(modified + Duration::from_secs(1))?;
         assert!(cache.load_tagged_jpeg(&raw, "edit")?.is_none());
         assert!(
             cache
