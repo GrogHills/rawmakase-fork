@@ -47,7 +47,11 @@ impl Library {
     /// An expanded grid cell's details: dimensions and capture date, e.g.
     /// "6000 × 4000 · 29/06/2016". The info is read once per photo.
     pub(super) fn cell_details(&mut self, photo: &crate::catalog::Photo) -> String {
+        const MAX_CELL_INFO: usize = 2048;
         let catalog = self.session.catalog();
+        if !self.cell_info.contains_key(&photo.id) && self.cell_info.len() >= MAX_CELL_INFO {
+            self.cell_info.clear();
+        }
         let info = self
             .cell_info
             .entry(photo.id)

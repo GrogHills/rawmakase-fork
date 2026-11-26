@@ -107,9 +107,12 @@ impl Library {
             .chain(surveyed[..at].iter().rev())
             .find(|i| shown(self, i))
             .copied();
-        self.selection.selected = surveyed.into_iter().filter(|i| shown(self, i)).collect();
-        self.selection.active = active;
-        self.selection.anchor = active;
+        let next_selected = surveyed.into_iter().filter(|i| shown(self, i)).collect();
+        self.selection.mutate(|s| {
+            s.selected = next_selected;
+            s.active = active;
+            s.anchor = active;
+        });
         if advance && active == Some(id) {
             self.step_surveyed(1);
         }

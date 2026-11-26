@@ -184,13 +184,33 @@ impl Library {
     /// the filmstrip and the keys follow Compare.
     pub(super) fn sync_compare_selection(&mut self) {
         let active = self.compare.id(self.compare.active).or(self.compare.select);
-        self.selection.selected = [self.compare.select, self.compare.candidate]
-            .into_iter()
-            .flatten()
-            .collect();
-        self.selection.active = active;
-        self.selection.anchor = active;
-        self.compare.synced = Some(self.selection.clone());
+        let expected_len = usize::from(self.compare.select.is_some())
+            + usize::from(
+                self.compare.candidate.is_some() && self.compare.candidate != self.compare.select,
+            );
+        let matches = self.selection.active == active
+            && self.selection.anchor == active
+            && self.selection.selected.len() == expected_len
+            && self
+                .compare
+                .select
+                .is_none_or(|id| self.selection.selected.contains(&id))
+            && self
+                .compare
+                .candidate
+                .is_none_or(|id| self.selection.selected.contains(&id));
+        if !matches {
+            let (select, candidate) = (self.compare.select, self.compare.candidate);
+            self.selection.mutate(|s| {
+                s.selected.clear();
+                s.selected.extend([select, candidate].into_iter().flatten());
+                s.active = active;
+                s.anchor = active;
+            });
+        }
+        if self.compare.synced.as_ref() != Some(&*self.selection) {
+            self.compare.synced = Some(self.selection.snapshot());
+        }
     }
     /// A rating, flag or label key in Compare: the active photo only. With
     /// Shift, the candidate moves on.
@@ -206,7 +226,7 @@ impl Library {
         self.edit_metadata(id, edit, false)?;
         // The selection the edit left is Compare's own to reconcile, not
         // another command's to follow.
-        self.compare.synced = Some(self.selection.clone());
+        self.compare.synced = Some(self.selection.snapshot());
         // A photo the filter now hides has already given way to the next.
         let hidden = !self.is_shown(id);
         self.keep_compared_shown();
@@ -248,7 +268,7 @@ impl Library {
             .as_ref()
             .is_some_and(|synced| self.selection.selected.is_subset(&synced.selected));
         let restored = std::mem::take(&mut self.compare.restored);
-        if self.compare.synced.as_ref() != Some(&self.selection)
+        if self.compare.synced.as_ref() != Some(&*self.selection)
             && (restored || !(hidden && pruned))
         {
             self.follow_selection();

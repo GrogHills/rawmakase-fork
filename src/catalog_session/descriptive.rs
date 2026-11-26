@@ -92,7 +92,7 @@ impl CatalogSession {
     /// Names virtual copy `id` `name`, trimmed, in the catalog and the lists.
     pub(crate) fn rename_copy(&mut self, id: PhotoId, name: &str) -> Result<()> {
         self.catalog.set_copy_name(id, name)?;
-        if let Some(p) = self.photos.iter_mut().find(|p| p.id == id) {
+        if let Some(p) = self.photo_mut(id) {
             p.copy_name = name.trim().to_string();
         }
         Ok(())
@@ -161,8 +161,9 @@ impl CatalogSession {
         if listed.is_err() {
             // The lists as they were, less the copy: its id may be given to a new
             // photo.
-            if let Some(i) = self.photos.iter().position(|p| p.id == id) {
+            if let Some(i) = self.photo_position(id) {
                 let copy = self.photos.remove(i);
+                self.rebuild_photo_index();
                 if let Some(folder) = self.folders.iter_mut().find(|f| f.id == copy.folder) {
                     folder.count = folder.count.saturating_sub(1);
                 }
@@ -195,6 +196,7 @@ impl CatalogSession {
             // The lists as they were, less what is gone from the catalog: the
             // removed ids may be given to new photos.
             self.photos.retain(|p| !removed.contains(&p.id));
+            self.rebuild_photo_index();
             self.folders.retain(|f| !folders.contains(&f.id));
             let roots: std::collections::HashSet<_> = self.folders.iter().map(|f| f.root).collect();
             self.roots.retain(|(root, ..)| roots.contains(root));

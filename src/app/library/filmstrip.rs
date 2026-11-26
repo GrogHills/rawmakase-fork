@@ -3,7 +3,7 @@
 //! width and scroll position as the views change; what a click does is up
 //! to the view shown.
 use super::grid::filter_caption;
-use super::selection::{Mark, Selection};
+use super::selection::Mark;
 use super::views::View;
 use super::{Action, Library, cell};
 use crate::app::ui::design::{Tone, inset, radius, space, text};
@@ -42,9 +42,9 @@ pub(super) struct State {
     /// The photo last brought into view, and where it was then in
     /// `visible`: the strip scrolls again only when either changes.
     revealed: Option<(PhotoId, usize)>,
-    /// The selection and `shown_version` the strip was last drawn with, to
+    /// The `selection_version` and `shown_version` the strip was last drawn with, to
     /// notice a view drawn after it changing either.
-    drawn: (Selection, u64),
+    drawn: (u64, u64),
     /// The strip's glide after a trackpad swipe.
     kinetic: super::kinetic::Kinetic,
 }
@@ -115,7 +115,7 @@ impl Library {
     /// in the grid below does: the strip then needs another frame to mark
     /// it and bring it into view.
     pub(crate) fn filmstrip_behind(&self) -> bool {
-        self.strip.drawn.0 != self.selection || self.strip.drawn.1 != self.shown_version
+        self.strip.drawn != (self.selection_version(), self.shown_version)
     }
     /// A filmstrip click in Develop with Cmd or Shift: the photo joins or leaves the
     /// selection, or a range does, as in the grid, while the photo open stays active.
@@ -132,15 +132,19 @@ impl Library {
         // The open photo is the active one, stays in the selection, and is where a
         // Shift range starts.
         if let Some(open) = open {
-            self.selection.active = Some(open);
-            self.selection.anchor = Some(open);
-            self.selection.selected.insert(open);
+            self.selection.mutate(|s| {
+                s.active = Some(open);
+                s.anchor = Some(open);
+                s.selected.insert(open);
+            });
         }
         self.click(id, modifiers);
         if let Some(open) = open {
-            self.selection.selected.insert(open);
-            self.selection.active = Some(open);
-            self.selection.anchor = Some(open);
+            self.selection.mutate(|s| {
+                s.selected.insert(open);
+                s.active = Some(open);
+                s.anchor = Some(open);
+            });
         }
         true
     }
@@ -149,9 +153,11 @@ impl Library {
     pub(crate) fn develop_select_all(&mut self, open: Option<PhotoId>) {
         self.select_all();
         if let Some(open) = open {
-            self.selection.selected.insert(open);
-            self.selection.active = Some(open);
-            self.selection.anchor = Some(open);
+            self.selection.mutate(|s| {
+                s.selected.insert(open);
+                s.active = Some(open);
+                s.anchor = Some(open);
+            });
         }
     }
     /// A filmstrip click in the Library, as the view shown takes it: Grid,
@@ -188,7 +194,7 @@ impl Library {
         let mut changed = false;
         let library = module == Module::Library;
         if self.filmstrip_behind() {
-            self.strip.drawn = (self.selection.clone(), self.shown_version);
+            self.strip.drawn = (self.selection_version(), self.shown_version);
         }
         let photo = current.and_then(|id| self.photo(id)).cloned();
         let position = current.and_then(|current| {

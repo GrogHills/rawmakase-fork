@@ -141,6 +141,7 @@ impl Library {
             after,
             listed,
         } = self.session.edit_descriptive(&ids, edit)?;
+        self.refresh_summary();
         self.filter();
         if before == after {
             return listed;
@@ -183,6 +184,7 @@ impl Library {
             .cloned()
             .collect();
         self.session.restore_descriptive(&values, &ratings)?;
+        self.refresh_summary();
         self.resort_by_capture_time();
         self.filter();
         self.fields.reload();
@@ -288,6 +290,7 @@ impl Library {
         let mut report = reread.report;
         let written = self.session.apply_file_metadata(&ids, &read)?;
         report.unreadable.extend(written.unreadable);
+        self.refresh_summary();
         self.resort_by_capture_time();
         self.filter();
         let after = self.session.catalog().metadata_snapshot(&ids)?;

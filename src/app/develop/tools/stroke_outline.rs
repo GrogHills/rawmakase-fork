@@ -82,24 +82,27 @@ impl Grid {
         }
         let neighbours_forward = [(-1, -1), (0, -1), (1, -1), (-1, 0)];
         let neighbours_back = [(1, 1), (0, 1), (-1, 1), (1, 0)];
-        let mut sweep = |order: Vec<(usize, usize)>, from: [(isize, isize); 4]| {
-            for (i, j) in order {
-                for (di, dj) in from {
-                    let (ni, nj) = (i as isize + di, j as isize + dj);
-                    if ni < 0 || nj < 0 || ni as usize >= nx || nj as usize >= ny {
-                        continue;
-                    }
-                    if let Some(s) = nearest[nj as usize * nx + ni as usize] {
-                        offer(i, j, s, &mut nearest);
-                    }
+        let mut sweep = |i: usize, j: usize, from: [(isize, isize); 4]| {
+            for (di, dj) in from {
+                let (ni, nj) = (i as isize + di, j as isize + dj);
+                if ni < 0 || nj < 0 || ni as usize >= nx || nj as usize >= ny {
+                    continue;
+                }
+                if let Some(s) = nearest[nj as usize * nx + ni as usize] {
+                    offer(i, j, s, &mut nearest);
                 }
             }
         };
-        let forward: Vec<(usize, usize)> =
-            (0..ny).flat_map(|j| (0..nx).map(move |i| (i, j))).collect();
-        let back: Vec<(usize, usize)> = forward.iter().rev().copied().collect();
-        sweep(forward, neighbours_forward);
-        sweep(back, neighbours_back);
+        for j in 0..ny {
+            for i in 0..nx {
+                sweep(i, j, neighbours_forward);
+            }
+        }
+        for j in (0..ny).rev() {
+            for i in (0..nx).rev() {
+                sweep(i, j, neighbours_back);
+            }
+        }
         self.refine(&mut dist, segments, radius);
         dist.iter().map(|d| d - radius).collect()
     }
@@ -185,14 +188,16 @@ impl Grid {
                 let corners = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)];
                 let d = corners.map(|(i, j)| field[j * nx + i]);
                 let p = corners.map(|(i, j)| self.at(i, j));
-                let mut crossings = Vec::with_capacity(4);
+                let mut crossings = [Pos2::ZERO; 4];
+                let mut n = 0usize;
                 for k in 0..4 {
-                    let n = (k + 1) % 4;
-                    if (d[k] < 0.) != (d[n] < 0.) && d[k].is_finite() && d[n].is_finite() {
-                        crossings.push(cross(p[k], p[n], d[k], d[n]));
+                    let next = (k + 1) % 4;
+                    if (d[k] < 0.) != (d[next] < 0.) && d[k].is_finite() && d[next].is_finite() {
+                        crossings[n] = cross(p[k], p[next], d[k], d[next]);
+                        n += 1;
                     }
                 }
-                match crossings.len() {
+                match n {
                     2 => out.push([crossings[0], crossings[1]]),
                     // A saddle: cut off the two corners on the other side from the
                     // cell's centre, so what the centre joins stays joined.

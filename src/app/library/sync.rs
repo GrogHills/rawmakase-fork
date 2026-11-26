@@ -875,8 +875,9 @@ impl Editor {
         let (Some(library), Some(source)) = (&self.library, self.sync_ready_source()) else {
             return 0;
         };
-        let selected = library.selected_photos();
-        selected.len() - usize::from(selected.contains(&source))
+        library
+            .selected_count()
+            .saturating_sub(usize::from(library.selected_contains(source)))
     }
     /// The source's settings: the open photo's as Develop has them, or another photo
     /// to read with the targets.
@@ -963,7 +964,7 @@ impl Editor {
     /// How many photos a batch would apply to, for a control drawn every frame.
     pub(in crate::app) fn batch_target_count(&self) -> usize {
         match &self.library {
-            Some(library) if self.batch_ready() => library.selected_photos().len(),
+            Some(library) if self.batch_ready() => library.selected_count(),
             _ => 0,
         }
     }

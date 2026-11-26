@@ -5,6 +5,41 @@ use crate::model::recipe::Recipe;
 use rawmakase_cancel::Cancel;
 use rawmakase_decode::ai::cache::AiCache;
 use std::path::Path;
+use std::sync::{Condvar, Mutex, PoisonError};
+use std::time::Duration;
+
+const MAX_CONCURRENT_AI_DECODES: usize = 2;
+static AI_DECODE_GATE: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// Bounds concurrent full-resolution AI-denoise thumbnail decodes across
+/// background preview workers while still waking promptly on cancellation.
+struct AiDecodeGuard;
+
+impl AiDecodeGuard {
+    fn acquire(cancel: Cancel<'_>) -> anyhow::Result<Self> {
+        let (lock, cvar) = &AI_DECODE_GATE;
+        let mut active = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while *active >= MAX_CONCURRENT_AI_DECODES {
+            anyhow::ensure!(!cancel.is_cancelled(), "Cancelled");
+            let (guard, _) = cvar
+                .wait_timeout(active, Duration::from_millis(25))
+                .unwrap_or_else(PoisonError::into_inner);
+            active = guard;
+        }
+        anyhow::ensure!(!cancel.is_cancelled(), "Cancelled");
+        *active += 1;
+        Ok(Self)
+    }
+}
+
+impl Drop for AiDecodeGuard {
+    fn drop(&mut self) {
+        let (lock, cvar) = &AI_DECODE_GATE;
+        let mut active = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        cvar.notify_all();
+    }
+}
 
 /// A 640 px preview of `path` developed with `source`, as Develop's Fit draws it
 /// (`develop::render_fitted`): from a reduced copy of the photo, several times
@@ -104,6 +139,7 @@ fn develop_with_ai(
     edge: u32,
     cancel: Cancel<'_>,
 ) -> anyhow::Result<image::RgbImage> {
+    let _gate = AiDecodeGuard::acquire(cancel)?;
     use rawmakase_decode::ai::denoise::{ModelOutput, assemble};
     let raw = crate::photo::open(path)?;
     let recipe = EditSource::recipe(Some(source), &raw.metadata, path, cancel)?;

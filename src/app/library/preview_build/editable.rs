@@ -42,7 +42,7 @@ use crate::storage::Identity;
 use anyhow::{Context, ensure};
 use rawmakase_cancel::Cancel;
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
@@ -168,7 +168,7 @@ impl Progress {
 
 #[derive(Default)]
 struct State {
-    waiting: VecDeque<Item>,
+    waiting: super::WaitingQueue<PhotoId, Item>,
     running: Option<PhotoId>,
     /// The flag the running build stops on; replaced when it is set.
     cancel: Arc<AtomicBool>,
@@ -196,12 +196,8 @@ impl State {
         let mut added = 0;
         for mut item in items {
             item.discards = self.discards;
-            match self.waiting.iter_mut().find(|w| w.photo == item.photo) {
-                Some(waiting) => *waiting = item,
-                None => {
-                    self.waiting.push_back(item);
-                    added += 1;
-                }
+            if self.waiting.enqueue(item.photo, item) {
+                added += 1;
             }
         }
         self.progress.total += added;
@@ -221,7 +217,11 @@ impl State {
         }
         let wanted = |photo: &PhotoId| photos.is_none_or(|p| p.contains(photo));
         let before = self.waiting.len();
-        self.waiting.retain(|item| !wanted(&item.photo));
+        if photos.is_none() {
+            self.waiting.clear();
+        } else {
+            self.waiting.retain(|photo, _| !wanted(photo));
+        }
         let mut stopped = before - self.waiting.len();
         self.progress.total -= stopped;
         if self.running.as_ref().is_some_and(wanted) {

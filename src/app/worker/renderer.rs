@@ -45,10 +45,35 @@ fn draft_edge(width: u32, height: u32) -> Option<u32> {
     (halved > 0).then_some(edge.round() as u32)
 }
 
+/// Weak identity of a decoded [`CameraImage`](crate::camera_data::CameraImage) (or
+/// [`AiSource`](develop::AiSource)) so cached renders do not keep multi-gigabyte pixel
+/// buffers alive once the UI moves on.
+struct SameImage(std::sync::Weak<crate::camera_data::CameraImage>);
+impl SameImage {
+    fn of(image: &Arc<crate::camera_data::CameraImage>) -> Self {
+        Self(Arc::downgrade(image))
+    }
+    fn matches(&self, image: &Arc<crate::camera_data::CameraImage>) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(image))
+    }
+}
+impl PartialEq for SameImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+fn same_ai(cached: &Option<SameImage>, job: &Option<develop::AiSource>) -> bool {
+    match (cached, job) {
+        (None, None) => true,
+        (Some(cached), Some(job)) => cached.matches(job.image()),
+        _ => false,
+    }
+}
+
 /// A finished render and the view it shows.
 struct Shown {
-    image: Arc<crate::camera_data::CameraImage>,
-    ai: Option<develop::AiSource>,
+    image: SameImage,
+    ai: Option<SameImage>,
     recipe: Recipe,
     max_edge: u32,
     region: Option<[u32; 4]>,
@@ -71,8 +96,8 @@ enum Shot {
 impl Shown {
     fn new(job: &RenderJob, out: Shot) -> Self {
         Self {
-            image: job.image.clone(),
-            ai: job.ai.clone(),
+            image: SameImage::of(&job.image),
+            ai: job.ai.as_ref().map(|a| SameImage::of(a.image())),
             recipe: job.recipe.clone(),
             max_edge: job.max_edge,
             region: job.region,
@@ -85,8 +110,8 @@ impl Shown {
     }
     /// The same photo, view and edit, with pixels that are still there.
     fn matches(&self, job: &RenderJob, gpu: Option<&gpu::Processor>) -> bool {
-        let same = Arc::ptr_eq(&self.image, &job.image)
-            && self.ai == job.ai
+        let same = self.image.matches(&job.image)
+            && same_ai(&self.ai, &job.ai)
             && self.max_edge == job.max_edge
             && self.region == job.region
             && self.recipe == job.recipe
@@ -287,6 +312,21 @@ fn render(
         Pane::Before => before,
         Pane::Magnifier => magnifier,
     };
+    if fit.as_ref().is_some_and(|s| !s.image.matches(&job.image)) {
+        *fit = None;
+    }
+    if zoomed
+        .as_ref()
+        .is_some_and(|s| !s.image.matches(&job.image))
+    {
+        *zoomed = None;
+    }
+    if whole_shown
+        .as_ref()
+        .is_some_and(|(image, ..)| !image.matches(&job.image))
+    {
+        *whole_shown = None;
+    }
     let (whole_slot, region_slot) = match job.pane {
         Pane::After => (gpu::Slot::Whole, gpu::Slot::Region),
         Pane::Before => (gpu::Slot::BeforeWhole, gpu::Slot::BeforeRegion),
@@ -534,7 +574,7 @@ fn render(
                     // So does a change of AI Denoise: its reduced preview would need the
                     // same full-size blend as the region, adding only a blurry frame.
                     let ai_changed = zoomed.as_ref().is_some_and(|s| {
-                        s.ai != job.ai || s.recipe.ai_denoise != job.recipe.ai_denoise
+                        !same_ai(&s.ai, &job.ai) || s.recipe.ai_denoise != job.recipe.ai_denoise
                     });
                     if *showing_region && !*quick_region && !ai_changed {
                         let out = processor.render_region_preview_to(
@@ -573,9 +613,9 @@ fn render(
             // responsive on a GPU slower than they change; the full render follows.
             // Opening a photo or changing the view goes straight to the full render.
             let editing = !*showing_region
-                && fit.as_ref().is_some_and(|s| {
-                    Arc::ptr_eq(&s.image, &job.image) && s.max_edge == job.max_edge
-                });
+                && fit
+                    .as_ref()
+                    .is_some_and(|s| s.image.matches(&job.image) && s.max_edge == job.max_edge);
             let draft = || {
                 let g = develop::Geometry::new(&job.image, &job.recipe, job.max_edge);
                 draft_edge(g.width, g.height)
@@ -629,12 +669,7 @@ fn render(
 type Histogram = Box<crate::rendered::Histogram>;
 /// A whole photo's histogram and what it was rendered from: the image, its AI Denoise
 /// source and the edit.
-type WholeHistogram = (
-    Arc<crate::camera_data::CameraImage>,
-    Option<develop::AiSource>,
-    Recipe,
-    Histogram,
-);
+type WholeHistogram = (SameImage, Option<SameImage>, Recipe, Histogram);
 
 /// At 100% the view shows a region, but the histogram describes the whole
 /// photo, as Lightroom's does: from the Fit render of the same edit when there
@@ -648,10 +683,8 @@ fn whole_histogram(
     tx: &Sender<Event>,
     ctx: &egui::Context,
 ) -> anyhow::Result<()> {
-    let same = |image: &Arc<crate::camera_data::CameraImage>,
-                ai: &Option<develop::AiSource>,
-                recipe: &Recipe| {
-        Arc::ptr_eq(image, &job.image) && *ai == job.ai && *recipe == job.recipe
+    let same = |image: &SameImage, ai: &Option<SameImage>, recipe: &Recipe| {
+        image.matches(&job.image) && same_ai(ai, &job.ai) && *recipe == job.recipe
     };
     let histogram =
         if let Some((.., histogram)) = whole.as_ref().filter(|(i, a, r, _)| same(i, a, r)) {
@@ -673,8 +706,8 @@ fn whole_histogram(
             Box::new(out.pixels().histogram())
         };
     *whole = Some((
-        job.image.clone(),
-        job.ai.clone(),
+        SameImage::of(&job.image),
+        job.ai.as_ref().map(|a| SameImage::of(a.image())),
         job.recipe.clone(),
         histogram.clone(),
     ));
@@ -1067,5 +1100,65 @@ mod tests {
         let edited = histogram(3, &recipe, region);
         assert_ne!(edited, fit);
         assert_eq!(histogram(4, &recipe, None), edited);
+    }
+    #[test]
+    fn cached_views_do_not_pin_images_or_ai_sources_strongly() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = renderer(tx, egui::Context::default());
+        let first = image();
+        let ai = develop::AiSource::recover((*image_of(240, 160)).clone(), Cancel::NEVER).unwrap();
+        let weak_first = Arc::downgrade(&first);
+        let weak_ai = Arc::downgrade(ai.image());
+        let mut recipe = Recipe::default();
+        recipe.ai_denoise.enabled = true;
+        recipe.ai_denoise.amount = 0.5;
+        // Render Fit and 100% region (which populates fit, zoomed and whole_shown).
+        run_at(
+            &worker,
+            &rx,
+            Pane::After,
+            1,
+            &first,
+            &recipe,
+            None,
+            60,
+            Some(ai.clone()),
+        );
+        run_at(
+            &worker,
+            &rx,
+            Pane::After,
+            2,
+            &first,
+            &recipe,
+            Some([10, 10, 80, 60]),
+            60,
+            Some(ai.clone()),
+        );
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap() {
+                Event::Histogram { id: 2, .. } => break,
+                Event::Failed { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+        drop(first);
+        drop(ai);
+        // Run on `Pane::Before` so job 2 finishes returning (dropping its `RenderJob`)
+        // and `PreviewRenderer::ai` clears while `Pane::After`'s cached slots keep theirs.
+        let second = image();
+        run_at(
+            &worker,
+            &rx,
+            Pane::Before,
+            3,
+            &second,
+            &Recipe::default(),
+            None,
+            60,
+            None,
+        );
+        assert_eq!(weak_first.strong_count(), 0);
+        assert_eq!(weak_ai.strong_count(), 0);
     }
 }

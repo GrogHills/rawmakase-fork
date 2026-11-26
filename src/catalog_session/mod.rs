@@ -62,6 +62,8 @@ pub(crate) struct CatalogSession {
     catalog: Catalog,
     /// The catalog's photos, without macOS "._" metadata files.
     photos: Vec<Photo>,
+    /// Position of each photo in `photos` by [`Photo::id`].
+    photo_index: HashMap<PhotoId, usize>,
     /// Folders, each counting the photos in `photos` it holds.
     folders: Vec<Folder>,
     collections: Vec<Collection>,
@@ -208,6 +210,35 @@ impl CatalogSession {
         self.photos.sort_by(|a, b| {
             (&a.captured, &a.filename, a.id).cmp(&(&b.captured, &b.filename, b.id))
         });
+        self.rebuild_photo_index();
+    }
+    pub(crate) fn rebuild_photo_index(&mut self) {
+        self.photo_index.clear();
+        self.photo_index.reserve(self.photos.len());
+        for (i, photo) in self.photos.iter().enumerate() {
+            self.photo_index.insert(photo.id, i);
+        }
+    }
+    fn photo_position(&self, id: PhotoId) -> Option<usize> {
+        if let Some(&i) = self.photo_index.get(&id)
+            && self.photos.get(i).is_some_and(|p| p.id == id)
+        {
+            return Some(i);
+        }
+        #[cfg(test)]
+        if self.photo_index.len() != self.photos.len() || self.photo_index.contains_key(&id) {
+            return self.photos.iter().position(|p| p.id == id);
+        }
+        None
+    }
+    /// The listed photo `id`, if it is in the session.
+    pub(crate) fn photo(&self, id: PhotoId) -> Option<&Photo> {
+        let i = self.photo_position(id)?;
+        Some(&self.photos[i])
+    }
+    pub(crate) fn photo_mut(&mut self, id: PhotoId) -> Option<&mut Photo> {
+        let i = self.photo_position(id)?;
+        Some(&mut self.photos[i])
     }
     /// Forgets the photos, folders, roots, collection members and Previous
     /// Import when the catalog could not be read again after a change made
@@ -216,6 +247,7 @@ impl CatalogSession {
     /// stay as listed; the failed read started a new generation already.
     pub(crate) fn forget_lists(&mut self) {
         self.photos.clear();
+        self.photo_index.clear();
         self.folders.clear();
         self.roots.clear();
         self.collection_photos.clear();
@@ -252,6 +284,7 @@ impl CatalogSession {
         let mut session = Self {
             catalog,
             photos: Vec::new(),
+            photo_index: HashMap::new(),
             folders: Vec::new(),
             collections: Vec::new(),
             collection_photos: HashMap::new(),
@@ -289,7 +322,7 @@ impl CatalogSession {
     pub(crate) fn set_ratings(&mut self, values: &[(PhotoId, i32, i32, String)]) -> Result<()> {
         self.catalog.set_metadata_of(values)?;
         for (id, rating, flag, label) in values {
-            if let Some(p) = self.photos.iter_mut().find(|p| p.id == *id) {
+            if let Some(p) = self.photo_mut(*id) {
                 p.rating = *rating;
                 p.flag = *flag;
                 p.label = label.clone();
@@ -309,31 +342,28 @@ impl CatalogSession {
             .filter(|p| wanted.contains(&p.id))
             .map(|p| (p.id, p))
             .collect();
-        for p in &mut self.photos {
-            if let Some(f) = fresh.get(&p.id) {
+        for (id, f) in fresh {
+            if let Some(p) = self.photo_mut(id) {
                 p.rating = f.rating;
                 p.flag = f.flag;
-                p.label = f.label.clone();
-                p.captured = f.captured.clone();
+                p.label = f.label;
+                p.captured = f.captured;
             }
         }
         self.refresh_keywords(ids)
     }
     /// Reads the keywords of `ids` again from the catalog into `photos`.
     pub(crate) fn refresh_keywords(&mut self, ids: &[PhotoId]) -> Result<()> {
-        let mut names = HashMap::new();
-        for id in ids {
-            let keywords: Vec<String> = self
-                .catalog
-                .keywords(*id)?
-                .into_iter()
-                .map(|k| k.name)
-                .collect();
-            names.insert(*id, keywords.join(", "));
-        }
-        for p in &mut self.photos {
-            if let Some(n) = names.remove(&p.id) {
-                p.keywords = n;
+        let by_photo = self.catalog.keywords_for_photos(ids)?;
+        for (id, keywords) in by_photo {
+            if let Some(p) = self.photo_mut(id) {
+                p.keywords.clear();
+                for (i, kw) in keywords.into_iter().enumerate() {
+                    if i > 0 {
+                        p.keywords.push_str(", ");
+                    }
+                    p.keywords.push_str(&kw.name);
+                }
             }
         }
         Ok(())
@@ -386,6 +416,7 @@ impl CatalogSession {
         let overrides = self.catalog.overrides()?;
         let previous_import = self.catalog.previous_import()?.into_iter().collect();
         self.photos = photos;
+        self.rebuild_photo_index();
         self.previous_import = previous_import;
         self.folders = folders;
         self.collections = collections;

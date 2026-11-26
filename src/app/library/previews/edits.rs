@@ -376,13 +376,16 @@ impl Renders {
     /// as its preview under `tag`; a file changed since gets none of it, and
     /// that is not a cache failure.
     fn store(&self, path: &Path, tag: &str, stamp: &Stamp, image: &image::RgbImage) {
+        if Stamp::read(path).ok().as_ref() != Some(stamp) {
+            return;
+        }
         let stored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match &mut *cache(&self.cache) {
-                Some(cache) if Stamp::read(path).ok().as_ref() == Some(stamp) => cache
+                Some(cache) => cache
                     .store_tagged(path, tag, stamp, image)
                     .err()
                     .map(|error| error.to_string()),
-                _ => None,
+                None => None,
             }
         }));
         match stored {
@@ -450,7 +453,20 @@ impl Renders {
     /// to keep it in (rendered when shown).
     fn start(&self, index: usize) {
         let shared = &self.results.shared;
-        let no_cache = cache(&self.cache).is_none();
+        let check_cache = {
+            let state = shared.lock();
+            if state.closed {
+                return;
+            }
+            matches!(
+                &state.jobs[index].job,
+                EditJob::Render { id, ahead: true, .. }
+                    if !state.jobs[index].dropped
+                        && state.pace != Pace::Background
+                        && !shown(&self.wanted, *id)
+            )
+        };
+        let no_cache = check_cache && cache(&self.cache).is_none();
         let mut state = shared.lock();
         // Closed since it was looked up: nothing is rendered, nor answered.
         if state.closed {

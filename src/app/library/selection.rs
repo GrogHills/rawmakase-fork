@@ -12,6 +12,60 @@ pub(super) struct Selection {
     pub selected: HashSet<PhotoId>,
     pub anchor: Option<PhotoId>,
 }
+
+/// [`Selection`] paired with a monotonic version bumped on every change so
+/// callers can check for changes in O(1) without cloning `HashSet`s.
+#[derive(Debug)]
+pub(super) struct TrackedSelection {
+    inner: Selection,
+    version: u64,
+}
+impl Default for TrackedSelection {
+    fn default() -> Self {
+        Self {
+            inner: Selection::default(),
+            version: 1,
+        }
+    }
+}
+impl std::ops::Deref for TrackedSelection {
+    type Target = Selection;
+    fn deref(&self) -> &Selection {
+        &self.inner
+    }
+}
+impl TrackedSelection {
+    pub(super) fn version(&self) -> u64 {
+        self.version
+    }
+    pub(super) fn snapshot(&self) -> Selection {
+        self.inner.clone()
+    }
+    pub(super) fn replace(&mut self, next: Selection) {
+        if self.inner != next {
+            self.inner = next;
+            self.version += 1;
+        }
+    }
+    pub(super) fn mutate(&mut self, f: impl FnOnce(&mut Selection)) {
+        f(&mut self.inner);
+        self.version += 1;
+    }
+    pub(super) fn mutate_if_changed(&mut self, f: impl FnOnce(&mut Selection) -> bool) {
+        if f(&mut self.inner) {
+            self.version += 1;
+        }
+    }
+    pub(super) fn forget_photo(&mut self, id: PhotoId) {
+        if self.inner.selected.contains(&id)
+            || self.inner.active == Some(id)
+            || self.inner.anchor == Some(id)
+        {
+            self.inner.forget_photo(id);
+            self.version += 1;
+        }
+    }
+}
 impl Selection {
     /// Without photo `id`, which is gone. A selection left with other photos keeps
     /// one of them active (and the anchor), as it is always selected.
@@ -48,17 +102,30 @@ pub(super) enum Step {
 }
 
 impl Library {
+    /// Monotonic version of the current selection.
+    pub(super) fn selection_version(&self) -> u64 {
+        self.selection.version()
+    }
     /// The active photo.
     pub(crate) fn selected(&self) -> Option<PhotoId> {
         self.selection.active
     }
     /// Selects only `id`, or nothing.
     pub(crate) fn select(&mut self, id: Option<PhotoId>) {
-        self.selection = Selection {
-            active: id,
-            selected: id.into_iter().collect(),
-            anchor: id,
-        };
+        let same = self.selection.active == id
+            && self.selection.anchor == id
+            && self.selection.selected.len() == usize::from(id.is_some())
+            && id.is_none_or(|id| self.selection.selected.contains(&id));
+        if !same {
+            self.selection.mutate(|s| {
+                s.active = id;
+                s.selected.clear();
+                if let Some(id) = id {
+                    s.selected.insert(id);
+                }
+                s.anchor = id;
+            });
+        }
     }
     /// Makes `id` active and in view: kept in the selection when it is shown,
     /// else selected alone with the filters that hide it cleared.
@@ -76,8 +143,12 @@ impl Library {
     /// Makes `id` active, keeping the selection when it is part of it.
     pub(crate) fn make_active(&mut self, id: PhotoId) {
         if self.selection.selected.contains(&id) {
-            self.selection.active = Some(id);
-            self.selection.anchor = Some(id);
+            if self.selection.active != Some(id) || self.selection.anchor != Some(id) {
+                self.selection.mutate(|s| {
+                    s.active = Some(id);
+                    s.anchor = Some(id);
+                });
+            }
         } else {
             self.select(Some(id));
         }
@@ -130,24 +201,37 @@ impl Library {
             && let Some(anchor) = anchor
         {
             let range = self.range(anchor, id);
-            if !modifiers.command {
-                self.selection.selected.clear();
-            }
-            self.selection.selected.extend(range);
-            self.selection.active = Some(id);
+            self.selection.mutate(|s| {
+                if !modifiers.command {
+                    s.selected.clear();
+                }
+                s.selected.extend(range);
+                s.active = Some(id);
+            });
         } else if modifiers.command {
-            if self.selection.selected.remove(&id) {
+            let next_active = if self.selection.selected.contains(&id) {
                 if self.selection.active == Some(id) {
-                    self.selection.active = self.nearest_selected(id);
+                    self.nearest_selected(id)
+                } else {
+                    self.selection.active
                 }
             } else {
-                self.selection.selected.insert(id);
-                self.selection.active = Some(id);
-            }
-            self.selection.anchor = self.selection.active;
+                Some(id)
+            };
+            self.selection.mutate(|s| {
+                if !s.selected.remove(&id) {
+                    s.selected.insert(id);
+                }
+                s.active = next_active;
+                s.anchor = next_active;
+            });
         } else if self.selection.selected.contains(&id) && self.selection.selected.len() > 1 {
-            self.selection.active = Some(id);
-            self.selection.anchor = Some(id);
+            if self.selection.active != Some(id) || self.selection.anchor != Some(id) {
+                self.selection.mutate(|s| {
+                    s.active = Some(id);
+                    s.anchor = Some(id);
+                });
+            }
         } else {
             self.select(Some(id));
         }
@@ -167,24 +251,33 @@ impl Library {
             .map(|i| self.session.photos()[*i].id)
     }
     pub(in crate::app) fn select_all(&mut self) {
-        self.selection.selected = self
+        let next_selected: HashSet<PhotoId> = self
             .visible
             .iter()
             .map(|i| self.session.photos()[*i].id)
             .collect();
-        if self.selection.active.is_none() {
-            self.selection.active = self.visible.first().map(|i| self.session.photos()[*i].id);
-        }
-        self.selection.anchor = self.selection.active;
+        let first = self.visible.first().map(|i| self.session.photos()[*i].id);
+        self.selection.mutate_if_changed(|s| {
+            let active = s.active.or(first);
+            let changed = s.selected != next_selected || s.active != active || s.anchor != active;
+            if changed {
+                s.selected = next_selected;
+                s.active = active;
+                s.anchor = active;
+            }
+            changed
+        });
     }
     /// Lightroom's `/`: deselects the active photo; the next selected one
     /// becomes active.
     pub(super) fn deselect_active(&mut self) {
         if let Some(id) = self.selection.active {
             let next = self.nearest_selected(id);
-            self.selection.selected.remove(&id);
-            self.selection.active = next;
-            self.selection.anchor = next;
+            self.selection.mutate(|s| {
+                s.selected.remove(&id);
+                s.active = next;
+                s.anchor = next;
+            });
         }
     }
     /// Moves the active photo; with `extend` (Shift) the selection grows from
@@ -215,9 +308,13 @@ impl Library {
             self.loupe_direction = if delta < 0 { -1 } else { 1 };
         }
         if extend && let Some(anchor) = self.selection.anchor.or(self.selection.active) {
-            self.selection.selected = self.range(anchor, id).into_iter().collect();
-            self.selection.anchor = Some(anchor);
-            self.selection.active = Some(id);
+            let range = self.range(anchor, id);
+            self.selection.mutate(|s| {
+                s.selected.clear();
+                s.selected.extend(range);
+                s.anchor = Some(anchor);
+                s.active = Some(id);
+            });
         } else {
             self.select(Some(id));
         }
@@ -225,22 +322,36 @@ impl Library {
     }
     /// After filtering: drops photos no longer shown from the selection.
     pub(super) fn keep_shown_selected(&mut self) {
+        if self.selection.selected.is_empty()
+            && self.selection.active.is_none()
+            && self.selection.anchor.is_none()
+        {
+            return;
+        }
         let shown: HashSet<PhotoId> = self
             .visible
             .iter()
             .map(|i| self.session.photos()[*i].id)
             .collect();
-        self.selection.selected.retain(|id| shown.contains(id));
-        // The first photo still selected takes over from a hidden active one.
-        if self.selection.active.is_some_and(|id| !shown.contains(&id)) {
-            self.selection.active = self
-                .visible
-                .iter()
-                .map(|i| self.session.photos()[*i].id)
-                .find(|id| self.selection.selected.contains(id));
-        }
-        if self.selection.anchor.is_some_and(|id| !shown.contains(&id)) {
-            self.selection.anchor = self.selection.active;
+        let any_hidden_selected = self.selection.selected.iter().any(|id| !shown.contains(id));
+        let active_hidden = self.selection.active.is_some_and(|id| !shown.contains(&id));
+        let anchor_hidden = self.selection.anchor.is_some_and(|id| !shown.contains(&id));
+        if any_hidden_selected || active_hidden || anchor_hidden {
+            let visible = &self.visible;
+            let photos = self.session.photos();
+            self.selection.mutate(|s| {
+                s.selected.retain(|id| shown.contains(id));
+                // The first photo still selected takes over from a hidden active one.
+                if s.active.is_some_and(|id| !shown.contains(&id)) {
+                    s.active = visible
+                        .iter()
+                        .map(|i| photos[*i].id)
+                        .find(|id| s.selected.contains(id));
+                }
+                if s.anchor.is_some_and(|id| !shown.contains(&id)) {
+                    s.anchor = s.active;
+                }
+            });
         }
     }
     /// The Grid's selection keys: Cmd+A, Cmd+D, `/`, arrows, Page Up and Page

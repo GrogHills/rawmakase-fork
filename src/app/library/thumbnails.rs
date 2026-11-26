@@ -1,18 +1,17 @@
-use crate::catalog::Photo;
 use anyhow::Result;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
-pub(super) fn available_paths(photos: &[Photo]) -> HashSet<PathBuf> {
+pub(super) fn available_paths(paths: &[PathBuf]) -> HashSet<PathBuf> {
     use rayon::prelude::*;
     let mut directories: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-    for photo in photos {
-        if let Some(parent) = photo.path.parent() {
+    for path in paths {
+        if let Some(parent) = path.parent() {
             directories
                 .entry(parent.into())
                 .or_default()
-                .insert(photo.path.clone());
+                .insert(path.clone());
         }
     }
     directories

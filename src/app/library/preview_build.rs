@@ -25,7 +25,7 @@ use anyhow::{Context, ensure};
 use eframe::egui::{self, Color32, Sense, Vec2};
 use rawmakase_cancel::Cancel;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
     sync::{
@@ -294,10 +294,59 @@ enum Op {
     Refresh(Vec<Item>),
 }
 
+/// FIFO queue indexed by `K` so deduped enqueue and membership checks are O(1)
+/// while keeping queue order when a waiting entry is replaced.
+struct WaitingQueue<K, V> {
+    order: VecDeque<K>,
+    items: HashMap<K, V>,
+}
+
+impl<K, V> Default for WaitingQueue<K, V> {
+    fn default() -> Self {
+        Self {
+            order: VecDeque::new(),
+            items: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Copy + Eq + Hash, V> WaitingQueue<K, V> {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+    fn clear(&mut self) {
+        self.order.clear();
+        self.items.clear();
+    }
+    fn contains(&self, key: &K) -> bool {
+        self.items.contains_key(key)
+    }
+    /// Replaces a waiting entry in place or appends a new one; returns `true`
+    /// when a new entry was added.
+    fn enqueue(&mut self, key: K, value: V) -> bool {
+        if let Some(existing) = self.items.get_mut(&key) {
+            *existing = value;
+            false
+        } else {
+            self.items.insert(key, value);
+            self.order.push_back(key);
+            true
+        }
+    }
+    fn pop_front(&mut self) -> Option<V> {
+        let key = self.order.pop_front()?;
+        self.items.remove(&key)
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        self.items.retain(|k, v| keep(k, v));
+        self.order.retain(|k| self.items.contains_key(k));
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// One entry per photo and kind, holding the latest request.
-    waiting: VecDeque<Item>,
+    waiting: WaitingQueue<(PhotoId, PreviewKind), Item>,
     running: Option<(PhotoId, PreviewKind)>,
     /// The flag the running build stops on; replaced when it is set.
     cancel: Arc<AtomicBool>,
@@ -447,19 +496,25 @@ impl Builder {
     /// Drops the builds not started of `photos` (all of them when `None`), of
     /// `kinds`.
     fn drop_waiting(&self, photos: Option<&[PhotoId]>, kinds: &[PreviewKind]) {
+        let photo_set: Option<HashSet<PhotoId>> = photos
+            .filter(|p| p.len() > 16)
+            .map(|p| p.iter().copied().collect());
+        let matches_photo = |photo: PhotoId| match (&photo_set, photos) {
+            (Some(set), _) => set.contains(&photo),
+            (None, Some(slice)) => slice.contains(&photo),
+            (None, None) => true,
+        };
         let mut state = self.shared.state.lock().expect("preview builds");
         let before = state.waiting.len();
-        state.waiting.retain(|item| {
-            !(kinds.contains(&item.kind) && photos.is_none_or(|p| p.contains(&item.photo)))
-        });
+        state
+            .waiting
+            .retain(|(photo, kind), _| !(kinds.contains(kind) && matches_photo(*photo)));
         let dropped = before - state.waiting.len();
         state.progress.total -= dropped;
         state.generation += 1;
         for op in &mut state.ops {
             if let Op::Refresh(items) = op {
-                items.retain(|item| {
-                    !(kinds.contains(&item.kind) && photos.is_none_or(|p| p.contains(&item.photo)))
-                });
+                items.retain(|item| !(kinds.contains(&item.kind) && matches_photo(item.photo)));
             }
         }
     }
@@ -516,16 +571,8 @@ impl State {
         }
         let mut added = 0;
         for item in items {
-            let waiting = self
-                .waiting
-                .iter_mut()
-                .find(|w| w.photo == item.photo && w.kind == item.kind);
-            match waiting {
-                Some(waiting) => *waiting = item,
-                None => {
-                    self.waiting.push_back(item);
-                    added += 1;
-                }
+            if self.waiting.enqueue((item.photo, item.kind), item) {
+                added += 1;
             }
         }
         self.progress.total += added;
@@ -533,11 +580,7 @@ impl State {
     }
     /// Whether a build of the photo is waiting or running.
     fn pending(&self, photo: PhotoId, kind: PreviewKind) -> bool {
-        self.running == Some((photo, kind))
-            || self
-                .waiting
-                .iter()
-                .any(|item| item.photo == photo && item.kind == kind)
+        self.running == Some((photo, kind)) || self.waiting.contains(&(photo, kind))
     }
 }
 

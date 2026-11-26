@@ -129,16 +129,16 @@ impl Filters {
         keys: &super::sort::Keys,
     ) -> Vec<usize> {
         let query = self.query.to_lowercase();
-        let mut visible: Vec<usize> = photos
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                self.source_holds(p, &available)
-                    && (!self.only_editable_previews || editable_preview(p.id))
-                    && (!self.enabled || self.bar_shows(p, &query))
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let mut scratch = String::new();
+        let mut visible: Vec<usize> = Vec::new();
+        for (i, p) in photos.iter().enumerate() {
+            if self.source_holds(p, &available)
+                && (!self.only_editable_previews || editable_preview(p.id))
+                && (!self.enabled || self.bar_shows(p, &query, &mut scratch))
+            {
+                visible.push(i);
+            }
+        }
         self.sort.sort(photos, &mut visible, keys, self.reverse);
         if self.shows_stacks() {
             visible = stacked(photos, visible);
@@ -163,7 +163,7 @@ impl Filters {
             && (!self.only_missing || !available(&p.path))
     }
     /// Whether the filter bar lets `p` through; `query` is in lower case.
-    fn bar_shows(&self, p: &Photo, query: &str) -> bool {
+    fn bar_shows(&self, p: &Photo, query: &str, scratch: &mut String) -> bool {
         (self.flags.is_empty() || self.flags.contains(&p.flag))
             && self
                 .rating
@@ -174,13 +174,7 @@ impl Filters {
                 Kind::Masters => p.master.is_none(),
                 Kind::Copies => p.master.is_some(),
             }
-            && (query.is_empty()
-                || format!(
-                    "{} {} {} {} {}",
-                    p.filename, p.copy_name, p.keywords, p.captured, p.label
-                )
-                .to_lowercase()
-                .contains(query))
+            && (query.is_empty() || matches_query(p, query, scratch))
     }
     /// Whether anything is set in the bar, applied or not.
     pub(super) fn bar_set(&self) -> bool {
@@ -200,6 +194,29 @@ impl Filters {
         self.kind = Kind::All;
         self.enabled = true;
     }
+}
+
+/// Whether any searchable field of `p` contains `query` (which is already lowercased),
+/// reusing `scratch` across photos to avoid per-photo allocations.
+fn matches_query(p: &Photo, query: &str, scratch: &mut String) -> bool {
+    scratch.clear();
+    let push_lower = |out: &mut String, field: &str| {
+        for c in field.chars() {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    };
+    push_lower(scratch, &p.filename);
+    scratch.push(' ');
+    push_lower(scratch, &p.copy_name);
+    scratch.push(' ');
+    push_lower(scratch, &p.keywords);
+    scratch.push(' ');
+    push_lower(scratch, &p.captured);
+    scratch.push(' ');
+    push_lower(scratch, &p.label);
+    scratch.contains(query)
 }
 
 /// `visible`, filtered and sorted, with each stack's photos together in
