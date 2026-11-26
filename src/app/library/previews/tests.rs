@@ -812,10 +812,16 @@ fn ai_denoise_renders_limit_concurrency_without_deadlocking_rayon_pool() -> anyh
     for _ in 0..4 {
         match rx.recv_timeout(Duration::from_secs(20))? {
             EditResult::Ready(..) => completed += 1,
-            other => panic!(
-                "unexpected result: {:?}",
-                matches!(other, EditResult::Failed(..))
-            ),
+            other => {
+                let kind = match other {
+                    EditResult::Ready(..) => "Ready",
+                    EditResult::Kept(..) => "Kept",
+                    EditResult::Skipped(..) => "Skipped",
+                    EditResult::Failed(..) => "Failed",
+                    EditResult::CacheError(error) => panic!("unexpected CacheError: {error}"),
+                };
+                panic!("unexpected result: {kind}");
+            }
         }
     }
     assert_eq!(completed, 4);

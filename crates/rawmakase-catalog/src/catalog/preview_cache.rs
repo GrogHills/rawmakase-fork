@@ -561,32 +561,28 @@ impl PreviewCache {
                 "SELECT COALESCE(sum(length(jpeg)),0) FROM sized_previews WHERE kind=?1",
             )?
             .query_row([kind.code()], |r| r.get(0))?;
-        if total <= budget {
-            return Ok(());
-        }
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows: Vec<(i64, i64)> = {
-            let mut stmt = tx.prepare_cached(
-                "SELECT rowid, length(jpeg) FROM sized_previews WHERE kind=?1 ORDER BY last_used ASC, source_path ASC",
-            )?;
-            stmt.query_map([kind.code()], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        let to_delete = evict_prefix(rows, budget);
-        let deleted = !to_delete.is_empty();
-        if deleted {
-            let mut del =
-                tx.prepare_cached("DELETE FROM sized_previews WHERE rowid=?1 AND kind=?2")?;
-            for rowid in to_delete {
-                del.execute(params![rowid, kind.code()])?;
+        if total > budget {
+            let tx = self
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let rows: Vec<(i64, i64)> = {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT rowid, length(jpeg) FROM sized_previews WHERE kind=?1 ORDER BY last_used ASC, source_path ASC",
+                )?;
+                stmt.query_map([kind.code()], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            let to_delete = evict_prefix(rows, budget);
+            if !to_delete.is_empty() {
+                let mut del =
+                    tx.prepare_cached("DELETE FROM sized_previews WHERE rowid=?1 AND kind=?2")?;
+                for rowid in to_delete {
+                    del.execute(params![rowid, kind.code()])?;
+                }
             }
+            tx.commit()?;
         }
-        tx.commit()?;
-        if deleted {
-            self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
-        }
+        self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
         Ok(())
     }
     fn prune(&mut self, budget: i64) -> Result<()> {
@@ -594,31 +590,27 @@ impl PreviewCache {
             .db
             .prepare_cached("SELECT COALESCE(sum(length(jpeg)),0) FROM previews")?
             .query_row([], |r| r.get(0))?;
-        if total <= budget {
-            return Ok(());
-        }
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows: Vec<(i64, i64)> = {
-            let mut stmt = tx.prepare_cached(
-                "SELECT rowid, length(jpeg) FROM previews ORDER BY last_used ASC, source_path ASC",
-            )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        let to_delete = evict_prefix(rows, budget);
-        let deleted = !to_delete.is_empty();
-        if deleted {
-            let mut del = tx.prepare_cached("DELETE FROM previews WHERE rowid=?")?;
-            for rowid in to_delete {
-                del.execute([rowid])?;
+        if total > budget {
+            let tx = self
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let rows: Vec<(i64, i64)> = {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT rowid, length(jpeg) FROM previews ORDER BY last_used ASC, source_path ASC",
+                )?;
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            let to_delete = evict_prefix(rows, budget);
+            if !to_delete.is_empty() {
+                let mut del = tx.prepare_cached("DELETE FROM previews WHERE rowid=?")?;
+                for rowid in to_delete {
+                    del.execute([rowid])?;
+                }
             }
+            tx.commit()?;
         }
-        tx.commit()?;
-        if deleted {
-            self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
-        }
+        self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
         Ok(())
     }
 }
@@ -1193,6 +1185,54 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(remaining_one_to_one, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn under_budget_prune_reclaims_freelist_pages() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let mut cache = PreviewCache::open(&d.path().join("previews.sqlite3"))?;
+        cache.db.execute(
+            "INSERT INTO previews VALUES('big',1,'1','',?1,32,16,zeroblob(200000),1)",
+            [GENERATION],
+        )?;
+        cache
+            .db
+            .execute("DELETE FROM previews WHERE source_path='big'", [])?;
+        let freelist: i64 = cache
+            .db
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        assert!(freelist > 0);
+        // `execute_batch` steps `PRAGMA incremental_vacuum(256)` once per call, so an
+        // under-budget prune strictly reduces `freelist_count` rather than skipping it.
+        cache.prune(LIMIT)?;
+        let after_thumb: i64 = cache
+            .db
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        assert!(
+            after_thumb < freelist,
+            "expected under-budget prune to shrink freelist ({after_thumb} < {freelist})"
+        );
+
+        cache.db.execute(
+            "INSERT INTO sized_previews VALUES('big','id',?1,1,'1',?2,2048,32,16,zeroblob(200000),1)",
+            params![PreviewKind::Standard.code(), SIZED_GENERATION],
+        )?;
+        cache
+            .db
+            .execute("DELETE FROM sized_previews WHERE source_path='big'", [])?;
+        let freelist: i64 = cache
+            .db
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        assert!(freelist > 0);
+        cache.prune_sized(PreviewKind::Standard, PreviewKind::Standard.budget())?;
+        let after_sized: i64 = cache
+            .db
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        assert!(
+            after_sized < freelist,
+            "expected under-budget prune_sized to shrink freelist ({after_sized} < {freelist})"
+        );
         Ok(())
     }
 }

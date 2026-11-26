@@ -498,16 +498,20 @@ impl Matching<'_> {
             let Some(path) = self.inputs.path_of(id) else {
                 continue;
             };
-            match FileChecksum::read_quick(&path, |_| self.go_on())? {
-                ChecksumRead::Done(quick) => {
+            match FileChecksum::read_quick(&path, |_| self.go_on()) {
+                Ok(ChecksumRead::Done(quick)) => {
                     self.extra_by_quick
                         .entry((quick.size, quick.quick.clone()))
                         .or_default()
                         .push(id);
                     self.extra_checksums.insert(id, quick);
                 }
-                ChecksumRead::Changed => {}
-                ChecksumRead::Cancelled => bail!("Synchronization stopped"),
+                Ok(ChecksumRead::Changed) | Err(_) => {
+                    if !self.go_on() {
+                        bail!("Synchronization stopped");
+                    }
+                }
+                Ok(ChecksumRead::Cancelled) => bail!("Synchronization stopped"),
             }
         }
         Ok(())

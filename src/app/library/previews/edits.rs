@@ -105,11 +105,24 @@ struct State {
 }
 struct Queued {
     job: EditJob,
+    /// Whether this job's edit enables AI Denoise (computed outside `State`'s lock).
+    renders_ai: bool,
     /// The cache had no preview for it when asked; it waits for a render.
     missed: bool,
     /// Asked ahead for a list no longer shown: answered without a render
     /// unless its photo is shown.
     dropped: bool,
+}
+impl Queued {
+    fn new(job: EditJob) -> Self {
+        let renders_ai = matches!(&job, EditJob::Render { source, .. } if source.renders_ai());
+        Self {
+            job,
+            renders_ai,
+            missed: false,
+            dropped: false,
+        }
+    }
 }
 const MAX_CONCURRENT_AI_RENDERS: usize = 2;
 
@@ -148,15 +161,12 @@ impl std::fmt::Display for Closed {
 impl std::error::Error for Closed {}
 impl EditQueue {
     pub(in crate::app::library) fn send(&self, job: EditJob) -> Result<(), Closed> {
+        let queued = Queued::new(job);
         let mut state = self.0.lock();
         if state.closed {
             return Err(Closed);
         }
-        state.jobs.push(Queued {
-            job,
-            missed: false,
-            dropped: false,
-        });
+        state.jobs.push(queued);
         self.0.changed.notify_all();
         Ok(())
     }
@@ -477,6 +487,7 @@ impl Renders {
             return;
         }
         let queued = state.jobs.remove(index);
+        let renders_ai = queued.renders_ai;
         let EditJob::Render {
             id,
             ticket,
@@ -501,7 +512,7 @@ impl Renders {
         }
         let full = state.pace == Pace::Full;
         let ai = state.ai.clone();
-        let ai_render = source.renders_ai() && ai.is_some();
+        let ai_render = renders_ai && ai.is_some();
         let slot = state.next_slot;
         state.next_slot += 1;
         let cancel = Arc::<AtomicBool>::default();
@@ -663,12 +674,8 @@ fn next_step(shared: &Shared, wanted: &Wanted, full_renders: usize) -> Step {
         // Full-size AI decodes stay bounded in the scheduler so pool threads never
         // wait on a gate while nested Rayon work may be running inside the pool.
         let ai_running = state.running.iter().filter(|r| r.ai).count();
-        let ai_allowed = |q: &Queued| match &q.job {
-            EditJob::Render { source, .. } => {
-                !(source.renders_ai() && state.ai.is_some())
-                    || ai_running < MAX_CONCURRENT_AI_RENDERS
-            }
-            EditJob::Store { .. } => true,
+        let ai_allowed = |q: &Queued| {
+            ai_running < MAX_CONCURRENT_AI_RENDERS || !(q.renders_ai && state.ai.is_some())
         };
         // Photos shown, the latest first: from the cache whether or not a
         // render could start, rendered when one can.

@@ -234,10 +234,10 @@ pub fn convert_develop(
     // Spots and masks convert on their own and report what they skip.
     let local_settings = std::mem::take(&mut preset.local);
     let base = Recipe::with_profiles(m, profiles);
-    let fast_path = !preset
-        .settings
-        .get("HasCrop")
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"));
+    let fast_path = !matches!(
+        crate::xmp::boolean(&preset.settings, "HasCrop"),
+        Ok(Some(false))
+    );
     let (mut recipe, substitute) = match fast_path
         .then(|| preset.apply(&base, m, profiles, image))
         .and_then(Result::ok)

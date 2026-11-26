@@ -937,4 +937,36 @@ mod scenarios {
         assert!(plan.default_accepted().additions.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn unreadable_catalog_photo_in_size_bucket_does_not_mark_new_file_not_checked() -> Result<()> {
+        let f = fixture()?;
+        f.cat
+            .db_for_tests()
+            .execute_batch("DELETE FROM photo_checksums")?;
+        let id_1002 = f.id("IMG_1002.dng");
+        let removed_photo = f.root.join("Lisbon/IMG_1001.dng");
+        let copy = f.root.join("Lisbon/IMG_9998.dng");
+        let novel = f.root.join("Lisbon/IMG_9999.dng");
+        std::fs::write(&copy, bytes(2))?;
+        std::fs::write(&novel, bytes(4))?;
+        let inputs = f.cat.sync_inputs(SyncScope::All)?;
+        let removed = std::cell::Cell::new(false);
+        let plan = scan(&inputs, &|_| true, Cancel::NEVER, &|_| {
+            if !removed.replace(true) {
+                std::fs::remove_file(&removed_photo).unwrap();
+            }
+        })?;
+        assert!(
+            plan.not_checked.is_empty(),
+            "expected no not_checked files, got {}",
+            plan.not_checked.len()
+        );
+        assert_eq!(plan.additions.len(), 2);
+        assert_eq!(plan.additions[0].file, copy);
+        assert_eq!(plan.additions[0].copy_of, [id_1002]);
+        assert_eq!(plan.additions[1].file, novel);
+        assert!(plan.additions[1].copy_of.is_empty());
+        Ok(())
+    }
 }

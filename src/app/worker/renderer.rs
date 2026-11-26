@@ -573,10 +573,13 @@ fn render(
                     // Zooming in goes straight to the full region, over the enlarged Fit.
                     // So does a change of AI Denoise: its reduced preview would need the
                     // same full-size blend as the region, adding only a blurry frame.
-                    let ai_changed = zoomed.as_ref().is_some_and(|s| {
-                        !same_ai(&s.ai, &job.ai) || s.recipe.ai_denoise != job.recipe.ai_denoise
-                    });
-                    if *showing_region && !*quick_region && !ai_changed {
+                    let editing = *showing_region
+                        && zoomed.as_ref().is_some_and(|s| {
+                            s.image.matches(&job.image)
+                                && same_ai(&s.ai, &job.ai)
+                                && s.recipe.ai_denoise == job.recipe.ai_denoise
+                        });
+                    if editing && !*quick_region {
                         let out = processor.render_region_preview_to(
                             &job.image,
                             &job.recipe,
@@ -1160,5 +1163,61 @@ mod tests {
         );
         assert_eq!(weak_first.strong_count(), 0);
         assert_eq!(weak_ai.strong_count(), 0);
+    }
+    #[test]
+    fn replacing_the_image_at_100_percent_renders_region_without_draft() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = renderer(tx, egui::Context::default());
+        let first = image();
+        let ai = develop::AiSource::recover((*image_of(240, 160)).clone(), Cancel::NEVER).unwrap();
+        let mut ai_recipe = Recipe::default();
+        ai_recipe.ai_denoise.enabled = true;
+        ai_recipe.ai_denoise.amount = 0.5;
+        let region = Some([10, 10, 80, 60]);
+        let initial = run_at(
+            &worker,
+            &rx,
+            Pane::After,
+            1,
+            &first,
+            &ai_recipe,
+            region,
+            60,
+            Some(ai),
+        );
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].0, RenderStage::Region);
+
+        let second = image();
+        let mut plain = Recipe::default();
+        let switched = run_at(
+            &worker,
+            &rx,
+            Pane::After,
+            2,
+            &second,
+            &plain,
+            region,
+            60,
+            None,
+        );
+        assert_eq!(switched.len(), 1);
+        assert_eq!(switched[0].0, RenderStage::Region);
+
+        plain.exposure = 0.5;
+        let edited = run_at(
+            &worker,
+            &rx,
+            Pane::After,
+            3,
+            &second,
+            &plain,
+            region,
+            60,
+            None,
+        );
+        assert_eq!(edited.len(), 2);
+        assert_eq!(edited[0].0, RenderStage::Draft);
+        assert_eq!(edited[1].0, RenderStage::Region);
     }
 }

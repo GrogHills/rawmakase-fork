@@ -452,7 +452,7 @@ pub(super) fn current_master(db: &impl Reads, id: PhotoId) -> Result<Option<Mast
     }))
 }
 
-/// Memoizes `list_all(dir)` results per directory within one scan or apply.
+/// Memoizes `list_all(dir)` results per directory within one scan.
 #[derive(Default)]
 pub(super) struct DirCheckCache(HashMap<PathBuf, Result<(), std::sync::Arc<std::io::Error>>>);
 

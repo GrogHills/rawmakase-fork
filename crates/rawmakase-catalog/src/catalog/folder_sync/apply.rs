@@ -103,30 +103,32 @@ impl Catalog {
         // On disk, just before the transaction: the file found is as it
         // was scanned, and the old file still missing by the scan's rules.
         let folders = self.db.snapshot(|s| self.locate_folders(s))?;
-        let state_for = |id: PhotoId, path: &Path| {
-            let anchor = plan
-                .scanned
+        let anchor_of = |id: PhotoId| {
+            plan.scanned
                 .get(&id)
                 .and_then(|(m, _)| folders.get(&m.folder))
-                .and_then(|f| f.anchor.as_deref());
-            state_of(Some(path), anchor, online)
+                .and_then(|f| f.anchor.clone())
+        };
+        let still_missing = |id: PhotoId, path: &Path| {
+            state_of(Some(path), anchor_of(id).as_deref(), online) == FileState::Missing
+        };
+        // A move from an offline location, verified: its old file must still
+        // not be there, offline or missing.
+        let still_absent = |m: &Move| {
+            if !m.offline {
+                return still_missing(m.photo, &m.from);
+            }
+            matches!(
+                state_of(Some(&m.from), anchor_of(m.photo).as_deref(), online),
+                FileState::Missing | FileState::Unavailable
+            )
         };
         let matcher = crate::catalog::ingest::Matcher::new(self)?;
         let mut ready: Vec<&Move> = Vec::new();
         for m in moves {
-            // A move from an offline location, verified: its old file must still
-            // not be there, offline or missing.
-            let still_absent = if !m.offline {
-                state_for(m.photo, &m.from) == FileState::Missing
-            } else {
-                matches!(
-                    state_for(m.photo, &m.from),
-                    FileState::Missing | FileState::Unavailable
-                )
-            };
             if Identity::read(&m.to).ok().as_ref() != Some(&m.identity) {
                 skip(&mut applied, &m.to, "changed since the scan");
-            } else if !still_absent {
+            } else if !still_absent(m) {
                 skip(&mut applied, &m.from, "no longer missing");
             } else if !placed_as(&matcher, m) {
                 skip(
@@ -145,7 +147,7 @@ impl Catalog {
             };
             if open == Some(*id) {
                 skip(&mut applied, &missing.path, "open in Develop");
-            } else if state_for(*id, &missing.path) != FileState::Missing {
+            } else if !still_missing(*id, &missing.path) {
                 skip(&mut applied, &missing.path, "no longer missing");
             } else {
                 removals.push((*id, missing.path.clone()));

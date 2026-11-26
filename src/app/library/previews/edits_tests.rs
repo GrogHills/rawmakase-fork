@@ -36,11 +36,7 @@ static RENDERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 fn photos_asked_ahead_are_not_rendered_once_they_lost_their_reason() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = edited_png(directory.path(), "1.png")?;
-    let queued = |job| Queued {
-        job,
-        missed: false,
-        dropped: false,
-    };
+    let queued = Queued::new;
     // No cache to keep it in: rendered when shown.
     let shared = Arc::<Shared>::default();
     shared.lock().pace = Pace::Full;
@@ -148,11 +144,7 @@ fn a_file_is_rendered_once_at_a_time() {
         .lock()
         .unwrap()
         .extend([PhotoId(1), PhotoId(2), PhotoId(3)]);
-    let queued = |job| Queued {
-        job,
-        missed: false,
-        dropped: false,
-    };
+    let queued = Queued::new;
     let shared = Shared::default();
     {
         let mut state = shared.lock();
@@ -195,11 +187,7 @@ fn photos_shown_go_before_the_ones_asked_ahead() {
     let shared = Shared::default();
     let wanted = Wanted::default();
     wanted.lock().unwrap().extend([PhotoId(2), PhotoId(3)]);
-    let queued = |job| Queued {
-        job,
-        missed: false,
-        dropped: false,
-    };
+    let queued = Queued::new;
     {
         let mut state = shared.lock();
         state.pace = Pace::Full;
@@ -261,4 +249,57 @@ fn photos_shown_go_before_the_ones_asked_ahead() {
         next_step(&shared, &wanted, 2),
         Step::Look(0, false)
     ));
+}
+
+#[test]
+fn ai_renders_are_bounded_by_scheduler_even_with_four_slots() {
+    let directory = tempfile::tempdir().unwrap();
+    let shared = Shared::default();
+    let wanted = Wanted::default();
+    wanted.lock().unwrap().extend([PhotoId(1), PhotoId(2)]);
+    let mut ai_recipe = crate::model::recipe::Recipe::default();
+    ai_recipe.ai_denoise.enabled = true;
+    ai_recipe.ai_denoise.amount = 0.5;
+    let ai_job = EditJob::Render {
+        id: PhotoId(2),
+        ticket: 2,
+        path: directory.path().join("ai.ARW"),
+        source: EditSource::Recipe(serde_json::to_string(&ai_recipe).unwrap()),
+        ahead: false,
+    };
+    {
+        let mut state = shared.lock();
+        state.pace = Pace::Full;
+        state.ai = Some(AiCache::new(directory.path().join("ai"), u64::MAX));
+        for slot in 0..MAX_CONCURRENT_AI_RENDERS {
+            state.running.push(Running {
+                slot: slot as u64,
+                full: true,
+                ai: true,
+                cancel: Arc::default(),
+                path: directory.path().join(format!("busy-{slot}.ARW")),
+            });
+        }
+        state.jobs = vec![
+            Queued::new(render_job(1, &directory.path().join("plain.png"), false)),
+            Queued::new(ai_job),
+        ];
+    }
+    // Latest visible job is AI-enabled, so it looks up in cache without starting a render.
+    assert!(matches!(
+        next_step(&shared, &wanted, 4),
+        Step::Look(1, false)
+    ));
+    shared.lock().jobs[1].missed = true;
+    // The non-AI job still looks up and renders beside the two AI renders.
+    assert!(matches!(
+        next_step(&shared, &wanted, 4),
+        Step::Look(0, true)
+    ));
+    shared.lock().jobs[0].missed = true;
+    assert!(matches!(next_step(&shared, &wanted, 4), Step::Render(0)));
+    // Once the non-AI job leaves and one AI slot frees up, the waiting AI job renders.
+    shared.lock().jobs.remove(0);
+    shared.lock().running.pop();
+    assert!(matches!(next_step(&shared, &wanted, 4), Step::Render(0)));
 }
