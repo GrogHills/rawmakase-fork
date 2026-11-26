@@ -62,6 +62,8 @@ const LIMIT: i64 = 512 * 1024 * 1024;
 // 13: a half-size decode's noise reduction, as `GENERATION` 14.
 const SIZED_GENERATION: i64 = 13;
 const SIZED_QUALITY: u8 = 85;
+const THUMBNAIL_MAX_EDGE: u32 = 1024;
+const THUMBNAIL_QUALITY: u8 = 88;
 /// Tables added after version 1, created on open so older builds, which ignore
 /// them, keep opening the file.
 const SIZED_SCHEMA: &str = "
@@ -100,6 +102,26 @@ pub struct PreviewUsage {
     pub one_to_one: u64,
 }
 pub use crate::storage::Stamp;
+/// A JPEG-encoded preview with its pixel dimensions, produced off-lock for
+/// [`PreviewCache::store_tagged_jpeg`] or [`PreviewCache::store_sized_jpeg`],
+/// or read by [`PreviewCache::load_sized_jpeg`] for [`PreviewCache::decode_sized`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedPreview {
+    width: u32,
+    height: u32,
+    jpeg: Vec<u8>,
+}
+impl EncodedPreview {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+    pub fn jpeg(&self) -> &[u8] {
+        &self.jpeg
+    }
+}
 pub struct PreviewCache {
     db: Connection,
     writes: u32,
@@ -140,6 +162,20 @@ fn generation(path: &Path) -> i64 {
 fn stale(path: &Path, size: i64, modified: &str) -> bool {
     Stamp::read(path)
         .is_ok_and(|stamp| stamp.size as i64 != size || stamp.modified_ns.to_string() != modified)
+}
+fn encode_jpeg(image: &image::RgbImage, quality: u8) -> Result<EncodedPreview> {
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality).encode(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgb8,
+    )?;
+    Ok(EncodedPreview {
+        width: image.width(),
+        height: image.height(),
+        jpeg,
+    })
 }
 impl PreviewCache {
     pub fn path() -> PathBuf {
@@ -187,11 +223,46 @@ impl PreviewCache {
         }
         Ok(cache)
     }
+    /// Encodes a thumbnail as JPEG at quality 88, enforcing the 1024 px side limit.
+    pub fn encode_thumbnail(image: &image::RgbImage) -> Result<EncodedPreview> {
+        ensure!(
+            image.width() <= THUMBNAIL_MAX_EDGE && image.height() <= THUMBNAIL_MAX_EDGE,
+            "Preview exceeds cache size limit"
+        );
+        encode_jpeg(image, THUMBNAIL_QUALITY)
+    }
+    /// Decodes a cached thumbnail JPEG off-lock, returning `None` if corrupt or
+    /// larger than 1024 px on a side.
+    pub fn decode_thumbnail(jpeg: &[u8]) -> Option<image::RgbImage> {
+        image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
+            .ok()
+            .filter(|im| im.width() <= THUMBNAIL_MAX_EDGE && im.height() <= THUMBNAIL_MAX_EDGE)
+            .map(|im| im.to_rgb8())
+    }
+    /// Encodes a sized preview as JPEG at [`SIZED_QUALITY`].
+    pub fn encode_sized(image: &image::RgbImage) -> Result<EncodedPreview> {
+        ensure!(
+            image.width() > 0 && image.height() > 0,
+            "Preview has no pixels"
+        );
+        encode_jpeg(image, SIZED_QUALITY)
+    }
+    /// Decodes a cached sized preview off-lock, returning `None` if corrupt or
+    /// its dimensions differ from those recorded in the row.
+    pub fn decode_sized(encoded: &EncodedPreview) -> Option<image::RgbImage> {
+        image::load_from_memory_with_format(&encoded.jpeg, image::ImageFormat::Jpeg)
+            .ok()
+            .filter(|im| (im.width(), im.height()) == (encoded.width, encoded.height))
+            .map(|im| im.to_rgb8())
+    }
     pub fn load(&self, path: &Path) -> Result<Option<image::RgbImage>> {
         self.load_tagged(path, "")
     }
-    /// A preview variant, e.g. rendered with an edit identified by `tag`.
-    pub fn load_tagged(&self, path: &Path, tag: &str) -> Result<Option<image::RgbImage>> {
+    /// Loads the cached JPEG bytes for `path` under `tag`, checking generation
+    /// and source staleness (an offline original stays usable). Callers decode
+    /// with [`PreviewCache::decode_thumbnail`] off-lock and call
+    /// [`PreviewCache::delete_tagged`] if decoding fails.
+    pub fn load_tagged_jpeg(&self, path: &Path, tag: &str) -> Result<Option<Vec<u8>>> {
         let key = tagged(path, tag);
         let row = self
             .db
@@ -214,31 +285,79 @@ impl PreviewCache {
         let stale = stale(path, size, &modified);
         // Maintenance is best effort, as another connection may hold the database, and
         // never changes the answer: a failed delete still misses, a failed touch hits.
-        let forget = || {
-            let _ = self
-                .db
-                .prepare_cached("DELETE FROM previews WHERE source_path=?")
-                .and_then(|mut s| s.execute([&key]));
-        };
         if generation != self::generation(path) || stale {
-            forget();
+            let _ = self.delete_tagged(path, tag);
             return Ok(None);
         }
-        let image = match image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg) {
-            Ok(im) if im.width() <= 1024 && im.height() <= 1024 => im.to_rgb8(),
-            _ => {
-                forget();
-                return Ok(None);
-            }
-        };
         let _ = self
             .db
             .prepare_cached("UPDATE previews SET last_used=? WHERE source_path=?")
             .and_then(|mut s| s.execute(params![now(), &key]));
-        Ok(Some(image))
+        Ok(Some(jpeg))
+    }
+    /// Removes any cached thumbnail for `path` under `tag`.
+    pub fn delete_tagged(&self, path: &Path, tag: &str) -> Result<()> {
+        self.db
+            .prepare_cached("DELETE FROM previews WHERE source_path=?")?
+            .execute([tagged(path, tag)])?;
+        Ok(())
+    }
+    /// A preview variant, e.g. rendered with an edit identified by `tag`.
+    pub fn load_tagged(&self, path: &Path, tag: &str) -> Result<Option<image::RgbImage>> {
+        let Some(jpeg) = self.load_tagged_jpeg(path, tag)? else {
+            return Ok(None);
+        };
+        match Self::decode_thumbnail(&jpeg) {
+            Some(image) => Ok(Some(image)),
+            None => {
+                let _ = self.delete_tagged(path, tag);
+                Ok(None)
+            }
+        }
     }
     pub fn store(&mut self, path: &Path, stamp: &Stamp, image: &image::RgbImage) -> Result<()> {
         self.store_tagged(path, "", stamp, image)
+    }
+    /// Stores a JPEG-encoded thumbnail built from the file as it was at
+    /// `stamp`, refusing it when the file has changed since.
+    pub fn store_tagged_jpeg(
+        &mut self,
+        path: &Path,
+        tag: &str,
+        stamp: &Stamp,
+        encoded: &EncodedPreview,
+    ) -> Result<()> {
+        ensure!(
+            encoded.width <= THUMBNAIL_MAX_EDGE && encoded.height <= THUMBNAIL_MAX_EDGE,
+            "Preview exceeds cache size limit"
+        );
+        ensure!(
+            encoded.width > 0 && encoded.height > 0 && !encoded.jpeg.is_empty(),
+            "Preview has no pixels"
+        );
+        ensure!(
+            Stamp::read(path)? == *stamp,
+            "Source changed while generating preview"
+        );
+        // prefix_hash, which needed the file's first 64 KB, is no longer checked.
+        self.db
+            .prepare_cached("INSERT INTO previews VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path) DO UPDATE SET source_size=excluded.source_size,modified_ns=excluded.modified_ns,prefix_hash=excluded.prefix_hash,generation=excluded.generation,width=excluded.width,height=excluded.height,jpeg=excluded.jpeg,last_used=excluded.last_used")?
+            .execute(params![
+                tagged(path, tag),
+                stamp.size as i64,
+                stamp.modified_ns.to_string(),
+                "",
+                generation(path),
+                encoded.width,
+                encoded.height,
+                encoded.jpeg.as_slice(),
+                now()
+            ])?;
+        self.writes += 1;
+        if self.writes.is_multiple_of(32) {
+            self.prune(LIMIT)?;
+        }
+        Ok(())
     }
     pub fn store_tagged(
         &mut self,
@@ -248,39 +367,26 @@ impl PreviewCache {
         image: &image::RgbImage,
     ) -> Result<()> {
         ensure!(
-            image.width() <= 1024 && image.height() <= 1024,
+            image.width() <= THUMBNAIL_MAX_EDGE && image.height() <= THUMBNAIL_MAX_EDGE,
             "Preview exceeds cache size limit"
         );
         ensure!(
             Stamp::read(path)? == *stamp,
             "Source changed while generating preview"
         );
-        let mut jpeg = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 88).encode(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            image::ExtendedColorType::Rgb8,
-        )?;
-        // prefix_hash, which needed the file's first 64 KB, is no longer checked.
-        self.db
-            .prepare_cached("INSERT INTO previews VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path) DO UPDATE SET source_size=excluded.source_size,modified_ns=excluded.modified_ns,prefix_hash=excluded.prefix_hash,generation=excluded.generation,width=excluded.width,height=excluded.height,jpeg=excluded.jpeg,last_used=excluded.last_used")?
-            .execute(params![tagged(path, tag),stamp.size as i64,stamp.modified_ns.to_string(),"",generation(path),image.width(),image.height(),jpeg,now()])?;
-        self.writes += 1;
-        if self.writes.is_multiple_of(32) {
-            self.prune(LIMIT)?;
-        }
-        Ok(())
+        let encoded = Self::encode_thumbnail(image)?;
+        self.store_tagged_jpeg(path, tag, stamp, &encoded)
     }
-    /// A built preview of `path` for the edit `identity`, with the thumbnails'
-    /// offline and staleness rules: an offline original still hits, without
-    /// being opened; a rewritten one misses and its row goes.
-    pub fn load_sized(
+    /// Loads the cached sized preview JPEG and stored dimensions for `path` and
+    /// `identity`, checking generation and source staleness (an offline original
+    /// stays usable). Callers decode with [`PreviewCache::decode_sized`]
+    /// off-lock and call [`PreviewCache::delete_sized`] if decoding fails.
+    pub fn load_sized_jpeg(
         &self,
         path: &Path,
         identity: &str,
         kind: PreviewKind,
-    ) -> Result<Option<image::RgbImage>> {
+    ) -> Result<Option<EncodedPreview>> {
         let source = key(path);
         let row = self
             .db
@@ -301,33 +407,51 @@ impl PreviewCache {
         let Some((size, modified, generation, width, height, jpeg)) = row else {
             return Ok(None);
         };
-        // Best effort, as for thumbnails: a failed delete still misses.
-        let forget = || {
-            let _ = self
-                .db
-                .prepare_cached(
-                    "DELETE FROM sized_previews WHERE source_path=? AND identity=? AND kind=?",
-                )
-                .and_then(|mut s| s.execute(params![&source, identity, kind.code()]));
-        };
+        // Best effort, as for thumbnails: a failed delete still misses, a failed touch hits.
         if generation != SIZED_GENERATION || stale(path, size, &modified) {
-            forget();
+            let _ = self.delete_sized(path, identity, kind);
             return Ok(None);
         }
-        let image = match image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg) {
-            Ok(im) if (im.width(), im.height()) == (width, height) => im.to_rgb8(),
-            _ => {
-                forget();
-                return Ok(None);
-            }
-        };
         let _ = self
             .db
             .prepare_cached(
                 "UPDATE sized_previews SET last_used=? WHERE source_path=? AND identity=? AND kind=?",
             )
             .and_then(|mut s| s.execute(params![now(), &source, identity, kind.code()]));
-        Ok(Some(image))
+        Ok(Some(EncodedPreview {
+            width,
+            height,
+            jpeg,
+        }))
+    }
+    /// Removes any cached sized preview of `kind` for `path` and `identity`.
+    pub fn delete_sized(&self, path: &Path, identity: &str, kind: PreviewKind) -> Result<()> {
+        self.db
+            .prepare_cached(
+                "DELETE FROM sized_previews WHERE source_path=? AND identity=? AND kind=?",
+            )?
+            .execute(params![key(path), identity, kind.code()])?;
+        Ok(())
+    }
+    /// A built preview of `path` for the edit `identity`, with the thumbnails'
+    /// offline and staleness rules: an offline original still hits, without
+    /// being opened; a rewritten one misses and its row goes.
+    pub fn load_sized(
+        &self,
+        path: &Path,
+        identity: &str,
+        kind: PreviewKind,
+    ) -> Result<Option<image::RgbImage>> {
+        let Some(encoded) = self.load_sized_jpeg(path, identity, kind)? else {
+            return Ok(None);
+        };
+        match Self::decode_sized(&encoded) {
+            Some(image) => Ok(Some(image)),
+            None => {
+                let _ = self.delete_sized(path, identity, kind);
+                Ok(None)
+            }
+        }
     }
     /// Whether a usable preview exists without reading its pixels: the file is
     /// unchanged and the row was built for at least `requested_edge`. The size
@@ -360,6 +484,48 @@ impl PreviewCache {
                 && !stale(path, size, &modified)
         }))
     }
+    /// Stores a JPEG-encoded preview built from the file as it was at `stamp`,
+    /// refusing it when the file has changed since.
+    pub fn store_sized_jpeg(
+        &mut self,
+        path: &Path,
+        identity: &str,
+        kind: PreviewKind,
+        stamp: &Stamp,
+        requested_edge: u32,
+        encoded: &EncodedPreview,
+    ) -> Result<()> {
+        ensure!(
+            encoded.width > 0 && encoded.height > 0 && !encoded.jpeg.is_empty(),
+            "Preview has no pixels"
+        );
+        ensure!(
+            Stamp::read(path)? == *stamp,
+            "Source changed while building preview"
+        );
+        self.db
+            .prepare_cached("INSERT OR REPLACE INTO sized_previews VALUES(?,?,?,?,?,?,?,?,?,?,?)")?
+            .execute(params![
+                key(path),
+                identity,
+                kind.code(),
+                stamp.size as i64,
+                stamp.modified_ns.to_string(),
+                SIZED_GENERATION,
+                requested_edge,
+                encoded.width,
+                encoded.height,
+                encoded.jpeg.as_slice(),
+                now()
+            ])?;
+        self.sized_writes += 1;
+        if self.sized_writes.is_multiple_of(8) {
+            for kind in PreviewKind::ALL {
+                self.prune_sized(kind, kind.budget())?;
+            }
+        }
+        Ok(())
+    }
     /// Stores a preview built from the file as it was at `stamp`, refusing it
     /// when the file has changed since.
     pub fn store_sized(
@@ -379,35 +545,8 @@ impl PreviewCache {
             Stamp::read(path)? == *stamp,
             "Source changed while building preview"
         );
-        let mut jpeg = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, SIZED_QUALITY).encode(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            image::ExtendedColorType::Rgb8,
-        )?;
-        self.db
-            .prepare_cached("INSERT OR REPLACE INTO sized_previews VALUES(?,?,?,?,?,?,?,?,?,?,?)")?
-            .execute(params![
-                key(path),
-                identity,
-                kind.code(),
-                stamp.size as i64,
-                stamp.modified_ns.to_string(),
-                SIZED_GENERATION,
-                requested_edge,
-                image.width(),
-                image.height(),
-                jpeg,
-                now()
-            ])?;
-        self.sized_writes += 1;
-        if self.sized_writes.is_multiple_of(8) {
-            for kind in PreviewKind::ALL {
-                self.prune_sized(kind, kind.budget())?;
-            }
-        }
-        Ok(())
+        let encoded = Self::encode_sized(image)?;
+        self.store_sized_jpeg(path, identity, kind, stamp, requested_edge, &encoded)
     }
     /// Image bytes held by each kind.
     pub fn usage(&self) -> Result<PreviewUsage> {
@@ -1232,6 +1371,210 @@ mod tests {
         assert!(
             after_sized < freelist,
             "expected under-budget prune_sized to shrink freelist ({after_sized} < {freelist})"
+        );
+        Ok(())
+    }
+    #[test]
+    fn off_lock_thumbnail_roundtrip_limits_and_offline_survival() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let (raw, mut cache) = photo(&d)?;
+        let stamp = Stamp::read(&raw)?;
+        let im = image::RgbImage::from_pixel(24, 16, image::Rgb([120, 70, 40]));
+        let encoded = PreviewCache::encode_thumbnail(&im)?;
+        assert_eq!((encoded.width(), encoded.height()), (24, 16));
+        assert!(!encoded.jpeg().is_empty());
+        cache.store_tagged_jpeg(&raw, "edit-1", &stamp, &encoded)?;
+        let loaded_jpeg = cache.load_tagged_jpeg(&raw, "edit-1")?.unwrap();
+        let decoded = PreviewCache::decode_thumbnail(&loaded_jpeg).unwrap();
+        assert_eq!(decoded.dimensions(), (24, 16));
+        assert!(decoded.get_pixel(4, 4)[0] > 100);
+
+        assert!(PreviewCache::encode_thumbnail(&image::RgbImage::new(1025, 8)).is_err());
+        assert!(PreviewCache::encode_thumbnail(&image::RgbImage::new(8, 1025)).is_err());
+        let oversized = PreviewCache::encode_sized(&image::RgbImage::new(1025, 8))?;
+        assert!(
+            cache
+                .store_tagged_jpeg(&raw, "too-wide", &stamp, &oversized)
+                .is_err()
+        );
+        assert!(PreviewCache::decode_thumbnail(oversized.jpeg()).is_none());
+        assert!(PreviewCache::decode_thumbnail(b"\x00\x11\x22").is_none());
+
+        std::fs::remove_file(&raw)?;
+        let offline_jpeg = cache.load_tagged_jpeg(&raw, "edit-1")?.unwrap();
+        assert_eq!(
+            PreviewCache::decode_thumbnail(&offline_jpeg)
+                .unwrap()
+                .dimensions(),
+            (24, 16)
+        );
+        Ok(())
+    }
+    #[test]
+    fn off_lock_sized_roundtrip_and_dimension_validation() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let (raw, mut cache) = photo(&d)?;
+        let stamp = Stamp::read(&raw)?;
+        assert!(PreviewCache::encode_sized(&image::RgbImage::new(0, 0)).is_err());
+
+        let standard = image::RgbImage::from_pixel(64, 32, image::Rgb([200, 100, 50]));
+        let one_to_one = image::RgbImage::from_pixel(128, 64, image::Rgb([50, 100, 200]));
+        let encoded_standard = PreviewCache::encode_sized(&standard)?;
+        let encoded_one_to_one = PreviewCache::encode_sized(&one_to_one)?;
+        cache.store_sized_jpeg(
+            &raw,
+            "edit-1",
+            PreviewKind::Standard,
+            &stamp,
+            2048,
+            &encoded_standard,
+        )?;
+        cache.store_sized_jpeg(
+            &raw,
+            "edit-1",
+            PreviewKind::OneToOne,
+            &stamp,
+            0,
+            &encoded_one_to_one,
+        )?;
+        let loaded_standard = cache
+            .load_sized_jpeg(&raw, "edit-1", PreviewKind::Standard)?
+            .unwrap();
+        assert_eq!(
+            PreviewCache::decode_sized(&loaded_standard)
+                .unwrap()
+                .dimensions(),
+            (64, 32)
+        );
+        let loaded_one_to_one = cache
+            .load_sized_jpeg(&raw, "edit-1", PreviewKind::OneToOne)?
+            .unwrap();
+        assert_eq!(
+            PreviewCache::decode_sized(&loaded_one_to_one)
+                .unwrap()
+                .dimensions(),
+            (128, 64)
+        );
+
+        // Stored dimensions that disagree with the JPEG fail off-lock decoding.
+        cache.db.execute(
+            "UPDATE sized_previews SET width=99 WHERE source_path=? AND identity=? AND kind=?",
+            params![key(&raw), "edit-1", PreviewKind::Standard.code()],
+        )?;
+        let mismatched = cache
+            .load_sized_jpeg(&raw, "edit-1", PreviewKind::Standard)?
+            .unwrap();
+        assert_eq!(mismatched.width(), 99);
+        assert!(PreviewCache::decode_sized(&mismatched).is_none());
+        cache.delete_sized(&raw, "edit-1", PreviewKind::Standard)?;
+        assert!(
+            cache
+                .load_sized_jpeg(&raw, "edit-1", PreviewKind::Standard)?
+                .is_none()
+        );
+
+        std::fs::remove_file(&raw)?;
+        let offline = cache
+            .load_sized_jpeg(&raw, "edit-1", PreviewKind::OneToOne)?
+            .unwrap();
+        assert_eq!(
+            PreviewCache::decode_sized(&offline).unwrap().dimensions(),
+            (128, 64)
+        );
+        Ok(())
+    }
+    #[test]
+    fn off_lock_stale_stamp_rejection_and_eviction() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let (raw, mut cache) = photo(&d)?;
+        let old_stamp = Stamp::read(&raw)?;
+        let thumb = PreviewCache::encode_thumbnail(&image::RgbImage::new(16, 16))?;
+        let sized = PreviewCache::encode_sized(&image::RgbImage::new(32, 16))?;
+
+        std::fs::write(&raw, b"replaced while encoding")?;
+        assert!(
+            cache
+                .store_tagged_jpeg(&raw, "edit", &old_stamp, &thumb)
+                .is_err()
+        );
+        assert!(
+            cache
+                .store_sized_jpeg(
+                    &raw,
+                    "edit",
+                    PreviewKind::Standard,
+                    &old_stamp,
+                    2048,
+                    &sized
+                )
+                .is_err()
+        );
+        assert!(cache.load_tagged_jpeg(&raw, "edit")?.is_none());
+        assert!(
+            cache
+                .load_sized_jpeg(&raw, "edit", PreviewKind::Standard)?
+                .is_none()
+        );
+
+        let stamp = Stamp::read(&raw)?;
+        cache.store_tagged_jpeg(&raw, "edit", &stamp, &thumb)?;
+        cache.store_sized_jpeg(&raw, "edit", PreviewKind::Standard, &stamp, 2048, &sized)?;
+        std::fs::write(&raw, b"rewritten later on disk")?;
+        assert!(cache.load_tagged_jpeg(&raw, "edit")?.is_none());
+        assert!(
+            cache
+                .load_sized_jpeg(&raw, "edit", PreviewKind::Standard)?
+                .is_none()
+        );
+        assert_eq!(cache.usage()?, PreviewUsage::default());
+
+        let stamp = Stamp::read(&raw)?;
+        cache.store_tagged_jpeg(&raw, "edit", &stamp, &thumb)?;
+        cache.store_sized_jpeg(&raw, "edit", PreviewKind::Standard, &stamp, 2048, &sized)?;
+        cache.db.execute("UPDATE previews SET generation=1", [])?;
+        cache
+            .db
+            .execute("UPDATE sized_previews SET generation=1", [])?;
+        assert!(cache.load_tagged_jpeg(&raw, "edit")?.is_none());
+        assert!(
+            cache
+                .load_sized_jpeg(&raw, "edit", PreviewKind::Standard)?
+                .is_none()
+        );
+        assert_eq!(cache.usage()?, PreviewUsage::default());
+        Ok(())
+    }
+    #[test]
+    fn off_lock_corrupt_jpeg_cleanup() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let (raw, mut cache) = photo(&d)?;
+        let stamp = Stamp::read(&raw)?;
+        let thumb = PreviewCache::encode_thumbnail(&image::RgbImage::new(16, 16))?;
+        let sized = PreviewCache::encode_sized(&image::RgbImage::new(32, 16))?;
+        cache.store_tagged_jpeg(&raw, "edit", &stamp, &thumb)?;
+        cache.store_sized_jpeg(&raw, "edit", PreviewKind::Standard, &stamp, 2048, &sized)?;
+
+        cache.db.execute("UPDATE previews SET jpeg=X'001122'", [])?;
+        cache
+            .db
+            .execute("UPDATE sized_previews SET jpeg=X'001122'", [])?;
+
+        let corrupt_thumb = cache.load_tagged_jpeg(&raw, "edit")?.unwrap();
+        assert!(PreviewCache::decode_thumbnail(&corrupt_thumb).is_none());
+        cache.delete_tagged(&raw, "edit")?;
+        assert_eq!(cache.usage()?.thumbnails, 0);
+        assert!(cache.load_tagged_jpeg(&raw, "edit")?.is_none());
+
+        let corrupt_sized = cache
+            .load_sized_jpeg(&raw, "edit", PreviewKind::Standard)?
+            .unwrap();
+        assert!(PreviewCache::decode_sized(&corrupt_sized).is_none());
+        cache.delete_sized(&raw, "edit", PreviewKind::Standard)?;
+        assert_eq!(cache.usage()?.standard, 0);
+        assert!(
+            cache
+                .load_sized_jpeg(&raw, "edit", PreviewKind::Standard)?
+                .is_none()
         );
         Ok(())
     }

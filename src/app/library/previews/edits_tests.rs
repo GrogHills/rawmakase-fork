@@ -496,3 +496,43 @@ fn set_shown_wakes_waiting_scheduler_for_deferred_offscreen_ai_job() {
     shared.lock().running.clear();
     drop(queue);
 }
+
+#[test]
+fn corrupt_cached_preview_is_deleted_off_lock_and_misses_cleanly() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = edited_png(directory.path(), "photo.png")?;
+    let cache_path = directory.path().join("previews.sqlite3");
+    let job = render_job(1, &path, false);
+    let EditJob::Render { ref source, .. } = job else {
+        unreachable!();
+    };
+    let tag = source.preview_tag(PreviewAi::Off);
+    {
+        let mut cache = PreviewCache::open(&cache_path)?;
+        cache.store_tagged(
+            &path,
+            &tag,
+            &Stamp::read(&path)?,
+            &image::RgbImage::new(8, 8),
+        )?;
+    }
+    rusqlite::Connection::open(&cache_path)?.execute("UPDATE previews SET jpeg=X'001122'", [])?;
+
+    let shared = Arc::<Shared>::default();
+    shared.lock().jobs.push(Queued::new(job));
+    let cache = PreviewCache::open(&cache_path)?;
+    let (renders, rx) = counting(&shared, Some(cache), Wanted::default());
+    renders.look(0, false);
+
+    assert!(rx.try_recv().is_err());
+    {
+        let state = shared.lock();
+        assert_eq!(state.jobs.len(), 1);
+        assert!(state.jobs[0].missed);
+    }
+    drop(renders);
+    let cache = PreviewCache::open(&cache_path)?;
+    assert_eq!(cache.usage()?.thumbnails, 0);
+    assert!(cache.load_tagged_jpeg(&path, &tag)?.is_none());
+    Ok(())
+}

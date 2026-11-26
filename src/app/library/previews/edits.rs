@@ -358,8 +358,8 @@ enum Step {
 /// latest request first, then the photos asked for ahead in the order asked.
 /// At [`Pace::Background`] one render runs at a time on two background
 /// threads; at [`Pace::Full`] up to [`FULL_RENDERS`] side by side on every
-/// core but one. The
-/// cache is read and written by the worker and its renders under one lock.
+/// core but one. The cache connection is shared under one lock while JPEG
+/// encoding and decoding run outside it.
 /// Closing the queue cancels the renders under way; the worker ends once
 /// they have stopped.
 pub(in crate::app::library) fn spawn_edited(
@@ -514,6 +514,61 @@ fn cache(cache: &Mutex<Option<PreviewCache>>) -> std::sync::MutexGuard<'_, Optio
 fn reopen(at: &Mutex<Option<PreviewCache>>, path: &Path) {
     *cache(at) = PreviewCache::open(path).ok();
 }
+/// Loads the first decodable cached preview for `path` among `tags`, holding
+/// the cache mutex only for SQLite lookups and corrupt-row removal while
+/// decoding JPEG bytes off-lock.
+fn load_first_tagged(
+    cache_at: &Mutex<Option<PreviewCache>>,
+    cache_path: &Path,
+    path: &Path,
+    tags: &[String],
+) -> Option<image::RgbImage> {
+    let mut start = 0;
+    while start < tags.len() {
+        let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cache = cache(cache_at);
+            let cache = cache.as_ref()?;
+            tags.iter()
+                .enumerate()
+                .skip(start)
+                .find_map(|(index, tag)| {
+                    cache
+                        .load_tagged_jpeg(path, tag)
+                        .ok()
+                        .flatten()
+                        .map(|jpeg| (index, jpeg))
+                })
+        }));
+        let (index, jpeg) = match fetched {
+            Ok(Some(hit)) => hit,
+            Ok(None) => return None,
+            Err(_) => {
+                reopen(cache_at, cache_path);
+                return None;
+            }
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PreviewCache::decode_thumbnail(&jpeg)
+        })) {
+            Ok(Some(image)) => return Some(image),
+            Ok(None) => {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(cache) = &*cache(cache_at) {
+                        let _ = cache.delete_tagged(path, &tags[index]);
+                    }
+                }))
+                .is_err()
+                {
+                    reopen(cache_at, cache_path);
+                    return None;
+                }
+                start = index + 1;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
 impl Renders {
     /// Keeps `image`, rendered from the file at `path` as `stamp` gives it,
     /// as its preview under `tag`; a file changed since gets none of it, and
@@ -522,13 +577,22 @@ impl Renders {
         if Stamp::read(path).ok().as_ref() != Some(stamp) {
             return;
         }
+        let Ok(encoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PreviewCache::encode_thumbnail(image)
+        })) else {
+            return;
+        };
         let stored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match &mut *cache(&self.cache) {
-                Some(cache) => cache
-                    .store_tagged(path, tag, stamp, image)
-                    .err()
-                    .map(|error| error.to_string()),
-                None => None,
+            let mut guard = cache(&self.cache);
+            let cache = guard.as_mut()?;
+            let encoded = match &encoded {
+                Ok(encoded) => encoded,
+                Err(error) => return Some(error.to_string()),
+            };
+            match cache.store_tagged_jpeg(path, tag, stamp, encoded) {
+                Ok(()) => None,
+                Err(_) if Stamp::read(path).ok().as_ref() != Some(stamp) => None,
+                Err(error) => Some(error.to_string()),
             }
         }));
         match stored {
@@ -580,16 +644,7 @@ impl Renders {
             }
         };
         let (renders_ai, tags) = preview_tags(&path, &source, renders_ai, ai.as_ref());
-        let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let cache = cache(&self.cache);
-            let cache = cache.as_ref()?;
-            tags.iter()
-                .find_map(|tag| cache.load_tagged(&path, tag).ok().flatten())
-        }))
-        .unwrap_or_else(|_| {
-            reopen(&self.cache, &self.cache_path);
-            None
-        });
+        let hit = load_first_tagged(&self.cache, &self.cache_path, &path, &tags);
         let mut state = self.results.shared.lock();
         match hit {
             Some(image) => {
@@ -708,9 +763,11 @@ impl Renders {
                         plain_of(&source),
                     ),
                 };
+                let tag = source.preview_tag(shows);
+                let encoded = PreviewCache::encode_thumbnail(&image);
                 if let Some(cache) = &mut *cache(&cache_at)
-                    && let Err(error) =
-                        cache.store_tagged(&path, &source.preview_tag(shows), &stamp, &image)
+                    && let Err(error) = encoded
+                        .and_then(|encoded| cache.store_tagged_jpeg(&path, &tag, &stamp, &encoded))
                 {
                     cache_error = Some(error.to_string());
                 }
