@@ -617,8 +617,12 @@ fn prepare(
         });
     let history_before = saved.clone();
     let mut history = History::restored(saved, &before_recipe);
-    let mut current = before_recipe;
+    let after = std::sync::Arc::new(after);
+    let mut current = std::sync::Arc::new(before_recipe);
     history.set(&after, &mut current, change.step());
+    let history_saved = history.saved(&current);
+    drop(current);
+    let after = std::sync::Arc::unwrap_or_clone(after);
     Ok(Prepared {
         edit: Some(PreparedEdit {
             synced: Synced {
@@ -626,7 +630,7 @@ fn prepare(
                 path: target.path.clone(),
                 before,
                 after,
-                history: history.saved(&current),
+                history: history_saved,
                 history_before,
                 identity,
             },

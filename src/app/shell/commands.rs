@@ -14,7 +14,7 @@ pub(in crate::app) use reply::{Outcome, Reply};
 #[derive(Default)]
 pub(in crate::app) struct Automation {
     pub revision: u64,
-    observed: Option<(u64, crate::model::recipe::Recipe)>,
+    observed: Option<(u64, std::sync::Arc<crate::model::recipe::Recipe>)>,
     outputs: output::Outputs,
     turn: Option<(std::time::Instant, TurnScope)>,
 }
@@ -346,16 +346,17 @@ impl Editor {
     /// the recipe outside an edit frame. Revisions identify observed recipe states.
     pub(in crate::app) fn sync_command_revision(&mut self) {
         let generation = self.document.load_id();
+        let current = self.document.edit.recipe_arc();
         if let Some((seen_generation, recipe)) = &self.automation.observed
             && *seen_generation == generation
-            && *recipe == *self.document.edit.recipe()
+            && (std::sync::Arc::ptr_eq(recipe, current) || **recipe == **current)
         {
             return;
         }
         if self.automation.observed.is_some() {
             self.automation.revision = self.automation.revision.wrapping_add(1);
         }
-        self.automation.observed = Some((generation, self.document.edit.recipe().clone()));
+        self.automation.observed = Some((generation, std::sync::Arc::clone(current)));
     }
     pub(in crate::app) fn command_state(&mut self) -> State {
         self.sync_command_revision();
@@ -778,14 +779,15 @@ impl Editor {
                 self.require_develop()?;
                 self.require_presets()?;
                 let i = preset::find(&self.presets.library.presets, &target)?;
-                let before = self.document.edit.recipe().clone();
+                let before = std::sync::Arc::clone(self.document.edit.recipe_arc());
                 let applied = self
                     .apply_preset(i)
                     .map_err(|e| Error::new("not_applied", format!("{e:#}")))?;
                 // Named here: applying the preset already applied, after other edits,
                 // changes no preset name for History to recognize it by. Only a change
                 // is named, or the name would be left for the next edit.
-                if *self.document.edit.recipe() != before {
+                let current = self.document.edit.recipe_arc();
+                if !std::sync::Arc::ptr_eq(current, &before) && **current != *before {
                     self.step_name.name("Preset".into(), applied.name.clone());
                 }
                 return Ok(Outcome::Preset { applied });
@@ -954,7 +956,7 @@ impl Editor {
         if value.is_some_and(|v| !v.is_finite()) {
             return Err(Error::new("invalid_value", "Value must be finite"));
         }
-        let before_recipe = self.document.edit.recipe().clone();
+        let before_recipe = std::sync::Arc::clone(self.document.edit.recipe_arc());
         let channel = self.view.mixer_adjust.min(2);
         let shown = if let Some(index) = target.mask {
             let mask = self
@@ -984,7 +986,8 @@ impl Editor {
         } else {
             param.label(channel)
         };
-        if before_recipe != *self.document.edit.recipe() {
+        let current = self.document.edit.recipe_arc();
+        if !std::sync::Arc::ptr_eq(current, &before_recipe) && *before_recipe != **current {
             self.step_name.name(label, shown);
         }
         Ok(())

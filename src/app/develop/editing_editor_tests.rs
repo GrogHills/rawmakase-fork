@@ -59,7 +59,7 @@ fn develop_history_survives_reopening_the_photo() -> anyhow::Result<()> {
     open(&mut editor);
     assert_eq!(editor.document.edit.recipe().exposure, 1.);
     assert_eq!(editor.document.edit.history().steps().0.len(), 2);
-    let mut recipe = editor.document.edit.recipe().clone();
+    let mut recipe = Arc::clone(editor.document.edit.recipe_arc());
     assert!(editor.document.edit.history_mut().undo(&mut recipe));
     assert_eq!(recipe.exposure, 0.5);
     Ok(())

@@ -183,28 +183,28 @@ fn auto_arriving_mid_drag_lands_between_the_two_halves_of_the_drag() {
         crate::app::preferences::session::Session::default(),
         None,
     );
-    let start = editor.document.edit.recipe().clone();
+    let start = Arc::clone(editor.document.edit.recipe_arc());
     // A Shadows drag is under way when the estimate arrives. Auto sets Shadows too,
     // so the drag does not make the estimate stale.
     editor.document.edit.setup_mut().shadows = 0.1;
-    let mid = editor.document.edit.recipe().clone();
+    let mid = Arc::clone(editor.document.edit.recipe_arc());
     editor
         .document
         .edit
         .history_mut()
-        .observe(start.clone(), &mid, true);
-    let mut auto = start.clone();
+        .observe(Arc::clone(&start), &mid, true);
+    let mut auto = (*start).clone();
     auto.exposure = 1.;
     editor.auto_ready(worker::AutoKind::Settings, Ok(Box::new(auto)));
-    let with_auto = editor.document.edit.recipe().clone();
+    let with_auto = Arc::clone(editor.document.edit.recipe_arc());
     assert_eq!(with_auto.exposure, 1.);
     editor.document.edit.setup_mut().shadows = 0.2;
-    let end = editor.document.edit.recipe().clone();
+    let end = Arc::clone(editor.document.edit.recipe_arc());
     editor
         .document
         .edit
         .history_mut()
-        .observe(with_auto.clone(), &end, false);
+        .observe(Arc::clone(&with_auto), &end, false);
     let names: Vec<_> = editor
         .document
         .edit
@@ -218,11 +218,11 @@ fn auto_arriving_mid_drag_lands_between_the_two_halves_of_the_drag() {
     assert_eq!(names[1], "Auto Settings");
     // Undoing the rest of the drag keeps Auto; the next undo removes only Auto.
     editor.undo();
-    assert_eq!(*editor.document.edit.recipe(), with_auto);
+    assert_eq!(*editor.document.edit.recipe(), *with_auto);
     editor.undo();
-    assert_eq!(*editor.document.edit.recipe(), mid);
+    assert_eq!(*editor.document.edit.recipe(), *mid);
     editor.undo();
-    assert_eq!(*editor.document.edit.recipe(), start);
+    assert_eq!(*editor.document.edit.recipe(), *start);
 }
 
 #[test]

@@ -31,9 +31,9 @@ impl Editor {
     /// nothing Auto measures has changed since, so running it again would change nothing. Adjustments Auto does not
     /// measure (curves, presence, color and the like) leave it in effect.
     pub(in crate::app) fn auto_in_effect(&self) -> bool {
-        let r = self.document.edit.recipe();
+        let r = self.document.edit.recipe_arc();
         if let Some((seen, in_effect)) = &*self.document.auto_effect.borrow()
-            && seen == r
+            && (std::sync::Arc::ptr_eq(seen, r) || **seen == **r)
         {
             return *in_effect;
         }
@@ -41,7 +41,7 @@ impl Editor {
             AutoTone::of(a) == AutoTone::of(r)
                 && inputs(AutoKind::Settings, a) == inputs(AutoKind::Settings, r)
         });
-        *self.document.auto_effect.borrow_mut() = Some((r.clone(), in_effect));
+        *self.document.auto_effect.borrow_mut() = Some((std::sync::Arc::clone(r), in_effect));
         in_effect
     }
 

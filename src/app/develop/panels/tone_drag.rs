@@ -201,7 +201,7 @@ mod tests {
     /// History observing each frame.
     struct Harness {
         ctx: egui::Context,
-        recipe: Recipe,
+        recipe: std::sync::Arc<Recipe>,
         drag: Option<ToneDrag>,
         history: History,
         controls: Vec<Rect>,
@@ -212,7 +212,7 @@ mod tests {
         fn new(controls: Vec<Rect>) -> Self {
             let mut h = Self {
                 ctx: egui::Context::default(),
-                recipe: Recipe::default(),
+                recipe: std::sync::Arc::new(Recipe::default()),
                 drag: None,
                 history: History::default(),
                 controls,
@@ -222,10 +222,10 @@ mod tests {
             h
         }
         fn frame(&mut self, events: Vec<egui::Event>) -> Option<ToneRegion> {
-            let before = self.recipe.clone();
+            let before = std::sync::Arc::clone(&self.recipe);
             let mut shown = None;
             let (recipe, drag, controls, step) = (
-                &mut self.recipe,
+                std::sync::Arc::make_mut(&mut self.recipe),
                 &mut self.drag,
                 &self.controls,
                 &mut self.step,
@@ -303,7 +303,7 @@ mod tests {
         );
         // A press without a move names no step either.
         h.drag(egui::PointerButton::Primary, Pos2::new(250., 50.), &[]);
-        assert_eq!(h.recipe, Recipe::default());
+        assert_eq!(*h.recipe, Recipe::default());
         assert!(h.steps().is_empty());
         assert!(h.step.given().is_none());
     }
@@ -329,9 +329,9 @@ mod tests {
         view.clear_document();
         assert_eq!(view.tone_drag, None);
         h.drag = view.tone_drag;
-        h.recipe = Recipe::default();
+        h.recipe = std::sync::Arc::new(Recipe::default());
         h.frame(vec![egui::Event::PointerMoved(Pos2::new(220., 50.))]);
         h.frame(vec![press(Pos2::new(220., 50.), false)]);
-        assert_eq!(h.recipe, Recipe::default());
+        assert_eq!(*h.recipe, Recipe::default());
     }
 }

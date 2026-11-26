@@ -167,7 +167,7 @@ fn point_colors_dropper_adds_a_selected_swatch_as_one_step_and_visualizes_it() {
     assert_eq!(editor.visualized_swatch(), None);
     editor.module = Module::Develop;
     // One History step, which Undo takes back.
-    let mut recipe = editor.document.edit.recipe().clone();
+    let mut recipe = std::sync::Arc::clone(editor.document.edit.recipe_arc());
     assert!(editor.document.edit.history_mut().undo(&mut recipe));
     assert!(recipe.point_colors.is_empty());
     assert_eq!(editor.visualized_swatch(), Some(0));

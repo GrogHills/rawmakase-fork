@@ -1109,21 +1109,21 @@ mod tests {
     fn double_click_reset_undo_restores_the_grade_before_either_click() {
         let mut h = Harness::new();
         let mut history = crate::app::history::History::default();
-        let mut recipe = Recipe::default();
-        recipe.grading[0] = [0.25, 0.4, 0.2];
-        let original = recipe.clone();
+        let mut recipe = std::sync::Arc::new(Recipe::default());
+        std::sync::Arc::make_mut(&mut recipe).grading[0] = [0.25, 0.4, 0.2];
+        let original = std::sync::Arc::clone(&recipe);
         let at = h.at(Vec2::new(-0.5, 0.));
         h.frame(
-            &mut recipe.grading[0],
+            &mut std::sync::Arc::make_mut(&mut recipe).grading[0],
             vec![egui::Event::PointerMoved(at)],
             egui::Modifiers::NONE,
         );
         for pressed in [true, false, true, false] {
             history.begin_frame();
-            let before = recipe.clone();
+            let before = std::sync::Arc::clone(&recipe);
             h.time -= 0.45;
             h.frame(
-                &mut recipe.grading[0],
+                &mut std::sync::Arc::make_mut(&mut recipe).grading[0],
                 vec![egui::Event::PointerButton {
                     pos: at,
                     button: egui::PointerButton::Primary,
@@ -1139,7 +1139,11 @@ mod tests {
         assert!(history.undo(&mut recipe));
         assert_eq!(recipe, original);
         // No delayed first click may reapply itself after the reset.
-        h.frame(&mut recipe.grading[0], vec![], egui::Modifiers::NONE);
+        h.frame(
+            &mut std::sync::Arc::make_mut(&mut recipe).grading[0],
+            vec![],
+            egui::Modifiers::NONE,
+        );
         assert_eq!(recipe, original);
     }
 
@@ -1148,21 +1152,21 @@ mod tests {
         let mut h = Harness::new();
         h.luminance = true;
         let mut history = crate::app::history::History::default();
-        let mut recipe = Recipe::default();
-        recipe.grading[0] = [0.25, 0.4, -0.3];
-        let original = recipe.clone();
+        let mut recipe = std::sync::Arc::new(Recipe::default());
+        std::sync::Arc::make_mut(&mut recipe).grading[0] = [0.25, 0.4, -0.3];
+        let original = std::sync::Arc::clone(&recipe);
         let at = Pos2::new(h.rect.left() + 120., h.rect.center().y);
         h.frame(
-            &mut recipe.grading[0],
+            &mut std::sync::Arc::make_mut(&mut recipe).grading[0],
             vec![egui::Event::PointerMoved(at)],
             egui::Modifiers::NONE,
         );
         for pressed in [true, false, true, false] {
             history.begin_frame();
-            let before = recipe.clone();
+            let before = std::sync::Arc::clone(&recipe);
             h.time -= 0.45;
             h.frame(
-                &mut recipe.grading[0],
+                &mut std::sync::Arc::make_mut(&mut recipe).grading[0],
                 vec![egui::Event::PointerButton {
                     pos: at,
                     button: egui::PointerButton::Primary,
@@ -1181,7 +1185,11 @@ mod tests {
         assert_eq!(history.steps().0[0].name, "Shadow Luminance");
         assert!(history.undo(&mut recipe));
         assert_eq!(recipe, original);
-        h.frame(&mut recipe.grading[0], vec![], egui::Modifiers::NONE);
+        h.frame(
+            &mut std::sync::Arc::make_mut(&mut recipe).grading[0],
+            vec![],
+            egui::Modifiers::NONE,
+        );
         assert_eq!(recipe, original);
     }
 

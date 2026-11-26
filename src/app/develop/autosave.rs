@@ -12,7 +12,10 @@ use eframe::egui;
 use std::{
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    },
     time::Instant,
 };
 
@@ -28,7 +31,7 @@ pub(in crate::app) struct Job {
     /// Whether the photo was opened from its editable preview: `source` is then
     /// the identity that recorded, standing in for `raw` while it is not there.
     pub from_editable_preview: bool,
-    pub recipe: Recipe,
+    pub recipe: Arc<Recipe>,
     pub export: ExportOptions,
     /// Its Develop History, saved in the same transaction.
     pub history: SavedHistory,
@@ -238,7 +241,7 @@ mod tests {
                 prefix_hash: String::new(),
             },
             from_editable_preview: false,
-            recipe: Recipe::default(),
+            recipe: Arc::new(Recipe::default()),
             export: ExportOptions::default(),
             history: SavedHistory {
                 origin: Recipe::default(),
