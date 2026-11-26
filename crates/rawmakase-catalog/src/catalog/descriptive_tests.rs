@@ -458,3 +458,78 @@ fn keywords_for_photos_skips_unrelated_hierarchy_rows_when_untagged() -> Result<
     assert!(empty[&ids[0]].is_empty());
     Ok(())
 }
+
+#[test]
+fn keywords_for_photos_batches_across_chunk_boundaries_and_large_selections() -> Result<()> {
+    let (_dir, mut cat, _) = catalog(0)?;
+    let total: usize = 1050;
+    {
+        let db = cat.db_mut_for_tests();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO roots(id, original_path) VALUES (1, '/photos')",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO folders(id, root, relative_path) VALUES (1, 1, '')",
+            [],
+        )?;
+        let mut insert_photo = tx.prepare(
+            "INSERT INTO photos(id, folder, filename, original_path) VALUES (?1, 1, ?2, ?3)",
+        )?;
+        for i in 1..=(total as i64) {
+            let name = format!("IMG_{i:04}.ARW");
+            let path = format!("/photos/{name}");
+            insert_photo.execute(rusqlite::params![i, name, path])?;
+        }
+        drop(insert_photo);
+        tx.execute_batch(
+            "INSERT INTO keywords(id, name, parent) VALUES (1, '', NULL);
+             INSERT INTO keywords(id, name, parent) VALUES (2, 'Trips', 1);
+             INSERT INTO keywords(id, name, parent) VALUES (3, 'Lisbon', 2);
+             INSERT INTO keywords(id, name, parent) VALUES (4, 'Night', NULL);
+             INSERT INTO keyword_export(keyword, include, parents) VALUES (2, 0, 1);",
+        )?;
+        let mut tag = tx.prepare("INSERT INTO photo_keywords(photo, keyword) VALUES (?1, ?2)")?;
+        // Tag photos across chunk boundaries (64, 128, ...) while leaving others untagged.
+        for i in 1..=(total as i64) {
+            if i % 7 == 0 || matches!(i, 1 | 64 | 65 | 128 | 129 | 1050) {
+                tag.execute(rusqlite::params![i, 3])?;
+            }
+            if i % 11 == 0 || matches!(i, 64 | 65 | 1050) {
+                tag.execute(rusqlite::params![i, 4])?;
+            }
+        }
+        drop(tag);
+        tx.commit()?;
+    }
+
+    let all_ids: Vec<PhotoId> = (1..=(total as i64)).map(PhotoId).collect();
+
+    // Exact chunk + 1 (65 photos: one 64-photo batch plus one single-photo chunk).
+    let sixty_five = cat.keywords_for_photos(&all_ids[..65])?;
+    assert_eq!(sixty_five.len(), 65);
+    for &id in &all_ids[..65] {
+        assert_eq!(sixty_five[&id], cat.keywords(id)?);
+    }
+
+    // Multiple chunks with trailing partial batch (130 photos: 64 + 64 + 2).
+    let one_thirty = cat.keywords_for_photos(&all_ids[..130])?;
+    assert_eq!(one_thirty.len(), 130);
+    for &id in &all_ids[..130] {
+        assert_eq!(one_thirty[&id], cat.keywords(id)?);
+    }
+
+    // Over 1,000 photos with duplicate IDs in the input slice.
+    let mut with_dups = all_ids.clone();
+    with_dups.extend_from_slice(&[PhotoId(1), PhotoId(64), PhotoId(65), PhotoId(1050)]);
+    let large = cat.keywords_for_photos(&with_dups)?;
+    assert_eq!(large.len(), total);
+    for &id in &all_ids {
+        assert_eq!(large[&id], cat.keywords(id)?);
+    }
+    assert!(large[&PhotoId(2)].is_empty());
+    assert_eq!(large[&PhotoId(64)].len(), 2);
+    assert_eq!(large[&PhotoId(1050)].len(), 2);
+    Ok(())
+}

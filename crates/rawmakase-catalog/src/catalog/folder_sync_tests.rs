@@ -1146,6 +1146,58 @@ mod scenarios {
         assert!(plan.additions[1].copy_of.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn transiently_unreadable_catalog_photo_is_retried_for_later_same_size_match() -> Result<()> {
+        let f = fixture()?;
+        f.cat
+            .db_for_tests()
+            .execute_batch("DELETE FROM photo_checksums")?;
+        let id = f.id("IMG_1001.dng");
+        let original = f.root.join("Lisbon/IMG_1001.dng");
+        let backup = f._dir.path().join("IMG_1001.dng.bak");
+        let copy1 = f.root.join("Lisbon/IMG_9991.dng");
+        let copy2 = f.root.join("Lisbon/IMG_9992.dng");
+        std::fs::copy(&original, &copy1)?;
+        std::fs::copy(&original, &copy2)?;
+        let inputs = f.cat.sync_inputs(SyncScope::All)?;
+        let plan = scan(&inputs, &|_| true, Cancel::NEVER, &|n| match n {
+            1 => std::fs::rename(&original, &backup).unwrap(),
+            2 => std::fs::rename(&backup, &original).unwrap(),
+            _ => {}
+        })?;
+        assert!(plan.not_checked.is_empty(), "{:?}", plan.not_checked);
+        assert_eq!(plan.additions.len(), 2);
+        assert_eq!(plan.additions[0].file, copy1);
+        assert!(plan.additions[0].copy_of.is_empty());
+        assert_eq!(plan.additions[1].file, copy2);
+        assert_eq!(plan.additions[1].copy_of, [id]);
+        assert_eq!(plan.default_accepted().additions, vec![copy1]);
+        Ok(())
+    }
+
+    #[test]
+    fn state_of_cached_rechecks_anchor_reachability_after_ok_hit() -> Result<()> {
+        let f = fixture()?;
+        let a = f.root.join("Lisbon/IMG_1001.dng");
+        let b = f.root.join("Lisbon/IMG_1002.dng");
+        std::fs::remove_file(&a)?;
+        std::fs::remove_file(&b)?;
+        let mut cache = super::super::DirCheckCache::default();
+        let online = |_: &Path| true;
+        assert_eq!(
+            super::super::state_of_cached(Some(&a), Some(&f.root), &online, &mut cache),
+            super::super::FileState::Missing
+        );
+        // Rename the shared anchor mid-scan while the volume still reports online.
+        let moved_root = f._dir.path().join("moved-root");
+        std::fs::rename(&f.root, &moved_root)?;
+        assert_eq!(
+            super::super::state_of_cached(Some(&b), Some(&f.root), &online, &mut cache),
+            super::super::FileState::Unavailable
+        );
+        Ok(())
+    }
 }
 
 #[test]

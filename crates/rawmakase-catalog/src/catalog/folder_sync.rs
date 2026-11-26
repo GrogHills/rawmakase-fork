@@ -468,7 +468,9 @@ pub(super) fn current_master(db: &impl Reads, id: PhotoId) -> Result<Option<Mast
     }))
 }
 
-/// Memoizes `list_all(dir)` results per directory within one scan.
+/// Memoizes `list_all(dir)` results per directory within one scan, rechecking
+/// that a previously listed directory can still be opened so a directory gone
+/// mid-scan is never treated as evidence of missing files.
 #[derive(Default)]
 pub(super) struct DirCheckCache(HashMap<PathBuf, Result<(), std::sync::Arc<std::io::Error>>>);
 
@@ -478,6 +480,14 @@ impl DirCheckCache {
         directory: &Path,
     ) -> Result<(), std::sync::Arc<std::io::Error>> {
         if let Some(cached) = self.0.get(directory) {
+            if cached.is_ok() {
+                if let Err(e) = std::fs::read_dir(directory) {
+                    let err = Err(std::sync::Arc::new(e));
+                    self.0.insert(directory.to_path_buf(), err.clone());
+                    return err;
+                }
+                return Ok(());
+            }
             return cached.clone();
         }
         let result = list_all(directory).map_err(std::sync::Arc::new);

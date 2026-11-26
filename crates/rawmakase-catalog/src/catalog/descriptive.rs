@@ -171,26 +171,60 @@ impl Catalog {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
+        const CHUNK: usize = 64;
+        const BATCH_SQL: Sql = sql!(
+            "SELECT photo, keyword FROM photo_keywords WHERE photo IN (
+             ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+             ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+             ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+             ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        );
+        row! {
+            struct Membership {
+                photo: PhotoId,
+                keyword: i64,
+            }
+        }
+        let mut unique = Vec::with_capacity(ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        for &photo_id in ids {
+            if seen.insert(photo_id) {
+                unique.push(photo_id);
+            }
+        }
         self.db.snapshot(|s| {
-            let mut memberships: Vec<(PhotoId, Vec<i64>)> = Vec::with_capacity(ids.len());
-            let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            let mut memberships: HashMap<PhotoId, Vec<i64>> = HashMap::with_capacity(unique.len());
+            for &photo_id in &unique {
+                memberships.insert(photo_id, Vec::new());
+            }
             let mut any_keyword = false;
-            for &photo_id in ids {
-                if !seen.insert(photo_id) {
-                    continue;
+            for chunk in unique.chunks(CHUNK) {
+                if chunk.len() == 1 {
+                    let photo_id = chunk[0];
+                    let kw_ids: Vec<i64> = s.read(
+                        sql!("SELECT keyword FROM photo_keywords WHERE photo=?"),
+                        &[&photo_id],
+                    )?;
+                    if !kw_ids.is_empty() {
+                        any_keyword = true;
+                        memberships.insert(photo_id, kw_ids);
+                    }
+                } else {
+                    let pad = &chunk[chunk.len() - 1];
+                    let params: [&dyn super::value::ToValue; CHUNK] = std::array::from_fn(|i| {
+                        chunk.get(i).unwrap_or(pad) as &dyn super::value::ToValue
+                    });
+                    let rows: Vec<Membership> = s.read(BATCH_SQL, &params)?;
+                    for row in rows {
+                        any_keyword = true;
+                        if let Some(list) = memberships.get_mut(&row.photo) {
+                            list.push(row.keyword);
+                        }
+                    }
                 }
-                let kw_ids: Vec<i64> = s.read(
-                    sql!("SELECT keyword FROM photo_keywords WHERE photo=?"),
-                    &[&photo_id],
-                )?;
-                any_keyword |= !kw_ids.is_empty();
-                memberships.push((photo_id, kw_ids));
             }
             if !any_keyword {
-                return Ok(memberships
-                    .into_iter()
-                    .map(|(photo_id, _)| (photo_id, Vec::new()))
-                    .collect());
+                return Ok(unique.into_iter().map(|id| (id, Vec::new())).collect());
             }
             let mut steps: HashMap<i64, KeywordStep> = HashMap::new();
             let mut resolved: HashMap<i64, Keyword> = HashMap::new();

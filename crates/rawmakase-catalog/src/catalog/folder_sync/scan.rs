@@ -504,6 +504,7 @@ impl Matching<'_> {
         let Some(ids) = self.unhashed_present_by_size.remove(&size) else {
             return Ok(());
         };
+        let mut retry = Vec::new();
         for id in ids {
             if !self.go_on() {
                 bail!("Synchronization stopped");
@@ -523,9 +524,13 @@ impl Matching<'_> {
                     if !self.go_on() {
                         bail!("Synchronization stopped");
                     }
+                    retry.push(id);
                 }
                 Ok(ChecksumRead::Cancelled) => bail!("Synchronization stopped"),
             }
+        }
+        if !retry.is_empty() {
+            self.unhashed_present_by_size.insert(size, retry);
         }
         Ok(())
     }
