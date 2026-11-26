@@ -23,7 +23,7 @@ fn guided_upright_gestures_are_one_history_step_each() {
         recovered: Default::default(),
         width: 300,
         height: 200,
-        pixels: vec![[0.1; 3]; 60000],
+        pixels: std::sync::Arc::new(vec![[0.1; 3]; 60000]),
         metadata: Metadata {
             width: 300,
             height: 200,

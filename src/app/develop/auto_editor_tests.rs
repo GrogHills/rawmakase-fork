@@ -18,12 +18,14 @@ fn auto_is_one_undoable_step_that_keeps_edits_made_while_it_ran() {
         width,
         height,
         // A dim, warm gradient: Auto brightens it, and the WB menu's Auto cools it.
-        pixels: (0..width * height)
-            .map(|i| {
-                let v = 0.002 + 0.06 * (i % width) as f32 / width as f32;
-                [v * 1.2, v, v * 0.8]
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..width * height)
+                .map(|i| {
+                    let v = 0.002 + 0.06 * (i % width) as f32 / width as f32;
+                    [v * 1.2, v, v * 0.8]
+                })
+                .collect(),
+        ),
         metadata: Metadata {
             width,
             height,
@@ -156,7 +158,7 @@ fn auto_shortcut_starts_auto_once_the_photo_is_decoded() {
         recovered: Default::default(),
         width: 8,
         height: 8,
-        pixels: vec![[0.1; 3]; 64],
+        pixels: std::sync::Arc::new(vec![[0.1; 3]; 64]),
         metadata: Metadata {
             width: 8,
             height: 8,
@@ -238,7 +240,7 @@ fn auto_runs_again_when_the_crop_changed_while_it_ran() {
         recovered: Default::default(),
         width: 8,
         height: 8,
-        pixels: vec![[0.1; 3]; 64],
+        pixels: std::sync::Arc::new(vec![[0.1; 3]; 64]),
         metadata: Metadata {
             width: 8,
             height: 8,
@@ -278,7 +280,7 @@ fn auto_runs_again_when_it_failed_on_settings_changed_since() {
         recovered: Default::default(),
         width: 8,
         height: 8,
-        pixels: vec![[0.1; 3]; 64],
+        pixels: std::sync::Arc::new(vec![[0.1; 3]; 64]),
         metadata: Metadata {
             width: 8,
             height: 8,
@@ -378,12 +380,14 @@ fn auto_white_balance_on_a_jpeg_sets_its_relative_temp_and_tint() {
         recovered: Default::default(),
         width,
         height,
-        pixels: (0..width * height)
-            .map(|i| {
-                let v = 0.05 + 0.5 * (i % width) as f32 / width as f32;
-                [v * 1.2, v, v * 0.8]
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..width * height)
+                .map(|i| {
+                    let v = 0.05 + 0.5 * (i % width) as f32 / width as f32;
+                    [v * 1.2, v, v * 0.8]
+                })
+                .collect(),
+        ),
         metadata: metadata.clone(),
         fast: false,
         scale_factor: 1.,

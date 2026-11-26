@@ -343,7 +343,7 @@ mod tests {
         let im = CameraImage {
             width: 100,
             height: 50,
-            pixels: vec![[0.2; 3]; 5000],
+            pixels: std::sync::Arc::new(vec![[0.2; 3]; 5000]),
             metadata: Metadata {
                 width: 100,
                 height: 50,
@@ -387,17 +387,19 @@ mod tests {
         let im = CameraImage {
             width: 64,
             height: 64,
-            pixels: (0..64 * 64)
-                .map(|i| {
-                    let x = i % 64;
-                    let l = 0.1 + 0.06 * (std::f32::consts::TAU * x as f32 / 3.8).sin();
-                    if x == 34 {
-                        [l * 1.5, l, l * 0.5]
-                    } else {
-                        [l; 3]
-                    }
-                })
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..64 * 64)
+                    .map(|i| {
+                        let x = i % 64;
+                        let l = 0.1 + 0.06 * (std::f32::consts::TAU * x as f32 / 3.8).sin();
+                        if x == 34 {
+                            [l * 1.5, l, l * 0.5]
+                        } else {
+                            [l; 3]
+                        }
+                    })
+                    .collect(),
+            ),
             metadata: Metadata::default(),
             recovered: Default::default(),
             fast: false,

@@ -99,7 +99,7 @@ impl AiBlend {
             recovered: Default::default(),
             width: plain.width,
             height: plain.height,
-            pixels,
+            pixels: Arc::new(pixels),
             metadata: plain.metadata.clone(),
             fast: plain.fast,
             scale_factor: plain.scale_factor,
@@ -123,9 +123,11 @@ mod tests {
             recovered: Default::default(),
             width: 24,
             height: 16,
-            pixels: (0..24 * 16)
-                .map(|i| pixel.map(|v| v * (0.9 + (i % 5) as f32 * 0.05)))
-                .collect(),
+            pixels: Arc::new(
+                (0..24 * 16)
+                    .map(|i| pixel.map(|v| v * (0.9 + (i % 5) as f32 * 0.05)))
+                    .collect(),
+            ),
             metadata: Metadata {
                 width: 24,
                 height: 16,
@@ -182,8 +184,8 @@ mod tests {
         for ((h, p), a) in half
             .pixels
             .iter()
-            .zip(&plain.pixels)
-            .zip(&ai.image().pixels)
+            .zip(plain.pixels.iter())
+            .zip(ai.image().pixels.iter())
         {
             // Camera Raw's weights at 50: 0.70 of the luminance change, 0.75 of colour's.
             let d: [f32; 3] = std::array::from_fn(|c| a[c] - p[c]);

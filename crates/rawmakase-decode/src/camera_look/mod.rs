@@ -197,11 +197,12 @@ fn clip_indicator(
         width: im.width,
         height: im.height,
         recovered: Default::default(),
-        pixels: im
-            .pixels
-            .iter()
-            .map(|p| [f32::from(u8::from((0..3).any(|c| p[c] / wb[c] >= 0.99))); 3])
-            .collect(),
+        pixels: std::sync::Arc::new(
+            im.pixels
+                .iter()
+                .map(|p| [f32::from(u8::from((0..3).any(|c| p[c] / wb[c] >= 0.99))); 3])
+                .collect(),
+        ),
         metadata: im.metadata.clone(),
         fast: im.fast,
         scale_factor: im.scale_factor,
@@ -802,7 +803,7 @@ mod tests {
         let im = CameraImage {
             width: w,
             height: h,
-            pixels,
+            pixels: std::sync::Arc::new(pixels),
             metadata: Metadata {
                 width: w,
                 height: h,

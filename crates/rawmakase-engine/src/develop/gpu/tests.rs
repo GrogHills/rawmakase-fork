@@ -1,6 +1,9 @@
 use super::*;
 use crate::develop::masks::local::LocalDeltas;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[test]
 fn windows_leaves_vulkan_out_while_directx_works() {
@@ -58,21 +61,23 @@ fn gpu_clarity_reconstructs_fine_edges_like_the_cpu() -> Result<()> {
     let image = CameraImage {
         width: w,
         height: h,
-        pixels: (0..w * h)
-            .map(|i| {
-                // A one-pixel rail is finer than the measurement grid. Both sides,
-                // different brightnesses and the floor exercise reconstruction.
-                let x = i % w;
-                let level = if x % 64 == 31 {
-                    0.6
-                } else if x < w / 2 {
-                    0.08
-                } else {
-                    0.00001
-                };
-                [level; 3]
-            })
-            .collect(),
+        pixels: Arc::new(
+            (0..w * h)
+                .map(|i| {
+                    // A one-pixel rail is finer than the measurement grid. Both sides,
+                    // different brightnesses and the floor exercise reconstruction.
+                    let x = i % w;
+                    let level = if x % 64 == 31 {
+                        0.6
+                    } else if x < w / 2 {
+                        0.08
+                    } else {
+                        0.00001
+                    };
+                    [level; 3]
+                })
+                .collect(),
+        ),
         metadata: metadata.clone(),
         recovered: Default::default(),
         fast: false,
@@ -83,7 +88,7 @@ fn gpu_clarity_reconstructs_fine_edges_like_the_cpu() -> Result<()> {
     let samples = Arc::new(Samples {
         width: w,
         height: h,
-        pixels: image.pixels.clone(),
+        pixels: image.pixels.to_vec(),
         positions: (0..w * h)
             .map(|i| [(i % w) as f32, (i / w) as f32])
             .collect(),
@@ -183,17 +188,19 @@ fn gpu_measured_tails_match_cpu_globally_and_in_masks() -> Result<()> {
     let image = CameraImage {
         width: 240,
         height: 240,
-        pixels: (0..240 * 240)
-            .map(|i| {
-                let (x, y) = (i % 240, i / 240);
-                let radius = (x as f32 - 120.).hypot(y as f32 - 120.);
-                // 10 stops over the background, past the Highlights table's top (7);
-                // the left half in 2-pixel stripes, where the tail reads the fine mean.
-                let stripe = x < 120 && y / 2 % 2 == 0;
-                let level = if stripe { 0. } else { (45. - radius) / 25. };
-                [(-7. + 10. * level.clamp(0., 1.)).exp2(); 3]
-            })
-            .collect(),
+        pixels: Arc::new(
+            (0..240 * 240)
+                .map(|i| {
+                    let (x, y) = (i % 240, i / 240);
+                    let radius = (x as f32 - 120.).hypot(y as f32 - 120.);
+                    // 10 stops over the background, past the Highlights table's top (7);
+                    // the left half in 2-pixel stripes, where the tail reads the fine mean.
+                    let stripe = x < 120 && y / 2 % 2 == 0;
+                    let level = if stripe { 0. } else { (45. - radius) / 25. };
+                    [(-7. + 10. * level.clamp(0., 1.)).exp2(); 3]
+                })
+                .collect(),
+        ),
         metadata: metadata.clone(),
         recovered: Default::default(),
         fast: false,
@@ -204,7 +211,7 @@ fn gpu_measured_tails_match_cpu_globally_and_in_masks() -> Result<()> {
     let samples = Arc::new(Samples {
         width: 240,
         height: 240,
-        pixels: image.pixels.clone(),
+        pixels: image.pixels.to_vec(),
         positions: (0..240 * 240)
             .map(|i| [(i % 240) as f32, (i / 240) as f32])
             .collect(),
@@ -368,13 +375,15 @@ fn gpu_preview_preserves_regions_spatial_effects_and_falls_back() -> Result<()> 
     let image = CameraImage {
         width: 137,
         height: 91,
-        pixels: (0..137 * 91)
-            .map(|i| {
-                let x = (i % 137) as f32 / 137.;
-                let y = (i / 137) as f32 / 91.;
-                [x * 1.2, y * 0.8, 0.2 + x * y]
-            })
-            .collect(),
+        pixels: Arc::new(
+            (0..137 * 91)
+                .map(|i| {
+                    let x = (i % 137) as f32 / 137.;
+                    let y = (i / 137) as f32 / 91.;
+                    [x * 1.2, y * 0.8, 0.2 + x * y]
+                })
+                .collect(),
+        ),
         metadata: Metadata {
             width: 137,
             height: 91,
@@ -488,9 +497,11 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
     let image = Arc::new(CameraImage {
         width: 64,
         height: 48,
-        pixels: (0..64 * 48)
-            .map(|i| [wave(i, 0.37) * 1.3, wave(i, 0.21), wave(i, 0.13) * 1.1])
-            .collect(),
+        pixels: Arc::new(
+            (0..64 * 48)
+                .map(|i| [wave(i, 0.37) * 1.3, wave(i, 0.21), wave(i, 0.13) * 1.1])
+                .collect(),
+        ),
         metadata: metadata.clone(),
         recovered: Default::default(),
         fast: false,
@@ -501,11 +512,13 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
     // The same with its darkest level lifted to about 2^-6, where Camera Raw's default
     // black adapts to it (`GlobalTone`'s default black).
     let lifted = Arc::new(CameraImage {
-        pixels: image
-            .pixels
-            .iter()
-            .map(|p| p.map(|v| 0.02 + 0.9 * v))
-            .collect(),
+        pixels: Arc::new(
+            image
+                .pixels
+                .iter()
+                .map(|p| p.map(|v| 0.02 + 0.9 * v))
+                .collect(),
+        ),
         ..(*image).clone()
     });
     let n = 4000;
@@ -680,7 +693,7 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
     let rendered_samples = Arc::new(Samples {
         width: srgb.len() as u32,
         height: 1,
-        pixels: rendered.pixels.clone(),
+        pixels: rendered.pixels.to_vec(),
         positions: (0..srgb.len()).map(|i| [i as f32, 0.]).collect(),
     });
     let untouched = Recipe::for_rendered(&rendered.metadata);
@@ -876,29 +889,31 @@ fn check_presented_previews(w: u32, h: u32, ca_only: bool) -> Result<()> {
     let image = CameraImage {
         width: w,
         height: h,
-        pixels: (0..w * h)
-            .map(|i| {
-                let (x, y) = ((i % w) as f32, (i / w) as f32);
-                // A finite constant-colour strip exercises one-sided coherence
-                // at its boundary, alongside the varied surrounding texture.
-                if (32..68).contains(&(i / w)) {
-                    let period = if ca_only && y >= 50. { 3.8 } else { 3.03 };
-                    let phase = if ca_only {
-                        std::f32::consts::FRAC_PI_4
-                    } else {
-                        0.
-                    };
-                    let v = 0.1 + 0.06 * (std::f32::consts::TAU * x / period + phase).sin();
-                    return [1.08 * v, v, 0.92 * v];
-                }
-                // Fine stripes exercise the CPU/GPU CA chromaticity safeguard too.
-                let v = 0.3
-                    + 0.15 * (x * 0.21).sin() * (y * 0.13).cos()
-                    + 0.08 * (x * 0.9).sin()
-                    + 0.06 * (std::f32::consts::TAU * x / 3.03).sin();
-                [v * 1.3, v, v * 0.8 + x / w as f32 * 0.3]
-            })
-            .collect(),
+        pixels: Arc::new(
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f32, (i / w) as f32);
+                    // A finite constant-colour strip exercises one-sided coherence
+                    // at its boundary, alongside the varied surrounding texture.
+                    if (32..68).contains(&(i / w)) {
+                        let period = if ca_only && y >= 50. { 3.8 } else { 3.03 };
+                        let phase = if ca_only {
+                            std::f32::consts::FRAC_PI_4
+                        } else {
+                            0.
+                        };
+                        let v = 0.1 + 0.06 * (std::f32::consts::TAU * x / period + phase).sin();
+                        return [1.08 * v, v, 0.92 * v];
+                    }
+                    // Fine stripes exercise the CPU/GPU CA chromaticity safeguard too.
+                    let v = 0.3
+                        + 0.15 * (x * 0.21).sin() * (y * 0.13).cos()
+                        + 0.08 * (x * 0.9).sin()
+                        + 0.06 * (std::f32::consts::TAU * x / 3.03).sin();
+                    [v * 1.3, v, v * 0.8 + x / w as f32 * 0.3]
+                })
+                .collect(),
+        ),
         metadata: metadata.clone(),
         recovered: Default::default(),
         fast: false,
@@ -1119,9 +1134,11 @@ fn panning_never_writes_the_drawn_region() -> Result<()> {
     let image = CameraImage {
         width: w,
         height: h,
-        pixels: (0..w * h)
-            .map(|i| [0.2 + (i % w) as f32 / w as f32 * 0.5, 0.3, 0.4])
-            .collect(),
+        pixels: Arc::new(
+            (0..w * h)
+                .map(|i| [0.2 + (i % w) as f32 / w as f32 * 0.5, 0.3, 0.4])
+                .collect(),
+        ),
         metadata: Metadata {
             width: w,
             height: h,
@@ -1211,9 +1228,11 @@ fn gpu_masks_match_cpu_pixel_stage() -> Result<()> {
     let image = Arc::new(CameraImage {
         width: 64,
         height: 48,
-        pixels: (0..64 * 48)
-            .map(|i| [wave(i, 0.37) * 1.3, wave(i, 0.21), wave(i, 0.13) * 1.1])
-            .collect(),
+        pixels: Arc::new(
+            (0..64 * 48)
+                .map(|i| [wave(i, 0.37) * 1.3, wave(i, 0.21), wave(i, 0.13) * 1.1])
+                .collect(),
+        ),
         metadata: metadata.clone(),
         recovered: Default::default(),
         fast: false,
@@ -1435,13 +1454,16 @@ fn kept_stages_present_the_frames_of_a_fresh_renderer() -> Result<()> {
     let image = Arc::new(CameraImage {
         width: w,
         height: h,
-        pixels: (0..w * h)
-            .map(|i| {
-                let (x, y) = ((i % w) as f32, (i / w) as f32);
-                let v = 0.2 + 0.25 * (x * 0.17).sin() * (y * 0.11).cos() + 0.15 * (x / w as f32);
-                [v * 1.3, v, v * 0.8]
-            })
-            .collect(),
+        pixels: Arc::new(
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f32, (i / w) as f32);
+                    let v =
+                        0.2 + 0.25 * (x * 0.17).sin() * (y * 0.11).cos() + 0.15 * (x / w as f32);
+                    [v * 1.3, v, v * 0.8]
+                })
+                .collect(),
+        ),
         metadata: metadata.clone(),
         recovered: Default::default(),
         fast: false,
@@ -1529,9 +1551,11 @@ fn an_unsubmitted_pass_leaves_its_kept_colour_unwritten() -> Result<()> {
     let image = CameraImage {
         width: w,
         height: h,
-        pixels: (0..w * h)
-            .map(|i| [0.1 + (i % w) as f32 / 60., 0.2, 0.15])
-            .collect(),
+        pixels: Arc::new(
+            (0..w * h)
+                .map(|i| [0.1 + (i % w) as f32 / 60., 0.2, 0.15])
+                .collect(),
+        ),
         metadata: metadata.clone(),
         recovered: Default::default(),
         fast: false,
@@ -1752,12 +1776,14 @@ fn check_lens_render(
     let image = CameraImage {
         width: w,
         height: h,
-        pixels: (0..w * h)
-            .map(|i| {
-                let v = 0.1 + 0.03 * (i as f32 * 0.13).sin();
-                [v * 1.1, v, v * 0.9]
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..w * h)
+                .map(|i| {
+                    let v = 0.1 + 0.03 * (i as f32 * 0.13).sin();
+                    [v * 1.1, v, v * 0.9]
+                })
+                .collect(),
+        ),
         metadata,
         recovered: Default::default(),
         fast: false,

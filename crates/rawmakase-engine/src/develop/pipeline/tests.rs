@@ -18,9 +18,11 @@ fn fixture() -> CameraImage {
         recovered: Default::default(),
         width: 12,
         height: 8,
-        pixels: (0..96)
-            .map(|i| [0.02 + i as f32 / 200., 0.1 + i as f32 / 500., 0.04])
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..96)
+                .map(|i| [0.02 + i as f32 / 200., 0.1 + i as f32 / 500., 0.04])
+                .collect(),
+        ),
         metadata: m,
         fast: false,
         scale_factor: 1.,
@@ -46,10 +48,11 @@ pub(crate) fn rendered_fixture(srgb: &[[u8; 3]]) -> CameraImage {
         recovered: Default::default(),
         width,
         height: 1,
-        pixels: srgb
-            .iter()
-            .map(|p| crate::color::mul(RGB_TO_PRO, p.map(decode)))
-            .collect(),
+        pixels: std::sync::Arc::new(
+            srgb.iter()
+                .map(|p| crate::color::mul(RGB_TO_PRO, p.map(decode)))
+                .collect(),
+        ),
         metadata: Metadata {
             width,
             height: 1,
@@ -589,7 +592,7 @@ fn wb_at_estimated_as_shot_is_continuous() {
 #[test]
 fn neutral_picker_balances_channels() {
     let mut im = fixture();
-    im.pixels.fill([0.4, 0.2, 0.1]);
+    std::sync::Arc::make_mut(&mut im.pixels).fill([0.4, 0.2, 0.1]);
     let r = Recipe::default();
     assert_eq!(neutral_pick(&im, &r, 0.5, 0.5), [0.5, 1., 2.]);
 }
@@ -603,7 +606,7 @@ fn clipped_channels_do_not_make_magenta_highlights() -> Result<()> {
         [0.0402, -0.4608, 1.4206],
     ];
     // Every channel clipped: highlight recovery makes the pixel neutral.
-    im.pixels.fill([2.5, 1., 1.4]);
+    std::sync::Arc::make_mut(&mut im.pixels).fill([2.5, 1., 1.4]);
     for exposure in [-3., 0., 2.] {
         let r = Recipe {
             exposure,
@@ -622,7 +625,10 @@ fn clipped_channels_do_not_make_magenta_highlights() -> Result<()> {
 #[test]
 fn temperature_leaves_the_photos_maximum_in_place() -> anyhow::Result<()> {
     let mut im = fixture();
-    for p in im.pixels.iter_mut().step_by(3) {
+    for p in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .step_by(3)
+    {
         *p = [0.9, 0.5, 0.2];
     }
     let profile: crate::camera_profiles::CameraProfile =
@@ -660,15 +666,20 @@ fn a_few_dark_pixels_move_the_minimum_but_not_the_dark_level() {
     im.height = height;
     im.metadata.width = width;
     im.metadata.height = height;
-    im.pixels = (0..(width * height) as usize)
-        .map(|i| [0.05 + (i % 128) as f32 / 400.; 3])
-        .collect();
+    im.pixels = std::sync::Arc::new(
+        (0..(width * height) as usize)
+            .map(|i| [0.05 + (i % 128) as f32 / 400.; 3])
+            .collect(),
+    );
     let r = Recipe::default();
     let camera = camera_stage(&im.metadata, &r);
     let measures = |im: &CameraImage| CurveSet::with_photo_measures(im.into(), &r, camera).measures;
     let plain = measures(&im);
-    for (x, y) in [(60, 40), (61, 40), (60, 41), (61, 41)] {
-        im.pixels[y * width as usize + x] = [0.001; 3];
+    {
+        let pixels = std::sync::Arc::make_mut(&mut im.pixels);
+        for (x, y) in [(60, 40), (61, 40), (60, 41), (61, 41)] {
+            pixels[y * width as usize + x] = [0.001; 3];
+        }
     }
     let spotted = measures(&im);
     assert!(
@@ -734,7 +745,7 @@ fn a_camera_without_colour_data_renders_through_no_profile() {
 #[test]
 fn the_camera_input_stage_is_before_highlight_reconstruction() -> anyhow::Result<()> {
     let mut im = fixture();
-    im.pixels[13] = [0.8, 0.5, 0.4];
+    std::sync::Arc::make_mut(&mut im.pixels)[13] = [0.8, 0.5, 0.4];
     let r = Recipe {
         wb: [1.5, 1., 0.8],
         ..Default::default()
@@ -746,7 +757,7 @@ fn the_camera_input_stage_is_before_highlight_reconstruction() -> anyhow::Result
         Cancel::NEVER,
     )?;
     assert_eq!([camera.width, camera.height], [12, 8]);
-    for (got, p) in camera.pixels.iter().zip(&im.pixels) {
+    for (got, p) in camera.pixels.iter().zip(im.pixels.iter()) {
         let want: [f32; 3] = std::array::from_fn(|c| p[c] * r.wb[c]);
         assert!(
             got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-6),
@@ -797,7 +808,10 @@ fn settings_after_the_scene_stage_leave_it_unchanged() -> anyhow::Result<()> {
 fn exposure_reveals_retained_highlights() {
     // A photo whose highlights were rebuilt to twice the sensor's white.
     let mut im = fixture();
-    for p in im.pixels.iter_mut().step_by(2) {
+    for p in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .step_by(2)
+    {
         *p = [2.; 3];
     }
     let pixel = |exposure: f32, v: f32| {
@@ -905,7 +919,7 @@ fn neutral_color_fast_path_matches_general_processing() {
 fn builtin_lens_correction_brightens_corners_and_keeps_regions_consistent() {
     use crate::optics::{LensCorrection, Radial};
     let mut im = fixture();
-    im.pixels = vec![[0.1; 3]; 96];
+    im.pixels = std::sync::Arc::new(vec![[0.1; 3]; 96]);
     im.metadata.lens = Some(LensCorrection {
         source: "test".into(),
         default_on: true,
@@ -950,7 +964,7 @@ fn builtin_lens_correction_brightens_corners_and_keeps_regions_consistent() {
 fn opcode_gain_maps_scale_each_channel_where_the_grid_says() {
     use crate::optics::{GainGrid, LensCorrection};
     let mut im = fixture();
-    im.pixels = vec![[0.1; 3]; 96];
+    im.pixels = std::sync::Arc::new(vec![[0.1; 3]; 96]);
     let w = im.width as f32;
     // Two columns of points: gain 1 on the first column of pixels; on the last, red 2,
     // green 1.5, blue 1.
@@ -1011,7 +1025,7 @@ fn opcode_gain_maps_scale_each_channel_where_the_grid_says() {
 fn measurement_copies_carry_the_gain_map() {
     use crate::optics::{GainGrid, LensCorrection};
     let mut im = fixture();
-    im.pixels = vec![[0.1; 3]; 96];
+    im.pixels = std::sync::Arc::new(vec![[0.1; 3]; 96]);
     im.metadata.lens = Some(LensCorrection {
         source: "DNG opcodes".into(),
         default_on: true,
@@ -1044,7 +1058,7 @@ fn measurement_copies_carry_the_gain_map() {
 fn gain_maps_before_a_warp_follow_each_channels_source() {
     use crate::optics::{GainGrid, LensCorrection, Radial};
     let mut im = fixture();
-    im.pixels = vec![[0.1; 3]; 96];
+    im.pixels = std::sync::Arc::new(vec![[0.1; 3]; 96]);
     let w = im.width as f32;
     im.metadata.lens = Some(LensCorrection {
         source: "DNG opcodes".into(),
@@ -1207,7 +1221,7 @@ fn constrain_crop_renders_no_white() {
         recovered: Default::default(),
         width: 90,
         height: 60,
-        pixels: vec![[0.1; 3]; 90 * 60],
+        pixels: std::sync::Arc::new(vec![[0.1; 3]; 90 * 60]),
         metadata: m,
         fast: false,
         scale_factor: 1.,
@@ -1485,7 +1499,7 @@ fn targeted_adjustments_sample_the_photo_where_each_control_sees_it() -> anyhow:
         recovered: Default::default(),
         width: 40,
         height: 10,
-        pixels: (0..400).map(|i| patches[(i % 40) / 10]).collect(),
+        pixels: std::sync::Arc::new((0..400).map(|i| patches[(i % 40) / 10]).collect()),
         metadata: m,
         fast: false,
         scale_factor: 1.,
@@ -1584,7 +1598,7 @@ fn lens_photo() -> CameraImage {
         recovered: Default::default(),
         width: 90,
         height: 60,
-        pixels: vec![[0.1; 3]; 90 * 60],
+        pixels: std::sync::Arc::new(vec![[0.1; 3]; 90 * 60]),
         metadata: m,
         fast: false,
         scale_factor: 1.,
@@ -1789,7 +1803,10 @@ fn contrast_and_the_scene_stage_are_measured_on_the_photo_alone() {
         [-0.0666, 0.1479, 0.52],
     ];
     // Dark with a few bright pixels, so the pivot is not the typical one.
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         *p = if i % 9 == 0 {
             [0.9; 3]
         } else {
@@ -1888,7 +1905,7 @@ fn a_looks_parametric_curve_follows_the_users() {
 #[test]
 fn measured_manual_vignetting_darkens_the_photo_not_the_crop() {
     let mut im = fixture();
-    im.pixels = vec![[0.1; 3]; 96];
+    im.pixels = std::sync::Arc::new(vec![[0.1; 3]; 96]);
     let mut r = Recipe::for_metadata(&im.metadata);
     r.effects.lens_vignette = -0.5;
     let lum = |p: [f32; 3]| p.iter().sum::<f32>();
@@ -1947,7 +1964,7 @@ fn new_edits_render_grain_at_camera_raw_strength() -> anyhow::Result<()> {
         recovered: Default::default(),
         width,
         height,
-        pixels: vec![[0.18; 3]; (width * height) as usize],
+        pixels: std::sync::Arc::new(vec![[0.18; 3]; (width * height) as usize]),
         metadata: m.clone(),
         fast: false,
         scale_factor: 1.,
@@ -2005,12 +2022,14 @@ fn new_edits_reduce_colour_noise_as_camera_raw() -> anyhow::Result<()> {
         recovered: Default::default(),
         width,
         height,
-        pixels: (0..width * height)
-            .map(|i| {
-                let (x, y) = (i % width, i / width);
-                std::array::from_fn(|c| 0.18 * (1. + 0.08 * noise(x, y, c as u32)))
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..width * height)
+                .map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    std::array::from_fn(|c| 0.18 * (1. + 0.08 * noise(x, y, c as u32)))
+                })
+                .collect(),
+        ),
         metadata: m.clone(),
         fast: false,
         scale_factor: 1.,
@@ -2081,15 +2100,17 @@ fn colour_blotches_are_taken_out() -> anyhow::Result<()> {
         recovered: Default::default(),
         width,
         height,
-        pixels: (0..width * height)
-            .map(|i| {
-                let (x, y) = (i % width, i / width);
-                std::array::from_fn(|c| {
-                    let c = c as u32;
-                    0.18 * (1. + amplitude * (0.5 * hash(x, y, c) + blotch(x, y, c)))
+        pixels: std::sync::Arc::new(
+            (0..width * height)
+                .map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    std::array::from_fn(|c| {
+                        let c = c as u32;
+                        0.18 * (1. + amplitude * (0.5 * hash(x, y, c) + blotch(x, y, c)))
+                    })
                 })
-            })
-            .collect(),
+                .collect(),
+        ),
         metadata: m.clone(),
         fast: false,
         scale_factor: 1.,
@@ -2149,12 +2170,14 @@ fn noisy_luminance_fixture() -> CameraImage {
         v ^= v >> 12;
         v as f32 / u32::MAX as f32 - 0.5
     };
-    im.pixels = (0..128 * 128)
-        .map(|i| {
-            let (x, y) = (i % 128, i / 128);
-            [0.1 + 0.02 * hash(x, y) + 0.025 * hash(x / 4, y / 4); 3]
-        })
-        .collect();
+    im.pixels = std::sync::Arc::new(
+        (0..128 * 128)
+            .map(|i| {
+                let (x, y) = (i % 128, i / 128);
+                [0.1 + 0.02 * hash(x, y) + 0.025 * hash(x / 4, y / 4); 3]
+            })
+            .collect(),
+    );
     im
 }
 
@@ -2228,17 +2251,19 @@ fn lens_ca_stripe_error(period: f32, phase: f32) -> f32 {
     im.metadata.width = im.width;
     im.metadata.height = im.height;
     im.metadata.xtrans = true;
-    im.pixels = (0..192 * 192)
-        .map(|i| {
-            let l = 0.1
-                + if (76..112).contains(&(i / 192)) {
-                    0.06 * (std::f32::consts::TAU * (i % 192) as f32 / period + phase).sin()
-                } else {
-                    0.
-                };
-            [1.08 * l, l, 0.92 * l]
-        })
-        .collect();
+    im.pixels = std::sync::Arc::new(
+        (0..192 * 192)
+            .map(|i| {
+                let l = 0.1
+                    + if (76..112).contains(&(i / 192)) {
+                        0.06 * (std::f32::consts::TAU * (i % 192) as f32 / period + phase).sin()
+                    } else {
+                        0.
+                    };
+                [1.08 * l, l, 0.92 * l]
+            })
+            .collect(),
+    );
     im.metadata.lens = Some(LensCorrection {
         source: "test".into(),
         default_on: true,
@@ -2298,32 +2323,34 @@ fn stripe_ca_guard_keeps_isolated_edges_resolved_colour_and_noise() {
     });
     for case in 0..5 {
         let mut seed = 0x23456789u32;
-        im.pixels = (0..192 * 64)
-            .map(|i| {
-                let x = (i % 192) as f32;
-                if case == 1 {
-                    let v = (std::f32::consts::TAU * x / 3.03).sin();
-                    [0.1 + 0.07 * v, 0.1 - 0.06 * v, 0.1 + 0.04 * v]
-                } else if case == 3 {
-                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                    let l = 0.08 + 0.04 * (seed >> 8) as f32 / 16777216.;
-                    [1.08 * l, l, 0.92 * l]
-                } else if case == 2 {
-                    std::array::from_fn(|_| {
+        im.pixels = std::sync::Arc::new(
+            (0..192 * 64)
+                .map(|i| {
+                    let x = (i % 192) as f32;
+                    if case == 1 {
+                        let v = (std::f32::consts::TAU * x / 3.03).sin();
+                        [0.1 + 0.07 * v, 0.1 - 0.06 * v, 0.1 + 0.04 * v]
+                    } else if case == 3 {
                         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                        0.1 + 0.04 * ((seed >> 8) as f32 / 16777216. - 0.5)
-                    })
-                } else {
-                    let edge = |x: f32| 0.03 + 0.2 / (1. + (-(x - 70.) / 2.).exp());
-                    let slat = if case == 4 && x < 68. {
-                        1. + 0.25 * (std::f32::consts::TAU * (i / 192) as f32 / 3.03).sin()
+                        let l = 0.08 + 0.04 * (seed >> 8) as f32 / 16777216.;
+                        [1.08 * l, l, 0.92 * l]
+                    } else if case == 2 {
+                        std::array::from_fn(|_| {
+                            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                            0.1 + 0.04 * ((seed >> 8) as f32 / 16777216. - 0.5)
+                        })
                     } else {
-                        1.
-                    };
-                    [edge(x + 0.3) * slat, edge(x) * slat, edge(x - 0.2) * slat]
-                }
-            })
-            .collect();
+                        let edge = |x: f32| 0.03 + 0.2 / (1. + (-(x - 70.) / 2.).exp());
+                        let slat = if case == 4 && x < 68. {
+                            1. + 0.25 * (std::f32::consts::TAU * (i / 192) as f32 / 3.03).sin()
+                        } else {
+                            1.
+                        };
+                        [edge(x + 0.3) * slat, edge(x) * slat, edge(x - 0.2) * slat]
+                    }
+                })
+                .collect(),
+        );
         let mut unguarded = im.clone();
         unguarded.metadata.xtrans = false;
         let r = Recipe::for_metadata(&im.metadata);
@@ -2360,7 +2387,7 @@ fn a_lensfun_choice_reaches_the_warp_and_the_gpu() {
     let im = CameraImage {
         width: metadata.width,
         height: metadata.height,
-        pixels: vec![[0.2; 3]; (metadata.width * metadata.height) as usize],
+        pixels: std::sync::Arc::new(vec![[0.2; 3]; (metadata.width * metadata.height) as usize]),
         metadata,
         recovered: Default::default(),
         fast: false,

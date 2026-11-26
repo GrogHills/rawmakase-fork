@@ -605,7 +605,7 @@ mod sampling_tests {
         let mut im = CameraImage {
             width: 256,
             height: 128,
-            pixels: vec![],
+            pixels: Default::default(),
             metadata: Metadata {
                 wb: [1.; 3],
                 daylight_wb: [1.; 3],
@@ -621,9 +621,11 @@ mod sampling_tests {
         };
         im.metadata.width = im.width;
         im.metadata.height = im.height;
-        im.pixels = (0..im.width * im.height)
-            .map(|i| [i as f32 % im.width as f32 / im.width as f32; 3])
-            .collect();
+        im.pixels = std::sync::Arc::new(
+            (0..im.width * im.height)
+                .map(|i| [i as f32 % im.width as f32 / im.width as f32; 3])
+                .collect(),
+        );
         im.metadata.lens = Some(LensCorrection {
             source: "test".into(),
             default_on: true,

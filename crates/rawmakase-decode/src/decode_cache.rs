@@ -286,16 +286,32 @@ impl DecodeCache {
             recovered: Default::default(),
             width: header.width,
             height: header.height,
-            pixels,
+            pixels: Arc::new(pixels),
             metadata,
             fast: header.fast,
             scale_factor: header.scale_factor,
             scale_clipped: header.scale_clipped,
             hdr: Default::default(),
         };
-        let mut recovered = CameraImage {
+        let recovered_pixels = if changes.is_empty() {
+            image.pixels.clone()
+        } else {
+            let mut recovered_pixels = vec![[0.; 3]; image.pixels.len()];
+            recovered_pixels
+                .par_chunks_mut(1 << 20)
+                .zip(image.pixels.par_chunks(1 << 20))
+                .for_each(|(a, b)| a.copy_from_slice(b));
+            for change in changes {
+                let p = recovered_pixels
+                    .get_mut(change.index as usize)
+                    .context("Invalid recovered pixel")?;
+                *p = change.value;
+            }
+            Arc::new(recovered_pixels)
+        };
+        let recovered = CameraImage {
             recovered: Default::default(),
-            pixels: vec![[0.; 3]; image.pixels.len()],
+            pixels: recovered_pixels,
             metadata: image.metadata.clone(),
             width: image.width,
             height: image.height,
@@ -304,18 +320,6 @@ impl DecodeCache {
             scale_clipped: image.scale_clipped,
             hdr: Default::default(),
         };
-        recovered
-            .pixels
-            .par_chunks_mut(1 << 20)
-            .zip(image.pixels.par_chunks(1 << 20))
-            .for_each(|(a, b)| a.copy_from_slice(b));
-        for change in changes {
-            let p = recovered
-                .pixels
-                .get_mut(change.index as usize)
-                .context("Invalid recovered pixel")?;
-            *p = change.value;
-        }
         let _ = image.recovered.set(Arc::new(recovered));
         Ok(image)
     }
@@ -334,30 +338,35 @@ impl DecodeCache {
             recovered.pixels.len() == image.pixels.len(),
             "Recovered size mismatch"
         );
-        const CHUNK: usize = 65_536;
-        let chunks: Vec<Vec<Change>> = image
-            .pixels
-            .par_chunks(CHUNK)
-            .zip(recovered.pixels.par_chunks(CHUNK))
-            .enumerate()
-            .map(|(chunk_idx, (a, b))| {
-                let base = chunk_idx * CHUNK;
-                let mut local = Vec::new();
-                for (offset, (pa, pb)) in a.iter().zip(b).enumerate() {
-                    if pa != pb {
-                        local.push(Change {
-                            index: (base + offset) as u32,
-                            value: *pb,
-                        });
+        let changes = if Arc::ptr_eq(&image.pixels, &recovered.pixels) {
+            Vec::new()
+        } else {
+            const CHUNK: usize = 65_536;
+            let chunks: Vec<Vec<Change>> = image
+                .pixels
+                .par_chunks(CHUNK)
+                .zip(recovered.pixels.par_chunks(CHUNK))
+                .enumerate()
+                .map(|(chunk_idx, (a, b))| {
+                    let base = chunk_idx * CHUNK;
+                    let mut local = Vec::new();
+                    for (offset, (pa, pb)) in a.iter().zip(b).enumerate() {
+                        if pa != pb {
+                            local.push(Change {
+                                index: (base + offset) as u32,
+                                value: *pb,
+                            });
+                        }
                     }
-                }
-                local
-            })
-            .collect();
-        let mut changes = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
-        for c in chunks {
-            changes.extend(c);
-        }
+                    local
+                })
+                .collect();
+            let mut changes = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+            for c in chunks {
+                changes.extend(c);
+            }
+            changes
+        };
         let header = serde_json::to_vec(&Header {
             key: key.into(),
             width: image.width,
@@ -572,13 +581,15 @@ mod tests {
     }
 
     fn image(width: u32, height: u32, seed: f32) -> CameraImage {
-        let mut im = CameraImage {
+        let im = CameraImage {
             recovered: Default::default(),
             width,
             height,
-            pixels: (0..width * height)
-                .map(|i| [(i as f32 * 0.1 + seed).sin().abs(), 0.5, seed])
-                .collect(),
+            pixels: Arc::new(
+                (0..width * height)
+                    .map(|i| [(i as f32 * 0.1 + seed).sin().abs(), 0.5, seed])
+                    .collect(),
+            ),
             metadata: Metadata::default(),
             fast: false,
             scale_factor: 1.5,
@@ -586,9 +597,51 @@ mod tests {
             hdr: Default::default(),
         };
         let mut recovered = im.clone();
-        recovered.pixels[3] = [2., 3., 4.];
-        im.recovered = Arc::new(recovered).into();
+        Arc::make_mut(&mut recovered.pixels)[3] = [2., 3., 4.];
+        let _ = im.recovered.set(Arc::new(recovered));
         im
+    }
+    #[test]
+    fn empty_recovery_changes_share_pixels_with_independent_recovered_image() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = DecodeCache::new(dir.path().join("decoded"), 1 << 20);
+        let metadata = Metadata {
+            make: "Test".into(),
+            ..Default::default()
+        };
+        let im = CameraImage {
+            recovered: Default::default(),
+            width: 16,
+            height: 12,
+            pixels: Arc::new(vec![[0.1, 0.2, 0.3]; 16 * 12]),
+            metadata: metadata.clone(),
+            fast: false,
+            scale_factor: 1.,
+            scale_clipped: 0,
+            hdr: Default::default(),
+        };
+        let _ = im.recovered.set(Arc::new(im.clone()));
+        cache.store("no_changes", &im)?;
+        let mut loaded = cache.load("no_changes", &metadata).unwrap();
+        assert!(Arc::ptr_eq(
+            &loaded.pixels,
+            &loaded.recovered.get().unwrap().pixels
+        ));
+        loaded.metadata.make = "Modified".into();
+        assert_eq!(loaded.recovered.get().unwrap().metadata.make, "Test");
+
+        let changed = image(16, 12, 0.2);
+        cache.store("with_changes", &changed)?;
+        let loaded_changed = cache.load("with_changes", &metadata).unwrap();
+        assert!(!Arc::ptr_eq(
+            &loaded_changed.pixels,
+            &loaded_changed.recovered.get().unwrap().pixels
+        ));
+        assert_eq!(
+            loaded_changed.recovered.get().unwrap().pixels[3],
+            [2., 3., 4.]
+        );
+        Ok(())
     }
     #[test]
     fn entries_round_trip_and_stay_within_the_cap() -> Result<()> {

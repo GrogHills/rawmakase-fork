@@ -19,17 +19,19 @@ fn red_eye_tool_adds_moves_and_deletes_one_history_step_each() {
         recovered: Default::default(),
         width: 400,
         height: 400,
-        pixels: (0..160000)
-            .map(|i| {
-                let (x, y) = ((i % 400) as f32, (i / 400) as f32);
-                let red = eyes.iter().any(|(c, r)| (x - c[0]).hypot(y - c[1]) <= *r);
-                if red {
-                    [0.6, 0.03, 0.03]
-                } else {
-                    [0.55, 0.35, 0.25]
-                }
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..160000)
+                .map(|i| {
+                    let (x, y) = ((i % 400) as f32, (i / 400) as f32);
+                    let red = eyes.iter().any(|(c, r)| (x - c[0]).hypot(y - c[1]) <= *r);
+                    if red {
+                        [0.6, 0.03, 0.03]
+                    } else {
+                        [0.55, 0.35, 0.25]
+                    }
+                })
+                .collect(),
+        ),
         metadata: Metadata {
             width: 400,
             height: 400,
@@ -153,16 +155,18 @@ fn a_new_red_eye_correction_turns_the_red_eye_switch_on() {
         recovered: Default::default(),
         width: 200,
         height: 200,
-        pixels: (0..40000)
-            .map(|i| {
-                let (x, y) = ((i % 200) as f32, (i / 200) as f32);
-                if (x - 100.).hypot(y - 100.) <= 8. {
-                    [0.6, 0.03, 0.03]
-                } else {
-                    [0.55, 0.35, 0.25]
-                }
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..40000)
+                .map(|i| {
+                    let (x, y) = ((i % 200) as f32, (i / 200) as f32);
+                    if (x - 100.).hypot(y - 100.) <= 8. {
+                        [0.6, 0.03, 0.03]
+                    } else {
+                        [0.55, 0.35, 0.25]
+                    }
+                })
+                .collect(),
+        ),
         metadata: Metadata {
             width: 200,
             height: 200,
@@ -199,18 +203,20 @@ fn pet_eye_type_finds_a_glowing_pupil_and_adds_a_catchlight() {
         recovered: Default::default(),
         width: 200,
         height: 200,
-        pixels: (0..40000)
-            .map(|i| {
-                let d = ((i % 200) as f32 - 100.).hypot((i / 200) as f32 - 100.);
-                if d <= 10. {
-                    [0.5, 0.8, 0.15]
-                } else if d <= 24. {
-                    [0.25, 0.18, 0.05]
-                } else {
-                    [0.3, 0.25, 0.2]
-                }
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..40000)
+                .map(|i| {
+                    let d = ((i % 200) as f32 - 100.).hypot((i / 200) as f32 - 100.);
+                    if d <= 10. {
+                        [0.5, 0.8, 0.15]
+                    } else if d <= 24. {
+                        [0.25, 0.18, 0.05]
+                    } else {
+                        [0.3, 0.25, 0.2]
+                    }
+                })
+                .collect(),
+        ),
         metadata: Metadata {
             width: 200,
             height: 200,
@@ -308,16 +314,18 @@ fn red_eye_tool_refuses_a_red_area_too_large_to_be_a_pupil() {
         recovered: Default::default(),
         width: 400,
         height: 400,
-        pixels: (0..160000)
-            .map(|i| {
-                let (x, y) = ((i % 400) as f32, (i / 400) as f32);
-                if (x - 200.).hypot(y - 200.) <= 150. {
-                    [0.6, 0.03, 0.03]
-                } else {
-                    [0.55, 0.35, 0.25]
-                }
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..160000)
+                .map(|i| {
+                    let (x, y) = ((i % 400) as f32, (i / 400) as f32);
+                    if (x - 200.).hypot(y - 200.) <= 150. {
+                        [0.6, 0.03, 0.03]
+                    } else {
+                        [0.55, 0.35, 0.25]
+                    }
+                })
+                .collect(),
+        ),
         metadata: Metadata {
             width: 400,
             height: 400,

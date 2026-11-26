@@ -575,7 +575,7 @@ fn synthetic(width: u32, height: u32) -> crate::camera_data::CameraImage {
         recovered: Default::default(),
         width,
         height,
-        pixels,
+        pixels: std::sync::Arc::new(pixels),
         metadata: Metadata {
             width,
             height,

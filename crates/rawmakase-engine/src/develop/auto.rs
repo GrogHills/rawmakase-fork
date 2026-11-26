@@ -373,7 +373,7 @@ impl crate::model::measures::PhotoMeasures for Measures<'_> {
 mod tests {
     use super::*;
     use crate::camera_data::Metadata;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     /// A 96 × 64 scene of smooth gradients, all channels scaled by `cast`.
     fn scene(cast: [f32; 3], level: f32) -> CameraImage {
@@ -382,13 +382,15 @@ mod tests {
             recovered: Default::default(),
             width,
             height,
-            pixels: (0..width * height)
-                .map(|i| {
-                    let (x, y) = ((i % width) as f32 / width as f32, (i / width) as f32);
-                    let v = level * (0.02 + 0.98 * x * x) * (1. + 0.1 * (y * 0.3).sin());
-                    std::array::from_fn(|c| (v * cast[c]).min(1.))
-                })
-                .collect(),
+            pixels: Arc::new(
+                (0..width * height)
+                    .map(|i| {
+                        let (x, y) = ((i % width) as f32 / width as f32, (i / width) as f32);
+                        let v = level * (0.02 + 0.98 * x * x) * (1. + 0.1 * (y * 0.3).sin());
+                        std::array::from_fn(|c| (v * cast[c]).min(1.))
+                    })
+                    .collect(),
+            ),
             metadata: Metadata {
                 width,
                 height,
@@ -425,7 +427,7 @@ mod tests {
             })
             .collect();
         let im = CameraImage {
-            pixels,
+            pixels: Arc::new(pixels),
             width,
             height,
             metadata: Metadata {
@@ -553,9 +555,11 @@ mod tests {
         big.height *= 10;
         big.metadata.width = big.width;
         big.metadata.height = big.height;
-        big.pixels = (0..big.width * big.height)
-            .map(|i| im.pixels[((i / big.width / 10) * im.width + i % big.width / 10) as usize])
-            .collect();
+        big.pixels = Arc::new(
+            (0..big.width * big.height)
+                .map(|i| im.pixels[((i / big.width / 10) * im.width + i % big.width / 10) as usize])
+                .collect(),
+        );
         let out = crate::develop::render(
             &tone_copy(&big, &r, Cancel::NEVER).unwrap(),
             &r.checked().unwrap(),
@@ -582,7 +586,7 @@ mod tests {
         im.height = height;
         im.metadata.width = width;
         im.metadata.height = height;
-        im.pixels = vec![[0.2; 3]; (width * height) as usize];
+        im.pixels = Arc::new(vec![[0.2; 3]; (width * height) as usize]);
         let r = Recipe {
             crop: [0.5, 0.5, 0.51, 0.51],
             ..Default::default()
@@ -675,7 +679,7 @@ mod tests {
         // rather than recovery-altered colours.
         let mut im = scene([1.; 3], 0.5);
         let width = im.width as usize;
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = (i % width, i / width);
             *p = if x >= width / 2 {
                 [0.4, 0.5, 0.6]
@@ -707,7 +711,7 @@ mod tests {
         // correction pulls out of the frame.
         let mut im = scene([1.; 3], 0.5);
         let width = im.width as usize;
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let x = i % width;
             *p = if x < 10 || x >= width - 10 {
                 [0.46, 0.4, 0.34]
@@ -749,7 +753,7 @@ mod tests {
         // The left half is under a warm light, the right half under a cool one.
         let mut im = scene([1.; 3], 0.5);
         let width = im.width as usize;
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let cast = if i % width < width / 2 {
                 [1.3, 1., 0.7]
             } else {
@@ -846,7 +850,7 @@ mod tests {
         let mut bright = clean.clone();
         let n = bright.pixels.len();
         // A light source far beyond the sensor's range covers 3% of the photo.
-        for p in &mut bright.pixels[n - n * 3 / 100..] {
+        for p in &mut Arc::make_mut(&mut bright.pixels)[n - n * 3 / 100..] {
             *p = [8.; 3];
         }
         let base = Recipe::default();
@@ -861,7 +865,7 @@ mod tests {
         let mut crushed = open.clone();
         // Shadows crushed in the camera: 2% of the photo is black.
         let n = crushed.pixels.len();
-        for p in &mut crushed.pixels[..n / 50] {
+        for p in &mut Arc::make_mut(&mut crushed.pixels)[..n / 50] {
             *p = [0.; 3];
         }
         let base = Recipe::default();
@@ -938,7 +942,9 @@ mod tests {
     #[test]
     fn empty_or_black_photos_are_errors() {
         let mut im = scene([1.; 3], 0.5);
-        im.pixels.iter_mut().for_each(|p| *p = [0.; 3]);
+        Arc::make_mut(&mut im.pixels)
+            .iter_mut()
+            .for_each(|p| *p = [0.; 3]);
         assert!(auto_white_balance(&im, &Recipe::default(), Cancel::NEVER).is_err());
     }
 
@@ -966,17 +972,19 @@ mod tests {
             width,
             height,
             // A warm left half and a cool right half.
-            pixels: (0..width * height)
-                .map(|i| {
-                    let x = i % width;
-                    let v = 0.05 + 0.4 * x as f32 / width as f32;
-                    if x < width / 2 {
-                        [v * 1.3, v, v * 0.7]
-                    } else {
-                        [v * 0.7, v, v * 1.3]
-                    }
-                })
-                .collect(),
+            pixels: Arc::new(
+                (0..width * height)
+                    .map(|i| {
+                        let x = i % width;
+                        let v = 0.05 + 0.4 * x as f32 / width as f32;
+                        if x < width / 2 {
+                            [v * 1.3, v, v * 0.7]
+                        } else {
+                            [v * 0.7, v, v * 1.3]
+                        }
+                    })
+                    .collect(),
+            ),
             metadata: m.clone(),
             fast: false,
             scale_factor: 1.,
@@ -1017,12 +1025,14 @@ mod tests {
             recovered: Default::default(),
             width,
             height,
-            pixels: (0..width * height)
-                .map(|i| {
-                    let v = 0.05 + 0.3 * (i % width) as f32 / width as f32;
-                    [v, v, 2. * v]
-                })
-                .collect(),
+            pixels: Arc::new(
+                (0..width * height)
+                    .map(|i| {
+                        let v = 0.05 + 0.3 * (i % width) as f32 / width as f32;
+                        [v, v, 2. * v]
+                    })
+                    .collect(),
+            ),
             metadata: m.clone(),
             fast: false,
             scale_factor: 1.,

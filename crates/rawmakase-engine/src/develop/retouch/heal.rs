@@ -276,11 +276,14 @@ pub(crate) fn apply(im: &mut CameraImage, op: &Placed) -> PixelRect {
         RetouchMode::Clone => source,
         RetouchMode::Heal => heal(&dest, &source, &alpha, w, h, DOMAIN),
     };
-    for i in 0..w * h {
-        let a = alpha[i] * op.opacity;
-        if a > 0. {
-            let d = dest[i];
-            im.pixels[at(i % w, i / w)] = std::array::from_fn(|c| d[c] + (patch[i][c] - d[c]) * a);
+    if op.opacity > 0. {
+        let pixels = std::sync::Arc::make_mut(&mut im.pixels);
+        for i in 0..w * h {
+            let a = alpha[i] * op.opacity;
+            if a > 0. {
+                let d = dest[i];
+                pixels[at(i % w, i / w)] = std::array::from_fn(|c| d[c] + (patch[i][c] - d[c]) * a);
+            }
         }
     }
     rect

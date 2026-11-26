@@ -373,7 +373,7 @@ pub struct CameraImage {
     pub width: u32,
     pub height: u32,
     pub recovered: std::sync::OnceLock<std::sync::Arc<CameraImage>>,
-    pub pixels: Vec<[f32; 3]>,
+    pub pixels: std::sync::Arc<Vec<[f32; 3]>>,
     pub metadata: Metadata,
     pub fast: bool,
     pub scale_factor: f32,
@@ -557,7 +557,7 @@ mod hdr_tests {
             width,
             height,
             recovered: Default::default(),
-            pixels: vec![[0.5; 3]; (width * height) as usize],
+            pixels: Arc::new(vec![[0.5; 3]; (width * height) as usize]),
             metadata: Metadata {
                 source: Source::Rendered,
                 ..Default::default()
@@ -626,5 +626,51 @@ mod source_tests {
         };
         let back: Metadata = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
         assert!(back.is_rendered());
+    }
+}
+
+#[cfg(test)]
+mod pixel_sharing_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn clone_shares_pixels_and_make_mut_copies_on_write() {
+        let a = CameraImage {
+            width: 2,
+            height: 2,
+            recovered: Default::default(),
+            pixels: Arc::new(vec![[0.25; 3]; 4]),
+            metadata: Metadata::default(),
+            fast: false,
+            scale_factor: 1.,
+            scale_clipped: 0,
+            hdr: Default::default(),
+        };
+        let mut b = a.clone();
+        assert!(Arc::ptr_eq(&a.pixels, &b.pixels));
+
+        Arc::make_mut(&mut b.pixels)[0] = [9., 8., 7.];
+        assert!(!Arc::ptr_eq(&a.pixels, &b.pixels));
+        assert_eq!(a.pixels[0], [0.25; 3]);
+        assert_eq!(b.pixels[0], [9., 8., 7.]);
+
+        let mut u = CameraImage {
+            width: 2,
+            height: 2,
+            recovered: Default::default(),
+            pixels: Arc::new(vec![[0.5; 3]; 4]),
+            metadata: Metadata::default(),
+            fast: false,
+            scale_factor: 1.,
+            scale_clipped: 0,
+            hdr: Default::default(),
+        };
+        let arc_ptr = Arc::as_ptr(&u.pixels);
+        let data_ptr = u.pixels.as_ptr();
+        Arc::make_mut(&mut u.pixels)[0] = [1., 2., 3.];
+        assert_eq!(Arc::as_ptr(&u.pixels), arc_ptr);
+        assert_eq!(u.pixels.as_ptr(), data_ptr);
+        assert_eq!(u.pixels[0], [1., 2., 3.]);
     }
 }

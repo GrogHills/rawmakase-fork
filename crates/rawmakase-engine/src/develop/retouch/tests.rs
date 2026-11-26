@@ -10,9 +10,11 @@ fn image(width: u32, height: u32, f: impl Fn(f32, f32) -> [f32; 3]) -> CameraIma
     CameraImage {
         width,
         height,
-        pixels: (0..width * height)
-            .map(|i| f((i % width) as f32, (i / width) as f32))
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..width * height)
+                .map(|i| f((i % width) as f32, (i / width) as f32))
+                .collect(),
+        ),
         metadata: crate::camera_data::Metadata {
             width,
             height,
@@ -59,7 +61,10 @@ fn heal_of_a_constant_field_is_exact() {
         |x, _| if x < 60. { [0.4, 0.3, 0.2] } else { [0.1; 3] },
     );
     let mut dusty = im.clone();
-    for (i, p) in dusty.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut dusty.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % 120) as f32, (i / 120) as f32);
         if (x - 25.).hypot(y - 40.) < 5. {
             *p = [0.05; 3];
@@ -82,7 +87,10 @@ fn heal_reproduces_linear_gradients() {
     let gradient = |x: f32, y: f32| [0.1 + x * 0.004, 0.2 + y * 0.003, 0.3];
     let im = image(160, 120, gradient);
     let mut dusty = im.clone();
-    for (i, p) in dusty.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut dusty.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % 160) as f32, (i / 160) as f32);
         if (x - 80.).hypot(y - 60.) < 9. {
             *p = [0.9, 0.0, 0.5];
@@ -246,7 +254,7 @@ fn incremental_tiles_match_a_full_rebuild() {
     // Only tiles near the new spot changed.
     let rects = cache.changed_from(&before).unwrap();
     assert!(rects.iter().all(|r| r[0] >= 512 && r[3] <= 256));
-    for (i, (a, b)) in before.pixels.iter().zip(&after.pixels).enumerate() {
+    for (i, (a, b)) in before.pixels.iter().zip(after.pixels.iter()).enumerate() {
         if a != b {
             let (x, y) = ((i % 700) as i32, (i / 700) as i32);
             assert!(
@@ -308,7 +316,10 @@ fn automatic_source_avoids_texture_edges_and_asks_again_for_the_next() {
         }
     });
     let mut dusty = im.clone();
-    for (i, p) in dusty.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut dusty.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % 400) as f32, (i / 400) as f32);
         if (x - 200.).hypot(y - 150.) < 6. {
             *p = [0.02; 3];

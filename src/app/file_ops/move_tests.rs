@@ -159,7 +159,7 @@ pub(super) fn decoded(fast: bool) -> std::sync::Arc<crate::camera_data::CameraIm
         recovered: Default::default(),
         width: 2,
         height: 2,
-        pixels: vec![[0.1; 3]; 4],
+        pixels: std::sync::Arc::new(vec![[0.1; 3]; 4]),
         metadata: Default::default(),
         fast,
         scale_factor: 1.,

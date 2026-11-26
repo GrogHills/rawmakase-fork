@@ -694,9 +694,11 @@ mod tests {
             recovered: Default::default(),
             width: w,
             height: h,
-            pixels: (0..w * h)
-                .map(|i| [0.1 + (i % w) as f32 / 200.; 3])
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..w * h)
+                    .map(|i| [0.1 + (i % w) as f32 / 200.; 3])
+                    .collect(),
+            ),
             metadata: crate::camera_data::Metadata {
                 width: w,
                 height: h,

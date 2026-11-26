@@ -158,7 +158,7 @@ impl Fixture {
             recovered: Default::default(),
             width: W as u32,
             height: H as u32,
-            pixels: vec![[0.2; 3]; W * H],
+            pixels: Arc::new(vec![[0.2; 3]; W * H]),
             metadata,
             fast: false,
             scale_factor: 1.,

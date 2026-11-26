@@ -46,19 +46,51 @@ pub fn recover_highlights_in_place(im: &mut CameraImage, cancel: Cancel<'_>) -> 
     check_cancel(cancel)?;
     let wb = im.metadata.wb.map(|v| v.max(0.001));
     let stride = im.width.max(1) as usize;
-    im.pixels.par_chunks_mut(stride).for_each(|row| {
-        if cancel.is_cancelled() {
-            return;
-        }
-        for p in row {
-            let sensor = std::array::from_fn(|c| p[c] / wb[c]);
-            if sensor.iter().all(|s| *s <= PULL_FLOOR) {
-                continue;
+    if let Some(pixels) = Arc::get_mut(&mut im.pixels) {
+        pixels.par_chunks_mut(stride).for_each(|row| {
+            if cancel.is_cancelled() {
+                return;
             }
-            *p = reconstruct(*p, sensor);
+            for p in row {
+                let sensor = std::array::from_fn(|c| p[c] / wb[c]);
+                if sensor.iter().all(|s| *s <= PULL_FLOOR) {
+                    continue;
+                }
+                *p = reconstruct(*p, sensor);
+            }
+        });
+        return check_cancel(cancel);
+    }
+    let any_bright = im.pixels.par_chunks(stride).any(|row| {
+        if cancel.is_cancelled() {
+            return false;
         }
+        row.iter()
+            .any(|p| !(0..3).all(|c| p[c] / wb[c] <= PULL_FLOOR))
     });
-    check_cancel(cancel)
+    check_cancel(cancel)?;
+    if !any_bright {
+        return Ok(());
+    }
+    let mut next = vec![[0f32; 3]; im.pixels.len()];
+    next.par_chunks_mut(stride)
+        .zip(im.pixels.par_chunks(stride))
+        .for_each(|(dst, src)| {
+            if cancel.is_cancelled() {
+                return;
+            }
+            for (d, p) in dst.iter_mut().zip(src) {
+                let sensor = std::array::from_fn(|c| p[c] / wb[c]);
+                *d = if sensor.iter().all(|s| *s <= PULL_FLOOR) {
+                    *p
+                } else {
+                    reconstruct(*p, sensor)
+                };
+            }
+        });
+    check_cancel(cancel)?;
+    im.pixels = Arc::new(next);
+    Ok(())
 }
 
 /// Highlight reconstruction in camera space, before colour conversion. Stops with an
@@ -113,16 +145,60 @@ mod tests {
     fn dark_pixels_are_untouched_and_white_balance_sets_the_sensor_fraction() {
         let mut im = crate::develop::quality::tests::fixture();
         im.metadata.wb = [2., 1., 1.5];
-        im.pixels.fill([0.3, 0.1, 0.2]);
-        // Green at the sensor's white: pulled to the mean of red and blue, which
-        // sit at 0.8 and 0.9 of theirs (and blue follows red and green a little).
-        im.pixels[40 * 96 + 40] = [1.6, 1., 1.35];
+        {
+            let pixels = Arc::make_mut(&mut im.pixels);
+            pixels.fill([0.3, 0.1, 0.2]);
+            // Green at the sensor's white: pulled to the mean of red and blue, which
+            // sit at 0.8 and 0.9 of theirs (and blue follows red and green a little).
+            pixels[40 * 96 + 40] = [1.6, 1., 1.35];
+        }
         let recovered = recover_highlights(&im, Cancel::NEVER).unwrap();
+        assert!(!Arc::ptr_eq(&im.pixels, &recovered.pixels));
+        assert_eq!(im.pixels[40 * 96 + 40], [1.6, 1., 1.35]);
         assert_eq!(recovered.pixels[0], [0.3, 0.1, 0.2]);
         let p = recovered.pixels[40 * 96 + 40];
         assert!(
             p[0] == 1.6 && p[1] > 1.5 && p[1] < 1.6 && p[2] > 1.35,
             "{p:?}"
         );
+    }
+
+    #[test]
+    fn recover_highlights_shares_dark_buffers_and_cow_isolates_shared_mutations() {
+        let mut dark = crate::develop::quality::tests::fixture();
+        dark.metadata.wb = [2., 1., 1.5];
+        Arc::make_mut(&mut dark.pixels).fill([0.4, 0.2, 0.3]);
+        let recovered_dark = recover_highlights(&dark, Cancel::NEVER).unwrap();
+        assert!(Arc::ptr_eq(&dark.pixels, &recovered_dark.pixels));
+
+        let mut shared_dark = dark.clone();
+        recover_highlights_in_place(&mut shared_dark, Cancel::NEVER).unwrap();
+        assert!(Arc::ptr_eq(&dark.pixels, &shared_dark.pixels));
+
+        let mut unique = crate::develop::quality::tests::fixture();
+        unique.metadata.wb = [2., 1., 1.5];
+        {
+            let pixels = Arc::make_mut(&mut unique.pixels);
+            pixels.fill([0.3, 0.1, 0.2]);
+            pixels[40 * 96 + 40] = [1.6, 1., 1.35];
+        }
+        let arc_ptr = Arc::as_ptr(&unique.pixels);
+        let data_ptr = unique.pixels.as_ptr();
+        recover_highlights_in_place(&mut unique, Cancel::NEVER).unwrap();
+        assert_eq!(Arc::as_ptr(&unique.pixels), arc_ptr);
+        assert_eq!(unique.pixels.as_ptr(), data_ptr);
+
+        let mut bright = crate::develop::quality::tests::fixture();
+        bright.metadata.wb = [2., 1., 1.5];
+        {
+            let pixels = Arc::make_mut(&mut bright.pixels);
+            pixels.fill([0.3, 0.1, 0.2]);
+            pixels[40 * 96 + 40] = [1.6, 1., 1.35];
+        }
+        let original = bright.clone();
+        recover_highlights_in_place(&mut bright, Cancel::NEVER).unwrap();
+        assert!(!Arc::ptr_eq(&original.pixels, &bright.pixels));
+        assert_eq!(original.pixels[40 * 96 + 40], [1.6, 1., 1.35]);
+        assert!(bright.pixels[40 * 96 + 40][1] > 1.5);
     }
 }

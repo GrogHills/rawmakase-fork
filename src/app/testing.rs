@@ -92,12 +92,14 @@ pub(in crate::app) fn editor_with_blue_photo(
         recovered: Default::default(),
         width,
         height,
-        pixels: (0..width * height)
-            .map(|i| {
-                let v = 0.05 + 0.3 * (i % width) as f32 / width as f32;
-                [v, v, 2. * v]
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..width * height)
+                .map(|i| {
+                    let v = 0.05 + 0.3 * (i % width) as f32 / width as f32;
+                    [v, v, 2. * v]
+                })
+                .collect(),
+        ),
         metadata,
         fast: false,
         scale_factor: 1.,

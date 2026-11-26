@@ -61,7 +61,7 @@ fn test_open(item: &Item, _: &Identity, cancel: Cancel<'_>) -> anyhow::Result<Or
         width: w,
         height: h,
         recovered: Default::default(),
-        pixels: (0..w * h).map(|i| [i as f32 / 900., 0.5, 0.25]).collect(),
+        pixels: std::sync::Arc::new((0..w * h).map(|i| [i as f32 / 900., 0.5, 0.25]).collect()),
         metadata: metadata(w, h, name.starts_with("absent")),
         fast: false,
         scale_factor: 1.,

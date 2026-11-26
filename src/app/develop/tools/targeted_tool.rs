@@ -386,15 +386,17 @@ mod tests {
             recovered: Default::default(),
             width: 200,
             height: 200,
-            pixels: (0..40000)
-                .map(|i| {
-                    if i % 200 < 100 {
-                        [0.5, 0.25, 0.08]
-                    } else {
-                        [0.2; 3]
-                    }
-                })
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..40000)
+                    .map(|i| {
+                        if i % 200 < 100 {
+                            [0.5, 0.25, 0.08]
+                        } else {
+                            [0.2; 3]
+                        }
+                    })
+                    .collect(),
+            ),
             metadata: Metadata {
                 width: 200,
                 height: 200,

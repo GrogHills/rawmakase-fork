@@ -278,7 +278,7 @@ mod tests {
                 recovered: Default::default(),
                 width: 4,
                 height: 4,
-                pixels: vec![[0.1; 3]; 16],
+                pixels: std::sync::Arc::new(vec![[0.1; 3]; 16]),
                 metadata: Default::default(),
                 fast: false,
                 scale_factor: 1.,

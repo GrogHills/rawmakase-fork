@@ -211,12 +211,15 @@ impl RetouchCache {
             let mut out = CameraImage::clone(start);
             out.recovered = Default::default();
             // Back to the recovered pixels in dirty tiles, then rerun what reaches them.
-            let width = base.width as usize;
-            for r in &rects {
-                for y in r[1]..r[3] {
-                    let row = y as usize * width;
-                    let (a, b) = (row + r[0] as usize, row + r[2] as usize);
-                    out.pixels[a..b].copy_from_slice(&base.pixels[a..b]);
+            if !Arc::ptr_eq(&out.pixels, &base.pixels) && !rects.is_empty() {
+                let width = base.width as usize;
+                let out_pixels = Arc::make_mut(&mut out.pixels);
+                for r in &rects {
+                    for y in r[1]..r[3] {
+                        let row = y as usize * width;
+                        let (a, b) = (row + r[0] as usize, row + r[2] as usize);
+                        out_pixels[a..b].copy_from_slice(&base.pixels[a..b]);
+                    }
                 }
             }
             for step in ops.steps(&frame) {

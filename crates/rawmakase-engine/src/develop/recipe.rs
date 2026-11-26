@@ -105,9 +105,11 @@ mod tests {
         let source = Arc::new(CameraImage {
             width: 65,
             height: 67,
-            pixels: (0..65 * 67)
-                .map(|i| [0.1 + (i % 7) as f32 * 0.002; 3])
-                .collect(),
+            pixels: Arc::new(
+                (0..65 * 67)
+                    .map(|i| [0.1 + (i % 7) as f32 * 0.002; 3])
+                    .collect(),
+            ),
             metadata: Default::default(),
             recovered: Default::default(),
             fast: false,
@@ -151,7 +153,7 @@ mod tests {
                 .pixels
         );
         let mut replacement = (*source).clone();
-        replacement.pixels.fill([0.3; 3]);
+        Arc::make_mut(&mut replacement.pixels).fill([0.3; 3]);
         let replacement = Arc::new(replacement);
         let replaced = cache
             .denoised(&replacement, r.denoise(), Cancel::new(&cancel))

@@ -333,7 +333,7 @@ fn a_failed_before_render_renders_the_edit_again_but_not_before() {
         recovered: Default::default(),
         width: 2,
         height: 2,
-        pixels: vec![[0.2; 3]; 4],
+        pixels: Arc::new(vec![[0.2; 3]; 4]),
         metadata: Metadata {
             width: 2,
             height: 2,
@@ -381,7 +381,7 @@ fn a_failed_magnifier_render_renders_the_edit_again_but_not_the_magnifier() {
         recovered: Default::default(),
         width: 2,
         height: 2,
-        pixels: vec![[0.2; 3]; 4],
+        pixels: Arc::new(vec![[0.2; 3]; 4]),
         metadata: Metadata {
             width: 2,
             height: 2,
@@ -426,7 +426,7 @@ fn a_failed_edit_render_renders_before_again_but_not_the_edit() {
         recovered: Default::default(),
         width: 2,
         height: 2,
-        pixels: vec![[0.2; 3]; 4],
+        pixels: Arc::new(vec![[0.2; 3]; 4]),
         metadata: Metadata {
             width: 2,
             height: 2,

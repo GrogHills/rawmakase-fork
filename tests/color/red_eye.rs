@@ -22,7 +22,10 @@ fn face() -> (CameraImage, [f32; 2]) {
     let mut im = develop(&chart_path("synthetic-d65"));
     let w = im.width as usize;
     let c = [im.width as f32 * 0.5, im.height as f32 * 0.5];
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % w) as f32, (i / w) as f32);
         let d = (x - c[0]).hypot(y - c[1]);
         *p = if d <= PUPIL {

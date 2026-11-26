@@ -57,7 +57,7 @@ impl LuminanceDenoise {
             width: im.width,
             height: im.height,
             recovered: Default::default(),
-            pixels,
+            pixels: std::sync::Arc::new(pixels),
             metadata: im.metadata.clone(),
             fast: im.fast,
             scale_factor: im.scale_factor,
@@ -69,7 +69,8 @@ impl LuminanceDenoise {
     pub(crate) fn apply_in_place(&self, im: &mut CameraImage, cancel: Cancel<'_>) -> Result<()> {
         check(cancel)?;
         let (plane, filtered) = self.filtered_luma(im, cancel)?;
-        im.pixels
+        check(cancel)?;
+        std::sync::Arc::make_mut(&mut im.pixels)
             .par_chunks_mut(1024)
             .enumerate()
             .for_each(|(chunk, pixels)| {
@@ -253,7 +254,7 @@ mod tests {
         CameraImage {
             width: w,
             height: h,
-            pixels: (0..w * h).map(|i| f(i % w, i / w)).collect(),
+            pixels: std::sync::Arc::new((0..w * h).map(|i| f(i % w, i / w)).collect()),
             metadata: crate::camera_data::Metadata {
                 wb: [1.; 3],
                 ..Default::default()
@@ -290,8 +291,8 @@ mod tests {
                     .unwrap()
                     .apply(&im, Cancel::new(&cancel))
                     .unwrap();
-                for p in out.pixels {
-                    for (v, expected) in p.into_iter().zip(color) {
+                for p in out.pixels.iter() {
+                    for (v, expected) in p.iter().zip(color) {
                         assert!(
                             v.is_finite() && (v - expected).abs() < 1e-6,
                             "{v} != {expected}"
@@ -341,7 +342,7 @@ mod tests {
             let b = luma(out.pixels[row * 256 + 128]);
             assert!(b - a > 0.35, "edge lost: {a} {b}");
         }
-        for p in out.pixels {
+        for p in out.pixels.iter() {
             let [r, g, b] = p.map(f32::sqrt);
             assert!((r - g - 0.04).abs() < 1e-6 && (g - b - 0.04).abs() < 1e-6);
         }

@@ -413,9 +413,11 @@ mod tests {
             recovered: Default::default(),
             width,
             height,
-            pixels: (0..width * height)
-                .map(|i| [value + (i % 7) as f32 * 0.01, value, value * 0.5])
-                .collect(),
+            pixels: Arc::new(
+                (0..width * height)
+                    .map(|i| [value + (i % 7) as f32 * 0.01, value, value * 0.5])
+                    .collect(),
+            ),
             metadata: crate::camera_data::Metadata {
                 width,
                 height,
@@ -501,7 +503,7 @@ mod tests {
     fn fit_approximates_the_resized_export() {
         let (w, h) = (640, 424);
         let mut im = image(w, h, 0.);
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             let v = 0.25 + 0.2 * (x * 0.05).sin() * (y * 0.031).cos() + 0.05 * (x * 0.9).sin();
             *p = [v * 1.1, v, v * 0.7 + x / w as f32 * 0.2];
@@ -545,7 +547,7 @@ mod tests {
     /// `demosaic::half` makes it.
     fn photo_and_half(w: u32, h: u32) -> (CameraImage, CameraImage) {
         let mut full = image(w, h, 0.);
-        for (i, p) in full.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut full.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             let v = 0.3 + 0.12 * (x * 0.21).sin() * (y * 0.17).cos() + 0.06 * (x * 0.09).sin();
             *p = [v * 1.1, v, v * 0.7];
@@ -553,14 +555,16 @@ mod tests {
         let (hw, hh) = (w / 2, h / 2);
         let mut half = full.clone();
         (half.width, half.height, half.fast) = (hw, hh, true);
-        half.pixels = (0..hw * hh)
-            .map(|i| {
-                let (x, y) = (2 * (i % hw), 2 * (i / hw));
-                let at = |dx: u32, dy: u32| full.pixels[((y + dy) * w + x + dx) as usize];
-                let [a, b, c, d] = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
-                std::array::from_fn(|k| (a[k] + b[k] + c[k] + d[k]) / 4.)
-            })
-            .collect();
+        half.pixels = Arc::new(
+            (0..hw * hh)
+                .map(|i| {
+                    let (x, y) = (2 * (i % hw), 2 * (i / hw));
+                    let at = |dx: u32, dy: u32| full.pixels[((y + dy) * w + x + dx) as usize];
+                    let [a, b, c, d] = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+                    std::array::from_fn(|k| (a[k] + b[k] + c[k] + d[k]) / 4.)
+                })
+                .collect(),
+        );
         (full, half)
     }
     fn mean_error(a: &Rendered, b: &Rendered) -> f32 {
@@ -639,9 +643,9 @@ mod tests {
     fn a_reduced_decode_grains_as_the_photo_resized() {
         let (w, h) = (640, 424);
         let mut full = image(w, h, 0.);
-        full.pixels.fill([0.18; 3]);
+        Arc::make_mut(&mut full.pixels).fill([0.18; 3]);
         let mut half = image(w / 2, h / 2, 0.);
-        half.pixels.fill([0.18; 3]);
+        Arc::make_mut(&mut half.pixels).fill([0.18; 3]);
         (half.metadata.width, half.metadata.height, half.fast) = (w, h, true);
         let mut r = Recipe {
             sharpening: 0.,
@@ -717,39 +721,43 @@ mod tests {
             })
             .collect();
         let mut full = image(w, h, 0.);
-        full.pixels = (0..w * h)
-            .map(|i| {
-                let (x, y) = (i % w, i / w);
-                let mut sum = [0.; 3];
-                let mut n = [0.; 3];
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let (xx, yy) = (x as i32 + dx, y as i32 + dy);
-                        if xx < 0 || yy < 0 || xx >= w as i32 || yy >= h as i32 {
-                            continue;
+        full.pixels = Arc::new(
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let mut sum = [0.; 3];
+                    let mut n = [0.; 3];
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            let (xx, yy) = (x as i32 + dx, y as i32 + dy);
+                            if xx < 0 || yy < 0 || xx >= w as i32 || yy >= h as i32 {
+                                continue;
+                            }
+                            let (xx, yy) = (xx as u32, yy as u32);
+                            let c = colour(xx, yy);
+                            if c == colour(x, y) && (dx, dy) != (0, 0) {
+                                continue;
+                            }
+                            sum[c] += mosaic[(yy * w + xx) as usize];
+                            n[c] += 1.;
                         }
-                        let (xx, yy) = (xx as u32, yy as u32);
-                        let c = colour(xx, yy);
-                        if c == colour(x, y) && (dx, dy) != (0, 0) {
-                            continue;
-                        }
-                        sum[c] += mosaic[(yy * w + xx) as usize];
-                        n[c] += 1.;
                     }
-                }
-                std::array::from_fn(|c| sum[c] / n[c])
-            })
-            .collect();
+                    std::array::from_fn(|c| sum[c] / n[c])
+                })
+                .collect(),
+        );
         let (hw, hh) = (w / 2, h / 2);
         let mut half = full.clone();
         (half.width, half.height, half.fast) = (hw, hh, true);
-        half.pixels = (0..hw * hh)
-            .map(|i| {
-                let (x, y) = (2 * (i % hw), 2 * (i / hw));
-                let at = |dx: u32, dy: u32| mosaic[((y + dy) * w + x + dx) as usize];
-                [at(0, 0), (at(1, 0) + at(0, 1)) / 2., at(1, 1)]
-            })
-            .collect();
+        half.pixels = Arc::new(
+            (0..hw * hh)
+                .map(|i| {
+                    let (x, y) = (2 * (i % hw), 2 * (i / hw));
+                    let at = |dx: u32, dy: u32| mosaic[((y + dy) * w + x + dx) as usize];
+                    [at(0, 0), (at(1, 0) + at(0, 1)) / 2., at(1, 1)]
+                })
+                .collect(),
+        );
         (full, half)
     }
     /// `full` reduced by area averaging to `w` × `h`, marked `fast` and keeping the
@@ -767,21 +775,23 @@ mod tests {
                 .filter(|(_, w)| *w > 0.)
                 .collect()
         };
-        out.pixels = (0..w * h)
-            .map(|i| {
-                let (ox, oy) = (i % w, i / w);
-                let mut s = [0.; 3];
-                for (y, wy) in weights(oy, fh, full.height) {
-                    for (x, wx) in weights(ox, fw, full.width) {
-                        let p = full.pixels[(y * full.width + x) as usize];
-                        for c in 0..3 {
-                            s[c] += p[c] * wx * wy;
+        out.pixels = Arc::new(
+            (0..w * h)
+                .map(|i| {
+                    let (ox, oy) = (i % w, i / w);
+                    let mut s = [0.; 3];
+                    for (y, wy) in weights(oy, fh, full.height) {
+                        for (x, wx) in weights(ox, fw, full.width) {
+                            let p = full.pixels[(y * full.width + x) as usize];
+                            for c in 0..3 {
+                                s[c] += p[c] * wx * wy;
+                            }
                         }
                     }
-                }
-                s
-            })
-            .collect();
+                    s
+                })
+                .collect(),
+        );
         out
     }
     /// The spread of `f` over the flat in columns `x0..x1` (shares of the width, rows
@@ -1050,7 +1060,7 @@ mod tests {
     fn cached_stages_never_serve_a_stale_result() {
         let (w, h) = (300, 200);
         let mut im = image(w, h, 0.);
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             let v = 0.3 + 0.2 * (x * 0.07).sin() * (y * 0.05).cos();
             *p = [v * 1.2, v, v * 0.6];
@@ -1126,7 +1136,7 @@ mod tests {
             [-0.3746, 1.2042, 0.1903],
             [-0.0666, 0.1479, 0.52],
         ];
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             let v = 0.02 + 0.6 * (x / w as f32) * (0.6 + 0.4 * (y * 0.05).cos());
             *p = [v * 1.3, v, v * 0.5 + 0.05 * (x * 0.1).sin().abs()];
@@ -1253,7 +1263,7 @@ mod tests {
             [-0.3746, 1.2042, 0.1903],
             [-0.0666, 0.1479, 0.52],
         ];
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             let v = 0.02 + 0.6 * (x / w as f32) * (0.6 + 0.4 * (y * 0.05).cos());
             *p = [v * 1.3, v, v * 0.5 + 0.05 * (x * 0.1).sin().abs()];
@@ -1327,7 +1337,7 @@ mod tests {
         use crate::model::masks::{MaskComponent, MaskGroup, MaskShape};
         let (w, h) = (300, 200);
         let mut im = image(w, h, 0.);
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let v = 0.1 + 0.3 * (i as u32 % w) as f32 / w as f32;
             *p = [v * 1.2, v, v * 0.6];
         }
@@ -1365,7 +1375,7 @@ mod tests {
         use crate::model::retouch::{RetouchMode, RetouchOp, RetouchShape};
         let (w, h) = (640, 424);
         let mut im = image(w, h, 0.);
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             let v = 0.25 + 0.15 * (x * 0.05).sin() * (y * 0.031).cos() + x / w as f32 * 0.2;
             let dust = (x - 300.).hypot(y - 200.) < 8.;
@@ -1475,7 +1485,7 @@ mod tests {
         // the percentile) on a lighter background.
         let photo = |color: [f32; 3]| {
             let mut im = image(w, h, 0.);
-            for (i, p) in im.pixels.iter_mut().enumerate() {
+            for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
                 let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
                 *p = if (x - spot[0]).hypot(y - spot[1]) < 12. {
                     color
@@ -1542,7 +1552,7 @@ mod tests {
         let (w, h) = (480, 320);
         let mut im = image(w, h, 0.);
         let eye = [300., 120.];
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             *p = if (x - eye[0]).hypot(y - eye[1]) < 12. {
                 [0.6, 0.03, 0.03]
@@ -1613,7 +1623,7 @@ mod tests {
         use crate::model::masks::{LocalAdjust, MaskComponent, MaskGroup, MaskShape};
         let (w, h) = (300, 200);
         let mut im = image(w, h, 0.);
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             let v = 0.3 + 0.2 * (x * 0.07).sin() * (y * 0.05).cos();
             *p = [v * 1.2, v, v * 0.6];
@@ -1674,7 +1684,7 @@ mod tests {
     fn region_preview_is_a_half_resolution_region() {
         let (w, h) = (400, 300);
         let mut im = image(w, h, 0.);
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
             let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
             let v = 0.3 + 0.2 * (x * 0.04).sin() * (y * 0.03).cos();
             *p = [v * 1.2, v, v * 0.6];
