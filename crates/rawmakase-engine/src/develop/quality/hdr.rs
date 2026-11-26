@@ -167,7 +167,7 @@ fn render_hdr_light(
         width: light.width(),
         height: light.height(),
         recovered: Default::default(),
-        pixels: light.pixels().to_vec(),
+        pixels: Arc::new(light.pixels().to_vec()),
         metadata: im.metadata.clone(),
         fast: im.fast,
         scale_factor: 1.,
@@ -242,7 +242,7 @@ mod tests {
             width: w,
             height: h,
             recovered: Default::default(),
-            pixels: pixels.iter().map(|p| p.map(|v| v.clamp(0., 1.))).collect(),
+            pixels: Arc::new(pixels.iter().map(|p| p.map(|v| v.clamp(0., 1.))).collect()),
             metadata,
             fast: false,
             scale_factor: 1.,
@@ -328,9 +328,11 @@ mod tests {
             width: w,
             height: h,
             recovered: Default::default(),
-            pixels: (0..w * h)
-                .map(|i| [levels[(i % w / 8) as usize]; 3])
-                .collect(),
+            pixels: Arc::new(
+                (0..w * h)
+                    .map(|i| [levels[(i % w / 8) as usize]; 3])
+                    .collect(),
+            ),
             metadata,
             fast: false,
             scale_factor: 1.,
@@ -603,24 +605,29 @@ mod tests {
         let mut full = grays(&[1.]);
         (full.width, full.height) = (w, h);
         (full.metadata.width, full.metadata.height) = (w, h);
-        full.pixels = (0..w * h)
-            .map(|i| {
-                let (x, y) = ((i % w) as f32, (i / w) as f32);
-                let v = 0.6 + 0.25 * (x * 0.21).sin() * (y * 0.17).cos() + 0.12 * (x * 0.09).sin();
-                [v * 1.1, v, v * 0.7]
-            })
-            .collect();
+        full.pixels = Arc::new(
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f32, (i / w) as f32);
+                    let v =
+                        0.6 + 0.25 * (x * 0.21).sin() * (y * 0.17).cos() + 0.12 * (x * 0.09).sin();
+                    [v * 1.1, v, v * 0.7]
+                })
+                .collect(),
+        );
         let (hw, hh) = (w / 2, h / 2);
         let mut half = full.clone();
         (half.width, half.height, half.fast) = (hw, hh, true);
-        half.pixels = (0..hw * hh)
-            .map(|i| {
-                let (x, y) = (2 * (i % hw), 2 * (i / hw));
-                let at = |dx: u32, dy: u32| full.pixels[((y + dy) * w + x + dx) as usize];
-                let [a, b, c, d] = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
-                std::array::from_fn(|k| (a[k] + b[k] + c[k] + d[k]) / 4.)
-            })
-            .collect();
+        half.pixels = Arc::new(
+            (0..hw * hh)
+                .map(|i| {
+                    let (x, y) = (2 * (i % hw), 2 * (i / hw));
+                    let at = |dx: u32, dy: u32| full.pixels[((y + dy) * w + x + dx) as usize];
+                    let [a, b, c, d] = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+                    std::array::from_fn(|k| (a[k] + b[k] + c[k] + d[k]) / 4.)
+                })
+                .collect(),
+        );
         assert_eq!(half.photo_scale(), 0.5);
         let plain = hdr_recipe(&full);
         let mut sharp = plain.clone();

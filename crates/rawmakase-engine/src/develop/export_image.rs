@@ -84,9 +84,11 @@ mod tests {
             width: w,
             height: h,
             recovered: Default::default(),
-            pixels: (0..w * h)
-                .map(|i| if i % w < w / 2 { a } else { b })
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..w * h)
+                    .map(|i| if i % w < w / 2 { a } else { b })
+                    .collect(),
+            ),
             metadata,
             fast: false,
             scale_factor: 1.,
@@ -222,9 +224,11 @@ mod tests {
         (im.metadata.width, im.metadata.height) = (w, h);
         let red = xyz([0.5, 0.33], 0.15);
         let blue = xyz([0.2, 0.2], 0.12);
-        im.pixels = (0..w * h)
-            .map(|i| if i % w < w / 2 { red } else { blue })
-            .collect();
+        im.pixels = std::sync::Arc::new(
+            (0..w * h)
+                .map(|i| if i % w < w / 2 { red } else { blue })
+                .collect(),
+        );
         let mut r = Recipe {
             sharpening: 0.,
             ..Default::default()

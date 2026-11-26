@@ -504,7 +504,7 @@ mod manual_distortion_tests {
         CameraImage {
             width: 300,
             height: 200,
-            pixels: vec![[0.2; 3]; 300 * 200],
+            pixels: std::sync::Arc::new(vec![[0.2; 3]; 300 * 200]),
             metadata: crate::camera_data::Metadata {
                 width: 300,
                 height: 200,
@@ -609,7 +609,7 @@ mod constrain_crop_tests {
         CameraImage {
             width: 300,
             height: 200,
-            pixels: vec![[0.2; 3]; 300 * 200],
+            pixels: std::sync::Arc::new(vec![[0.2; 3]; 300 * 200]),
             metadata: crate::camera_data::Metadata {
                 width: 300,
                 height: 200,

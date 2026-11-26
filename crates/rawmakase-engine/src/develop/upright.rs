@@ -880,9 +880,11 @@ mod tests {
             width: 300,
             height: 200,
             // Darker towards the left edge, which the border covers.
-            pixels: (0..300 * 200)
-                .map(|i| [0.05 + 0.9 * (i % 300) as f32 / 300.; 3])
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..300 * 200)
+                    .map(|i| [0.05 + 0.9 * (i % 300) as f32 / 300.; 3])
+                    .collect(),
+            ),
             metadata: crate::camera_data::Metadata {
                 width: 300,
                 height: 200,
@@ -918,7 +920,7 @@ mod tests {
         CameraImage {
             width: w as u32,
             height: h as u32,
-            pixels: luminance.iter().map(|v| [v / 255.; 3]).collect(),
+            pixels: std::sync::Arc::new(luminance.iter().map(|v| [v / 255.; 3]).collect()),
             metadata: crate::camera_data::Metadata {
                 width: w as u32,
                 height: h as u32,

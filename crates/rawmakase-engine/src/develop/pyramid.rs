@@ -58,15 +58,25 @@ impl Pyramid {
 /// Recomputes `rect` of `level` from the level above it.
 fn halve_into(above: &CameraImage, level: &mut CameraImage, rect: [i32; 4]) {
     let (w, h) = (level.width as i32, level.height as i32);
-    for y in rect[1].max(0)..rect[3].min(h) {
+    let (x0, y0, x1, y1) = (
+        rect[0].max(0),
+        rect[1].max(0),
+        rect[2].min(w),
+        rect[3].min(h),
+    );
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let level_pixels = Arc::make_mut(&mut level.pixels);
+    for y in y0..y1 {
         let y0 = 2 * y as u32;
         let y1 = (y0 + 1).min(above.height - 1);
-        for x in rect[0].max(0)..rect[2].min(w) {
+        for x in x0..x1 {
             let x0 = 2 * x as u32;
             let x1 = (x0 + 1).min(above.width - 1);
             let at = |x: u32, y: u32| above.pixels[(y * above.width + x) as usize];
             let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-            level.pixels[(y * w + x) as usize] =
+            level_pixels[(y * w + x) as usize] =
                 std::array::from_fn(|i| (a[i] + b[i] + c[i] + d[i]) * 0.25);
         }
     }
@@ -93,7 +103,7 @@ fn halve(im: &CameraImage) -> CameraImage {
         recovered: Default::default(),
         width: w,
         height: h,
-        pixels,
+        pixels: Arc::new(pixels),
         metadata: im.metadata.clone(),
         fast: im.fast,
         scale_factor: im.scale_factor,
@@ -110,9 +120,11 @@ mod tests {
             recovered: Default::default(),
             width,
             height,
-            pixels: (0..width * height)
-                .map(|i| [(i % width) as f32, (i / width) as f32, 1.])
-                .collect(),
+            pixels: Arc::new(
+                (0..width * height)
+                    .map(|i| [(i % width) as f32, (i / width) as f32, 1.])
+                    .collect(),
+            ),
             metadata: Default::default(),
             fast: false,
             scale_factor: 1.,
@@ -135,12 +147,15 @@ mod tests {
         assert_eq!(p.levels.len(), 4);
         // Updating a rectangle of level 0 gives the pyramid of the new image.
         let mut changed = image(1001, 600);
+        let changed_pixels = Arc::make_mut(&mut changed.pixels);
         for y in 100..140 {
             for x in 700..760 {
-                changed.pixels[y * 1001 + x] = [5., 6., 7.];
+                changed_pixels[y * 1001 + x] = [5., 6., 7.];
             }
         }
         p.update(Arc::new(changed.clone()), &[[700, 100, 760, 140]]);
+        assert_eq!(half.pixels[50 * 501 + 350], [700.5, 100.5, 1.]);
+        assert!(!Arc::ptr_eq(&half.pixels, &p.level_for(400.).pixels));
         let mut fresh = Pyramid::new(Arc::new(changed));
         fresh.level_for(1.);
         for k in 0..4 {

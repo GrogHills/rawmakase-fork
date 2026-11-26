@@ -10,13 +10,15 @@ fn image(width: u32, height: u32) -> CameraImage {
     CameraImage {
         width,
         height,
-        pixels: (0..width * height)
-            .map(|i| {
-                let (x, y) = ((i % width) as f32, (i / width) as f32);
-                let v = 0.05 + 0.4 * x / width as f32 + 0.05 * (y * 0.2).sin();
-                [v * 1.1, v, v * 0.8]
-            })
-            .collect(),
+        pixels: Arc::new(
+            (0..width * height)
+                .map(|i| {
+                    let (x, y) = ((i % width) as f32, (i / width) as f32);
+                    let v = 0.05 + 0.4 * x / width as f32 + 0.05 * (y * 0.2).sin();
+                    [v * 1.1, v, v * 0.8]
+                })
+                .collect(),
+        ),
         metadata: crate::camera_data::Metadata {
             width,
             height,
@@ -196,7 +198,7 @@ fn brush_strokes_build_up_to_density_and_erase() {
 fn auto_mask_stops_at_edges() {
     // Dark left half, bright right half; a stroke along the middle with Auto Mask.
     let mut im = image(200, 100);
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
         *p = if i % 200 < 100 { [0.05; 3] } else { [0.6; 3] };
     }
     let stroke = BrushStroke {
@@ -256,7 +258,7 @@ fn cached_brushes_follow_the_photos_proportions() {
 /// Dark left of `edge` (a fraction of the width), bright right of it.
 fn split(width: u32, height: u32, edge: f32) -> CameraImage {
     let mut im = image(width, height);
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in Arc::make_mut(&mut im.pixels).iter_mut().enumerate() {
         let x = (i as u32 % width) as f32 / width as f32;
         *p = if x < edge { [0.05; 3] } else { [0.6; 3] };
     }

@@ -347,7 +347,7 @@ fn image_of(
         width,
         height,
         recovered: Default::default(),
-        pixels,
+        pixels: Arc::new(pixels),
         metadata,
         fast: true,
         scale_factor: scale.factor,

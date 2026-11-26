@@ -227,12 +227,14 @@ pub(super) mod tests {
         CameraImage {
             width: 96,
             height: 80,
-            pixels: (0..96 * 80)
-                .map(|i| {
-                    let y = (i % 96) as f32 / 192. + 0.05;
-                    [y * 0.8, y, y * 0.6]
-                })
-                .collect(),
+            pixels: Arc::new(
+                (0..96 * 80)
+                    .map(|i| {
+                        let y = (i % 96) as f32 / 192. + 0.05;
+                        [y * 0.8, y, y * 0.6]
+                    })
+                    .collect(),
+            ),
             metadata: crate::camera_data::Metadata {
                 width: 96,
                 height: 80,

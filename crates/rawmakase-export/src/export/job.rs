@@ -366,7 +366,7 @@ mod tests {
                 width: 4,
                 height: 2,
                 recovered: Default::default(),
-                pixels: vec![[0.2; 3]; 8],
+                pixels: Arc::new(vec![[0.2; 3]; 8]),
                 metadata,
                 fast: false,
                 scale_factor: 1.,
@@ -399,7 +399,7 @@ mod tests {
             let mut image = (**plain).clone();
             image.recovered = Default::default();
             // Not the plain image's pattern: rows instead of columns.
-            for (i, p) in image.pixels.iter_mut().enumerate() {
+            for (i, p) in Arc::make_mut(&mut image.pixels).iter_mut().enumerate() {
                 *p = [0.02 + self.1 * ((i / plain.width as usize) % 7) as f32 / 30.; 3];
             }
             Ok(Arc::new(image))
@@ -486,9 +486,11 @@ mod tests {
         image.metadata.matrix = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
         image.metadata.wb = [1.; 3];
         image.metadata.daylight_wb = [1.; 3];
-        image.pixels = (0..64 * 48)
-            .map(|i| [0.02 + (i % 64) as f32 / 300.; 3])
-            .collect();
+        image.pixels = Arc::new(
+            (0..64 * 48)
+                .map(|i| [0.02 + (i % 64) as f32 / 300.; 3])
+                .collect(),
+        );
         plain.image = Arc::new(image);
         let off = render(&plain)?;
         // Off at a moved Amount, and on at Amount 0, are the plain render.
@@ -655,7 +657,7 @@ mod tests {
             width: 4,
             height: 3,
             recovered: Default::default(),
-            pixels: vec![[0.5; 3]; 12],
+            pixels: Arc::new(vec![[0.5; 3]; 12]),
             metadata: raw.metadata.clone(),
             fast: false,
             scale_factor: 1.,
@@ -684,7 +686,7 @@ mod tests {
                 width,
                 height,
                 recovered: Default::default(),
-                pixels: vec![[0.5; 3]; (width * height) as usize],
+                pixels: Arc::new(vec![[0.5; 3]; (width * height) as usize]),
                 metadata: metadata.clone(),
                 fast,
                 scale_factor: 1.,

@@ -139,7 +139,7 @@ fn original(width: u32, height: u32) -> CameraImage {
         width,
         height,
         recovered: Default::default(),
-        pixels,
+        pixels: Arc::new(pixels),
         metadata: every_fact(width, height),
         fast: false,
         scale_factor: 1.25,
@@ -233,7 +233,7 @@ fn reduced_by_area_never_enlarged() {
         [2., 2., 0., 2.],
         [1., 3., 1., 1.],
     ];
-    im.pixels = red.as_flattened().iter().map(|r| [*r, 0., 0.]).collect();
+    im.pixels = Arc::new(red.as_flattened().iter().map(|r| [*r, 0., 0.]).collect());
     im.recovered = Default::default();
     let _ = im.recovered.set(Arc::new(im.clone()));
     let small = build(
@@ -268,14 +268,14 @@ fn reduced_by_area_never_enlarged() {
 fn headroom_above_white_is_kept() {
     let dir = tempfile::tempdir().unwrap();
     let mut im = original(3, 2);
-    im.pixels = vec![
+    im.pixels = Arc::new(vec![
         [1.5, 8., 64.],
         [256., 1000., 4000.],
         [1e-5, 0.18, 1.],
         [2., 2., 2.],
         [32., 1., 1.],
         [3000., 4., 0.5],
-    ];
+    ]);
     im.recovered = Default::default();
     let _ = im.recovered.set(Arc::new(im.clone()));
     let preview = build(
@@ -288,7 +288,7 @@ fn headroom_above_white_is_kept() {
     )
     .unwrap();
     let back = read(&written(dir.path(), &preview), Cancel::NEVER).unwrap();
-    for (got, want) in back.image().pixels.iter().zip(&im.pixels) {
+    for (got, want) in back.image().pixels.iter().zip(im.pixels.iter()) {
         for c in 0..3 {
             let error = (got[c] - want[c]).abs();
             assert!(error <= 1.3e-4 * want[c] + 4e-8, "{got:?} {want:?}");
@@ -589,7 +589,7 @@ fn golden_pixels() -> Vec<[f32; 3]> {
 
 fn golden_source() -> CameraImage {
     let mut im = original(4, 3);
-    im.pixels = golden_pixels();
+    im.pixels = Arc::new(golden_pixels());
     im.recovered = Default::default();
     let _ = im.recovered.set(Arc::new(im.clone()));
     im
@@ -656,9 +656,11 @@ fn noisy_code(i: usize) -> u16 {
 fn of_codes(width: u32, height: u32, code: impl Fn(usize) -> u16) -> CameraImage {
     let table = curve::table();
     let mut im = original(width, height);
-    im.pixels = (0..(width * height) as usize)
-        .map(|i| std::array::from_fn(|c| table[code(i * 3 + c) as usize]))
-        .collect();
+    im.pixels = Arc::new(
+        (0..(width * height) as usize)
+            .map(|i| std::array::from_fn(|c| table[code(i * 3 + c) as usize]))
+            .collect(),
+    );
     im.recovered = Default::default();
     let _ = im.recovered.set(Arc::new(im.clone()));
     im
@@ -954,7 +956,12 @@ fn a_smaller_preview_round_trips_within_its_precision() {
     let back = read(&path, Cancel::NEVER).unwrap();
     assert_same(&small, &back);
     assert_eq!(read_header(&path).unwrap().codec, Codec::DitheredJxl12);
-    for (a, b) in back.image().pixels.iter().zip(&lossless.image().pixels) {
+    for (a, b) in back
+        .image()
+        .pixels
+        .iter()
+        .zip(lossless.image().pixels.iter())
+    {
         for c in 0..3 {
             assert!(within_smaller(a[c], b[c]), "{a:?} {b:?}");
         }
@@ -989,7 +996,7 @@ fn the_dither_keeps_flat_areas_unbiased() {
         // Values that fall between two 12-bit buckets' middles.
         let at = curve::position(v);
         let mut im = original(64, 64);
-        im.pixels = vec![[v; 3]; 64 * 64];
+        im.pixels = Arc::new(vec![[v; 3]; 64 * 64]);
         im.recovered = Default::default();
         let _ = im.recovered.set(Arc::new(im.clone()));
         let p = smaller(&im, 64);
@@ -1015,14 +1022,14 @@ fn the_dither_keeps_flat_areas_unbiased() {
 fn a_smaller_preview_keeps_headroom() {
     let dir = tempfile::tempdir().unwrap();
     let mut im = original(3, 2);
-    im.pixels = vec![
+    im.pixels = Arc::new(vec![
         [1.5, 8., 64.],
         [256., 1000., 4000.],
         [0.01, 0.18, 1.],
         [2., 2., 2.],
         [32., 1., 1.],
         [3000., 4., 0.5],
-    ];
+    ]);
     im.recovered = Default::default();
     let _ = im.recovered.set(Arc::new(im.clone()));
     let back = read(
@@ -1030,7 +1037,7 @@ fn a_smaller_preview_keeps_headroom() {
         Cancel::NEVER,
     )
     .unwrap();
-    for (got, want) in back.image().pixels.iter().zip(&im.pixels) {
+    for (got, want) in back.image().pixels.iter().zip(im.pixels.iter()) {
         for c in 0..3 {
             assert!(within_smaller(got[c], want[c]), "{got:?} {want:?}");
         }
@@ -1127,7 +1134,7 @@ fn the_golden_version_1_smaller_file_opens() {
         .iter()
         .map(|p| p.map(|q| table[(usize::from(q) << 4) + 8]))
         .collect();
-    assert_eq!(image.pixels, read_as);
+    assert_eq!(*image.pixels, read_as);
     assert_eq!(golden.exif(), Some(&exif()));
     assert_eq!(
         format!("{:?}", golden.image().metadata),

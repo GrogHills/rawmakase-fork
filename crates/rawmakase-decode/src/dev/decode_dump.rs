@@ -125,7 +125,7 @@ fn mode(image: anyhow::Result<CameraImage>) -> Mode {
     };
     let mut hash = sha2::Sha256::new();
     let mut sum = [0f64; 3];
-    for p in &image.pixels {
+    for p in image.pixels.iter() {
         for c in 0..3 {
             hash.update(p[c].to_le_bytes());
             sum[c] += f64::from(p[c]);

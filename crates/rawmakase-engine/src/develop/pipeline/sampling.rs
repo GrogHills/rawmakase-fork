@@ -117,13 +117,16 @@ pub(crate) fn measurement_source(im: Source, max: u32) -> CameraImage {
     let mut copy = preview_source(im, max);
     if let Some(grid) = copy.metadata.lens.as_ref().and_then(|l| l.gain_map.clone()) {
         let (w, h) = (copy.width as usize, copy.height as usize);
-        copy.pixels.par_iter_mut().enumerate().for_each(|(i, p)| {
-            let gain = grid.gain(
-                ((i / w) as f32 + 0.5) / h as f32,
-                ((i % w) as f32 + 0.5) / w as f32,
-            );
-            (0..3).for_each(|c| p[c] *= gain[c]);
-        });
+        std::sync::Arc::make_mut(&mut copy.pixels)
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, p)| {
+                let gain = grid.gain(
+                    ((i / w) as f32 + 0.5) / h as f32,
+                    ((i % w) as f32 + 0.5) / w as f32,
+                );
+                (0..3).for_each(|c| p[c] *= gain[c]);
+            });
     }
     copy
 }
@@ -139,7 +142,7 @@ pub(crate) fn preview_source(im: Source, max: u32) -> CameraImage {
         recovered: Default::default(),
         width: w,
         height: h,
-        pixels,
+        pixels: std::sync::Arc::new(pixels),
         metadata: im.metadata.clone(),
         fast: im.fast,
         scale_factor: im.scale_factor,

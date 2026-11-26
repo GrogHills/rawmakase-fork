@@ -19,12 +19,14 @@ fn remove_tool_adds_spots_paints_brushes_and_edits_the_selection() {
         recovered: Default::default(),
         width: 400,
         height: 400,
-        pixels: (0..160000)
-            .map(|i| {
-                let (x, y) = ((i % 400) as f32, (i / 400) as f32);
-                [0.2 + 0.05 * (x * 0.1).sin() * (y * 0.13).cos(); 3]
-            })
-            .collect(),
+        pixels: std::sync::Arc::new(
+            (0..160000)
+                .map(|i| {
+                    let (x, y) = ((i % 400) as f32, (i / 400) as f32);
+                    [0.2 + 0.05 * (x * 0.1).sin() * (y * 0.13).cos(); 3]
+                })
+                .collect(),
+        ),
         metadata: Metadata {
             width: 400,
             height: 400,

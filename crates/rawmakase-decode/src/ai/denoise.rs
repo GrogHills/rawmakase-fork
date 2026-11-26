@@ -278,7 +278,7 @@ pub fn assemble(
         recovered: Default::default(),
         width: plain.width,
         height: plain.height,
-        pixels,
+        pixels: Arc::new(pixels),
         metadata: plain.metadata.clone(),
         fast: false,
         scale_factor: plain.scale_factor,
@@ -425,9 +425,11 @@ mod tests {
             recovered: Default::default(),
             width: width as u32,
             height: height as u32,
-            pixels: (0..width * height)
-                .map(|i| [0.3 + (i % 5) as f32 * 0.01; 3])
-                .collect(),
+            pixels: Arc::new(
+                (0..width * height)
+                    .map(|i| [0.3 + (i % 5) as f32 * 0.01; 3])
+                    .collect(),
+            ),
             metadata,
             fast: false,
             scale_factor: 1.,

@@ -212,7 +212,7 @@ fn gradient(precision: Precision) -> EditablePreview {
         width: w,
         height: h,
         recovered: Default::default(),
-        pixels,
+        pixels: Arc::new(pixels),
         metadata,
         fast: false,
         scale_factor: 1.,

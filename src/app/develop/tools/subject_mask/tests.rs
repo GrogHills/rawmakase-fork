@@ -48,7 +48,7 @@ fn fixture() -> Fixture {
         recovered: Default::default(),
         width: 8,
         height: 6,
-        pixels: vec![[0.2; 3]; 48],
+        pixels: std::sync::Arc::new(vec![[0.2; 3]; 48]),
         metadata,
         fast: false,
         scale_factor: 1.,

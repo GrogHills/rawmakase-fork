@@ -117,6 +117,10 @@ impl Placed {
         let r = self.dest();
         let (w, h) = (im.width as i32, im.height as i32);
         let [x0, y0, x1, y1] = [r[0].max(0), r[1].max(0), r[2].min(w), r[3].min(h)];
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let pixels = std::sync::Arc::make_mut(&mut im.pixels);
         for y in y0..y1 {
             for x in x0..x1 {
                 let a = self.weight(x as f32, y as f32);
@@ -125,7 +129,7 @@ impl Placed {
                     |v: f32| v.max(0.).powf(1. / model.gamma),
                     |v: f32| v.powf(model.gamma),
                 );
-                let p = &mut im.pixels[(y * w + x) as usize];
+                let p = &mut pixels[(y * w + x) as usize];
                 if a > 0. {
                     let target = match self.kind {
                         EyeKind::Red => red_pupil(*p, self.darken, model),

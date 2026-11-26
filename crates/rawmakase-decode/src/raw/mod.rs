@@ -455,7 +455,7 @@ impl Raw {
                 recovered: Default::default(),
                 width,
                 height,
-                pixels,
+                pixels: std::sync::Arc::new(pixels),
                 metadata,
                 fast: decode == Decode::Half,
                 // Developed in floating point: nothing is scaled down to
@@ -521,7 +521,7 @@ impl Raw {
             recovered: Default::default(),
             width: w,
             height: h,
-            pixels,
+            pixels: std::sync::Arc::new(pixels),
             metadata,
             fast: half,
             scale_factor: 1.,
@@ -1104,7 +1104,7 @@ mod tests {
                 // The blank codestream is one value throughout.
                 let first = image.pixels[0];
                 assert!(first.iter().all(|&v| v > 0.0), "{model}, {decode:?}");
-                for p in &image.pixels {
+                for p in image.pixels.iter() {
                     for c in 0..3 {
                         assert!((p[c] - first[c]).abs() <= 1e-4, "{model}, {decode:?}");
                     }

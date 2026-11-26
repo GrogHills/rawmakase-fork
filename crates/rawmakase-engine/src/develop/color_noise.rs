@@ -167,7 +167,7 @@ impl ChromaDenoise {
             width: im.width,
             height: im.height,
             recovered: Default::default(),
-            pixels,
+            pixels: std::sync::Arc::new(pixels),
             metadata: im.metadata.clone(),
             fast: im.fast,
             scale_factor: im.scale_factor,
@@ -480,7 +480,7 @@ mod tests {
             recovered: Default::default(),
             width: w,
             height: h,
-            pixels: (0..w * h).map(|i| f(i % w, i / w)).collect(),
+            pixels: std::sync::Arc::new((0..w * h).map(|i| f(i % w, i / w)).collect()),
             metadata: Default::default(),
             fast: false,
             scale_factor: 1.,
@@ -514,7 +514,7 @@ mod tests {
         let out = d.apply(&im, Cancel::NEVER).unwrap();
         // Away from the edge colours are as they were; a strong colour edge stays sharp,
         // within a pixel of where it was.
-        for (i, (a, b)) in im.pixels.iter().zip(&out.pixels).enumerate() {
+        for (i, (a, b)) in im.pixels.iter().zip(out.pixels.iter()).enumerate() {
             let x = (i % 64) as i32;
             let tolerance = if (x - 32).abs() > 4 { 2e-3 } else { 0.03 };
             for c in 0..3 {
@@ -561,7 +561,7 @@ mod tests {
             .unwrap()
             .apply(&im, Cancel::NEVER)
             .unwrap();
-        for (a, b) in im.pixels.iter().zip(&out.pixels) {
+        for (a, b) in im.pixels.iter().zip(out.pixels.iter()) {
             let luma = |p: &[f32; 3]| {
                 let [r, g, b] = p.map(|v| v.max(0.).sqrt());
                 r + 2. * g + b
@@ -573,7 +573,10 @@ mod tests {
         let mut im = image(w, h, f);
         // White balance 1: the sensor clips at 1 in every channel.
         im.metadata.wb = [1.; 3];
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+            .iter_mut()
+            .enumerate()
+        {
             let (x, y) = (i as u32 % w, i as u32 / w);
             // Shot noise: its spread grows with the square root of the signal.
             for (c, v) in p.iter_mut().enumerate() {
@@ -610,7 +613,7 @@ mod tests {
         for amplitude in [0., 1e-7] {
             let clean = noisy(256, 128, amplitude, |x, _| side(x));
             let out = d.apply(&clean, Cancel::new(&cancel)).unwrap();
-            for (a, b) in clean.pixels.iter().zip(&out.pixels) {
+            for (a, b) in clean.pixels.iter().zip(out.pixels.iter()) {
                 for c in 0..3 {
                     assert!((a[c] - b[c]).abs() < 1e-4, "{amplitude}: {a:?} {b:?}");
                 }
@@ -655,7 +658,7 @@ mod tests {
         // has some clipped pixels, and its noise is still measured and taken out.
         let cancel = AtomicBool::new(false);
         let mut im = noisy(256, 256, 0.15, |_, _| [0.002, 0.004, 0.003]);
-        for p in im.pixels.iter_mut() {
+        for p in std::sync::Arc::make_mut(&mut im.pixels).iter_mut() {
             *p = p.map(|v| v.max(0.));
         }
         let clipped = im.pixels.iter().filter(|p| p.contains(&0.)).count();
@@ -688,7 +691,7 @@ mod tests {
             .unwrap()
             .apply(&im, Cancel::new(&cancel))
             .unwrap();
-        for (a, b) in im.pixels.iter().zip(&barely.pixels) {
+        for (a, b) in im.pixels.iter().zip(barely.pixels.iter()) {
             for c in 0..3 {
                 assert!((a[c] - b[c]).abs() < 2e-3, "{a:?} {b:?}");
             }

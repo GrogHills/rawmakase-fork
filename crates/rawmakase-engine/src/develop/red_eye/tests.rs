@@ -47,7 +47,7 @@ fn image(width: u32, height: u32, flip: i32, eyes: &[Eye]) -> CameraImage {
     CameraImage {
         width,
         height,
-        pixels,
+        pixels: std::sync::Arc::new(pixels),
         metadata: crate::camera_data::Metadata {
             width,
             height,
@@ -170,7 +170,10 @@ fn corrects_the_pupil_and_leaves_a_reddish_iris() {
 fn catchlight_inside_the_pupil_is_part_of_it() {
     let c = [100., 100.];
     let mut im = image(200, 200, 0, &[eye(c, 16., BROWN_IRIS)]);
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % 200) as f32, (i / 200) as f32);
         if (x - 95.).hypot(y - 95.) < 4. {
             *p = [0.9; 3];
@@ -203,7 +206,10 @@ fn tilted_pupils_and_camera_orientation() {
     let (a, b, angle) = (22f32, 10f32, 0.6f32);
     let make = |flip: i32| {
         let mut im = image(w, h, flip, &[]);
-        for (i, p) in im.pixels.iter_mut().enumerate() {
+        for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+            .iter_mut()
+            .enumerate()
+        {
             let (x, y) = ((i as u32 % w) as f32 - c[0], (i as u32 / w) as f32 - c[1]);
             let (u, v) = (
                 x * angle.cos() + y * angle.sin(),
@@ -233,7 +239,7 @@ fn tilted_pupils_and_camera_orientation() {
     for r in &results[1..] {
         let worst = r
             .iter()
-            .zip(&results[0])
+            .zip(results[0].iter())
             .flat_map(|(p, q)| (0..3).map(move |i| (p[i] - q[i]).abs()))
             .fold(0., f32::max);
         assert!(worst < 1e-4, "{worst}");
@@ -462,7 +468,7 @@ fn catchlights_turn_with_the_camera() {
     for r in &results[1..] {
         let worst = r
             .iter()
-            .zip(&results[0])
+            .zip(results[0].iter())
             .flat_map(|(p, q)| (0..3).map(move |i| (p[i] - q[i]).abs()))
             .fold(0., f32::max);
         assert!(worst < 1e-3, "{worst}");
@@ -475,7 +481,10 @@ fn a_catchlight_in_a_glowing_pupil_is_not_taken_for_it() {
     // A dim glow, darker than the face around the eye.
     e.pupil_color = [0.3, 0.45, 0.1];
     let mut im = image(200, 200, 0, &[e]);
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % 200) as f32, (i / 200) as f32);
         if (x - 95.).hypot(y - 96.) < 3.5 {
             *p = [1.; 3];
@@ -498,7 +507,10 @@ fn small_glowing_pupils_are_found_in_wide_circles() {
     e.pupil_color = [0.5, 0.8, 0.15];
     let mut im = image(300, 300, 0, &[e]);
     // Dark fur around a lighter iris.
-    for p in im.pixels.iter_mut().filter(|p| **p == SKIN) {
+    for p in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .filter(|p| **p == SKIN)
+    {
         *p = [0.15, 0.12, 0.1];
     }
     let frame = ImageFrame::new(&im);
@@ -538,10 +550,16 @@ fn a_dark_pupil_with_a_catchlight_is_not_a_glow() {
     let mut e = eye(c, 14., [0.35, 0.25, 0.1]);
     e.pupil_color = [0.02; 3];
     let mut im = image(200, 200, 0, &[e]);
-    for p in im.pixels.iter_mut().filter(|p| **p == SKIN) {
+    for p in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .filter(|p| **p == SKIN)
+    {
         *p = [0.15, 0.12, 0.1];
     }
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % 200) as f32, (i / 200) as f32);
         if (x - 96.).hypot(y - 96.) < 2.5 {
             *p = [1.; 3];
@@ -576,7 +594,10 @@ fn a_light_iris_around_a_dark_pupil_is_not_a_glow() {
         e.iris = 24.;
         e.pupil_color = [0.02; 3];
         let mut im = image(200, 200, 0, &[e]);
-        for p in im.pixels.iter_mut().filter(|p| **p == SKIN) {
+        for p in std::sync::Arc::make_mut(&mut im.pixels)
+            .iter_mut()
+            .filter(|p| **p == SKIN)
+        {
             *p = [0.15, 0.12, 0.1];
         }
         let frame = ImageFrame::new(&im);

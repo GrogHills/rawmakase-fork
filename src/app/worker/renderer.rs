@@ -744,12 +744,14 @@ mod tests {
             recovered: Default::default(),
             width: w,
             height: h,
-            pixels: (0..w * h)
-                .map(|i| {
-                    let v = 0.2 + 0.1 * ((i % w) as f32 * 0.2).sin();
-                    [v * 1.1, v, v * 0.8]
-                })
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..w * h)
+                    .map(|i| {
+                        let v = 0.2 + 0.1 * ((i % w) as f32 * 0.2).sin();
+                        [v * 1.1, v, v * 0.8]
+                    })
+                    .collect(),
+            ),
             metadata: Metadata {
                 width: w,
                 height: h,
@@ -886,7 +888,7 @@ mod tests {
         let worker = renderer(tx, egui::Context::default());
         let image = image();
         let brighter = Arc::new(CameraImage {
-            pixels: image.pixels.iter().map(|p| p.map(|v| v * 2.)).collect(),
+            pixels: Arc::new(image.pixels.iter().map(|p| p.map(|v| v * 2.)).collect()),
             ..(*image).clone()
         });
         let ai = develop::AiSource::recover((*brighter).clone(), Cancel::NEVER).unwrap();
@@ -1027,7 +1029,7 @@ mod tests {
         let recipe = Recipe::default();
         // Fewer pixels than its size says: indexing it panics.
         let mut broken = (*image()).clone();
-        broken.pixels.truncate(10);
+        Arc::make_mut(&mut broken.pixels).truncate(10);
         worker.submit(RenderJob {
             id: 1,
             pane: Pane::After,

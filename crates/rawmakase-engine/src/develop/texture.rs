@@ -87,14 +87,29 @@ impl TextureDetail {
     /// `im`, the image the detail was made from, with Texture `amount`.
     pub(crate) fn apply(&self, im: &CameraImage, amount: f32) -> CameraImage {
         let s = strength(amount) * DETAIL_STEP;
-        let mut out = im.clone();
-        out.recovered = Default::default();
-        out.pixels.par_iter_mut().enumerate().for_each(|(i, p)| {
-            for (v, detail) in p.iter_mut().zip(&self.channels) {
-                *v *= (s * detail[i] as f32).exp2();
-            }
-        });
-        out
+        if s == 0. {
+            return CameraImage {
+                recovered: Default::default(),
+                ..im.clone()
+            };
+        }
+        let pixels = im
+            .pixels
+            .par_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                [
+                    p[0] * (s * self.channels[0][i] as f32).exp2(),
+                    p[1] * (s * self.channels[1][i] as f32).exp2(),
+                    p[2] * (s * self.channels[2][i] as f32).exp2(),
+                ]
+            })
+            .collect();
+        CameraImage {
+            recovered: Default::default(),
+            pixels: std::sync::Arc::new(pixels),
+            ..im.clone()
+        }
     }
     /// The log2 detail of each channel at `x`, `y` of the `width`-wide image it was made
     /// from, interpolated bilinearly.
@@ -157,12 +172,14 @@ mod tests {
             recovered: Default::default(),
             width: w,
             height: h,
-            pixels: (0..w * h)
-                .map(|i| {
-                    let x = (i % w) as f32;
-                    [0.18 * (amplitude * (std::f32::consts::TAU * f * x).sin()).exp2(); 3]
-                })
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..w * h)
+                    .map(|i| {
+                        let x = (i % w) as f32;
+                        [0.18 * (amplitude * (std::f32::consts::TAU * f * x).sin()).exp2(); 3]
+                    })
+                    .collect(),
+            ),
             metadata: Default::default(),
             fast: false,
             scale_factor: 1.,
@@ -214,9 +231,11 @@ mod tests {
             recovered: Default::default(),
             width: w,
             height: h,
-            pixels: (0..w * h)
-                .map(|i| [0.1 + 0.1 * ((i % w) as f32 * 0.3).sin().abs(); 3])
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..w * h)
+                    .map(|i| [0.1 + 0.1 * ((i % w) as f32 * 0.3).sin().abs(); 3])
+                    .collect(),
+            ),
             metadata: crate::camera_data::Metadata {
                 width: full,
                 height: full * h / w,

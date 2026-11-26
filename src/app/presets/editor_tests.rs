@@ -16,7 +16,7 @@ fn refreshing_preset_support_cancels_the_hover_render() {
         recovered: Default::default(),
         width: 1,
         height: 1,
-        pixels: vec![[0.1; 3]],
+        pixels: Arc::new(vec![[0.1; 3]]),
         metadata: Metadata {
             width: 1,
             height: 1,

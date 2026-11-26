@@ -17,7 +17,10 @@ use rawmakase_cancel::Cancel;
 fn scene() -> CameraImage {
     let mut im = develop(&chart_path("synthetic-d65"));
     let (w, h) = (im.width as usize, im.height as usize);
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % w) as f32 / w as f32, (i / w) as f32 / h as f32);
         let light = 0.08 + 0.3 * x;
         let v = if y < 0.5 {
@@ -33,7 +36,10 @@ fn scene() -> CameraImage {
 }
 fn dust(im: &mut CameraImage, spots: &[([f32; 2], f32)]) {
     let w = im.width as usize;
-    for (i, p) in im.pixels.iter_mut().enumerate() {
+    for (i, p) in std::sync::Arc::make_mut(&mut im.pixels)
+        .iter_mut()
+        .enumerate()
+    {
         let (x, y) = ((i % w) as f32, (i / w) as f32);
         for (c, r) in spots {
             let d = (x - c[0]).hypot(y - c[1]);

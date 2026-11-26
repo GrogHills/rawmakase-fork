@@ -41,7 +41,7 @@ fn imported_profiles_render_and_roundtrip() -> anyhow::Result<()> {
         let im = CameraImage {
             width: 16,
             height: 16,
-            pixels: (0..256).map(|i| [i as f32 / 300., 0.3, 0.1]).collect(),
+            pixels: std::sync::Arc::new((0..256).map(|i| [i as f32 / 300., 0.3, 0.1]).collect()),
             metadata: m,
             fast: false,
             scale_factor: 1.,
@@ -108,7 +108,7 @@ fn imported_enhanced_profiles_match_camera_and_resolve_xmp() -> anyhow::Result<(
         let image = CameraImage {
             width: 16,
             height: 16,
-            pixels: (0..256).map(|i| [i as f32 / 300., 0.2, 0.1]).collect(),
+            pixels: std::sync::Arc::new((0..256).map(|i| [i as f32 / 300., 0.2, 0.1]).collect()),
             metadata,
             fast: false,
             scale_factor: 1.,

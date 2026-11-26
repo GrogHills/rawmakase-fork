@@ -103,7 +103,7 @@ fn wide_gamut_exports_read_back_through_their_profiles_as_the_srgb_export() -> R
     std::fs::write(&source, b"synthetic")?;
     // Muted colours and a neutral ramp, all inside sRGB.
     let mut image = synthetic(96, 64);
-    for p in &mut image.pixels {
+    for p in std::sync::Arc::make_mut(&mut image.pixels) {
         let mean = (p[0] + p[1] + p[2]) / 3.;
         *p = p.map(|v| mean + (v - mean) * 0.35);
     }

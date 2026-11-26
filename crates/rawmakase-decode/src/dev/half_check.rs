@@ -300,9 +300,11 @@ mod tests {
             width,
             height,
             recovered: Default::default(),
-            pixels: (0..(width * height) as usize)
-                .map(|k| pixel(k % width as usize, k / width as usize))
-                .collect(),
+            pixels: std::sync::Arc::new(
+                (0..(width * height) as usize)
+                    .map(|k| pixel(k % width as usize, k / width as usize))
+                    .collect(),
+            ),
             metadata,
             fast: false,
             scale_factor: 1.,

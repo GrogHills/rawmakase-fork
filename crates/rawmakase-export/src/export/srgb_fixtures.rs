@@ -187,7 +187,7 @@ pub(super) fn synthetic(width: u32, height: u32) -> CameraImage {
         width,
         height,
         recovered: Default::default(),
-        pixels,
+        pixels: Arc::new(pixels),
         metadata,
         fast: false,
         scale_factor: 1.,

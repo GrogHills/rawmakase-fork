@@ -576,7 +576,7 @@ mod tests {
             .develop(Decode::Full(Demosaic::Rawmakase), Cancel::new(&cancel))
             .unwrap();
         assert_eq!([full.width, full.height], [w, h]);
-        assert!(full.pixels == expected, "the full size is not X-Trans's");
+        assert!(*full.pixels == expected, "the full size is not X-Trans's");
         let half = open().develop(Decode::Half, Cancel::new(&cancel)).unwrap();
         assert_eq!([half.width, half.height], [w / 2, h / 2]);
         for (k, got) in half.pixels.iter().enumerate() {

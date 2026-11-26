@@ -380,7 +380,9 @@ fn a_partial_result_after_the_final_one_is_ignored() {
     editor.document.set_image(plain.clone());
     let final_one = AiSource::recover((*plain).clone(), Cancel::NEVER).unwrap();
     let mut other = (*plain).clone();
-    other.pixels.iter_mut().for_each(|p| p[0] = 0.9);
+    std::sync::Arc::make_mut(&mut other.pixels)
+        .iter_mut()
+        .for_each(|p| p[0] = 0.9);
     let partial = AiSource::recover(other, Cancel::NEVER).unwrap();
     editor.ai_denoise_update(Update {
         plain: Arc::downgrade(&plain),

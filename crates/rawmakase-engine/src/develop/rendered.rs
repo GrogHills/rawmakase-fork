@@ -78,8 +78,7 @@ pub fn scene_from_rendered(p: [f32; 3]) -> [f32; 3] {
 
 /// A rendered file's image as the scene its default rendering is of.
 pub fn to_scene(mut image: CameraImage) -> CameraImage {
-    image
-        .pixels
+    std::sync::Arc::make_mut(&mut image.pixels)
         .par_iter_mut()
         .for_each(|p| *p = scene_from_rendered(*p));
     image
