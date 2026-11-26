@@ -57,7 +57,7 @@ pub(crate) struct DngPlan {
 }
 
 /// Reads a DNG's header facts. `t` is the parsed TIFF.
-pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
+pub(crate) fn open(bytes: crate::io::Source<'_>, t: TiffFile) -> Result<RawInfo> {
     let ifd0 = &t.ifds[0];
     let version = t
         .bytes_of(ifd0, 50706)
@@ -301,7 +301,8 @@ pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
         && let Some(at) = t.offset_of(entry)
     {
         // Nikon's maker note, in Adobe's record of DNGPrivateData.
-        let private = t.bytes_of(ifd0, 50740).unwrap_or_default();
+        let private = t.bytes_of(ifd0, 50740);
+        let private = private.as_deref().unwrap_or_default();
         let model = crate::names::model("Nikon", &info.make, &info.model);
         if let Some(notes) = crate::vendor::nikon::read_dng(bytes, at, &model) {
             info.lens_id = notes.lens_id;
@@ -529,6 +530,7 @@ impl Calibration {
 fn list(t: &TiffFile, ifd: &Ifd, tag: u16) -> Vec<Opcode> {
     let ops = t
         .bytes_of(ifd, tag)
+        .as_deref()
         .and_then(opcodes::parse)
         .unwrap_or_default();
     ops.into_iter()
@@ -605,7 +607,8 @@ fn cfa(t: &TiffFile, ifd: &Ifd) -> Result<Cfa> {
     if rows == 0 || cols == 0 || rows > 16 || cols > 16 || pattern.len() < rows * cols {
         return Err(corrupt("DNG CFA pattern"));
     }
-    let planes = t.bytes_of(ifd, 50710).unwrap_or(&[0, 1, 2]);
+    let planes = t.bytes_of(ifd, 50710);
+    let planes = planes.as_deref().unwrap_or(&[0, 1, 2]);
     let mut colors = Vec::with_capacity(rows * cols);
     for &p in &pattern[..rows * cols] {
         let c = *planes

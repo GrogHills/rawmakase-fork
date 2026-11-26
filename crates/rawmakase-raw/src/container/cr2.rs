@@ -50,8 +50,8 @@ const MAX_SLICES: u32 = 64;
 const MAX_BORDER_SHORTFALL: u32 = 16;
 
 /// Whether `bytes` is a CR2: a TIFF with "CR" 2 after its header.
-pub(crate) fn is_cr2(bytes: &[u8]) -> bool {
-    bytes.get(8..11) == Some(b"CR\x02")
+pub(crate) fn is_cr2(bytes: crate::io::Source<'_>) -> bool {
+    bytes.starts_with_at(8, b"CR\x02")
 }
 
 /// The directory of the sensor data: the one that lists Canon's slices
@@ -64,13 +64,24 @@ fn raw_ifd<'t>(t: &'t TiffFile) -> Option<&'t Ifd> {
 }
 
 /// Reads a CR2's header facts.
-pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
+pub(crate) fn open(bytes: crate::io::Source<'_>, t: TiffFile) -> Result<RawInfo> {
     let ifd = raw_ifd(&t).ok_or_else(|| corrupt("CR2 without a raw image"))?;
     let at = t.int(ifd, 273).ok_or_else(|| corrupt("CR2 strip offset"))?;
     let len = t.int(ifd, 279).ok_or_else(|| corrupt("CR2 strip length"))?;
     let strip = (t.base + u64::from(at), u64::from(len));
-    let file = crate::io::Bytes::new(bytes, crate::io::Order::Little);
-    let jpeg = ljpeg::header(file.slice(strip.0, strip.1)?)?;
+    strip
+        .0
+        .checked_add(strip.1)
+        .filter(|&end| end <= bytes.len())
+        .ok_or_else(|| corrupt("CR2 strip"))?;
+    let header_len = match bytes {
+        crate::io::Source::Slice(_) => strip.1,
+        crate::io::Source::Sparse { .. } => strip.1.min(64 << 10),
+    };
+    let head = bytes
+        .get(strip.0, header_len)
+        .ok_or_else(|| corrupt("CR2 strip"))?;
+    let jpeg = ljpeg::header(&head)?;
     let note = t
         .exif
         .as_ref()
@@ -255,16 +266,22 @@ pub(crate) fn is_canon_tif(t: &TiffFile) -> bool {
 /// maker note's RawDataOffset is a lossless JPEG stream of the whole sensor
 /// to the end of the file, unsliced, each of its lines `components` rows of
 /// the image (two, one per component).
-pub(crate) fn open_tif(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
+pub(crate) fn open_tif(bytes: crate::io::Source<'_>, t: TiffFile) -> Result<RawInfo> {
     let note = maker_note(&t).ok_or_else(|| corrupt("Canon TIF maker note"))?;
     let at = t
         .int(&note, RAW_DATA_OFFSET)
         .map(|at| t.base + u64::from(at))
-        .filter(|&at| at < bytes.len() as u64)
+        .filter(|&at| at < bytes.len())
         .ok_or_else(|| corrupt("Canon TIF raw data offset"))?;
-    let strip = (at, bytes.len() as u64 - at);
-    let file = crate::io::Bytes::new(bytes, crate::io::Order::Little);
-    let jpeg = ljpeg::header(file.slice(strip.0, strip.1)?)?;
+    let strip = (at, bytes.len() - at);
+    let header_len = match bytes {
+        crate::io::Source::Slice(_) => strip.1,
+        crate::io::Source::Sparse { .. } => strip.1.min(64 << 10),
+    };
+    let head = bytes
+        .get(strip.0, header_len)
+        .ok_or_else(|| corrupt("Canon TIF raw data"))?;
+    let jpeg = ljpeg::header(&head)?;
     let per_mcu = jpeg.samples_per_mcu();
     if per_mcu != jpeg.components.len() {
         return Err(Error::Unsupported("Canon TIF sampling".into()));
@@ -468,14 +485,25 @@ fn white(info: &RawInfo, plan: &Cr2Plan, bits: u32, darkest: u32) -> u32 {
 /// black; `None` for a small RAW, without recorded levels (a black only the
 /// masked border tells) or a readable strip header. Read once the camera's
 /// names are RAWmakase's (`variant::open`): the camera table is keyed by them.
-pub(crate) fn levels(info: &RawInfo, plan: &Cr2Plan, bytes: &[u8]) -> Option<[u32; 3]> {
+pub(crate) fn levels(
+    info: &RawInfo,
+    plan: &Cr2Plan,
+    bytes: crate::io::Source<'_>,
+) -> Option<[u32; 3]> {
     if plan.sraw.is_some() {
         return None;
     }
     let black = plan.levels.black?;
-    let file = crate::io::Bytes::new(bytes, crate::io::Order::Little);
-    let strip = file.slice(plan.strip.0, plan.strip.1).ok()?;
-    let precision = ljpeg::header(strip).ok()?.precision;
+    let end = plan.strip.0.checked_add(plan.strip.1)?;
+    if end > bytes.len() {
+        return None;
+    }
+    let header_len = match bytes {
+        crate::io::Source::Slice(_) => plan.strip.1,
+        crate::io::Source::Sparse { .. } => plan.strip.1.min(64 << 10),
+    };
+    let strip = bytes.get(plan.strip.0, header_len)?;
+    let precision = ljpeg::header(&strip).ok()?.precision;
     let bits = 1u32.checked_shl(u32::from(precision))?.checked_sub(1)?;
     let darkest = black.iter().copied().max().unwrap_or(0);
     Some([

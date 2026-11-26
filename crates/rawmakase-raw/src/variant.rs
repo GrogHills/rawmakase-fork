@@ -265,6 +265,11 @@ pub(crate) enum Plan {
 
 /// Reads the header facts of the RAW file in `bytes`.
 pub(crate) fn open(bytes: &[u8]) -> Result<RawInfo> {
+    open_source(crate::io::Source::Slice(bytes))
+}
+
+/// Reads the header facts of the RAW file in `bytes` (slice or sparse).
+pub(crate) fn open_source(bytes: crate::io::Source<'_>) -> Result<RawInfo> {
     let mut info = probe(bytes)?;
     crate::names::apply(&mut info);
     if let Plan::Cr2(plan) = &info.plan {
@@ -277,7 +282,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<RawInfo> {
 }
 
 /// The container's own reading of the file, names as the file writes them.
-fn probe(bytes: &[u8]) -> Result<RawInfo> {
+fn probe(bytes: crate::io::Source<'_>) -> Result<RawInfo> {
     if crate::container::raf::is_raf(bytes) {
         return crate::container::raf::open(bytes);
     }
@@ -353,7 +358,7 @@ fn probe(bytes: &[u8]) -> Result<RawInfo> {
         return Err(crate::error::corrupt("TIFF directory"));
     }
     // An ISO base media file (an `ftyp` box first) other than a CR3.
-    if bytes.get(4..8) == Some(b"ftyp") {
+    if bytes.starts_with_at(4, b"ftyp") {
         return Err(Error::Unsupported(
             "ISO base media file of no known RAW".into(),
         ));

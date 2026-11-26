@@ -71,7 +71,7 @@ pub(crate) fn is_nef(t: &TiffFile) -> bool {
 }
 
 /// Reads a NEF's header facts.
-pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
+pub(crate) fn open(bytes: crate::io::Source<'_>, t: TiffFile) -> Result<RawInfo> {
     let raw =
         raw_directory(&t).ok_or_else(|| Error::Unsupported("NEF without a raw image".into()))?;
     let ifd = &t.ifds[raw];
@@ -90,9 +90,7 @@ pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
     let strips = strips(&t, ifd)?;
     let size: u64 = strips.iter().map(|s| s.1).sum();
     let notes = crate::vendor::nikon::read(&t, &model);
-    let first = strips
-        .first()
-        .and_then(|&(at, _)| bytes.get(at as usize..(at as usize).checked_add(4)?));
+    let first = strips.first().and_then(|&(at, _)| bytes.array::<4>(at));
     let pixels = u64::from(width) * u64::from(height);
     let rows = u64::from(height);
     let row = |b: u64| (u64::from(width) * b).div_ceil(8);
@@ -107,7 +105,7 @@ pub(crate) fn open(bytes: &[u8], t: TiffFile) -> Result<RawInfo> {
     } else {
         Layout::Msb
     };
-    let (variant, mut layout, stride) = if first == Some(&[0xff, 0x10, 0xff, 0x50][..]) {
+    let (variant, mut layout, stride) = if first == Some([0xff, 0x10, 0xff, 0x50]) {
         // JPEG XS's SOC and CAP: High Efficiency, whatever the body.
         (Variant::NefHighEfficiency, Layout::Coded, 0)
     } else if compression == 34713 && size == pixels * 3 {
@@ -253,26 +251,32 @@ fn raw_directory(t: &TiffFile) -> Option<usize> {
 
 /// The pixels of the JPEG at `at` from its frame header (ITU T.81 B.2.2);
 /// 0 when it has none before the scan.
-fn jpeg_pixels(bytes: &[u8], at: u64, len: u64) -> u64 {
-    let Some(jpeg) = usize::try_from(at)
-        .ok()
-        .zip(usize::try_from(at.saturating_add(len)).ok())
-        .and_then(|(start, end)| bytes.get(start..end.min(bytes.len())))
-    else {
+fn jpeg_pixels(bytes: crate::io::Source<'_>, at: u64, len: u64) -> u64 {
+    let end = at.saturating_add(len).min(bytes.len());
+    if at > end {
         return 0;
-    };
-    let mut i = 2;
-    while let Some(&[0xff, marker, hi, lo]) = jpeg.get(i..i + 4) {
-        let size = usize::from(u16::from_be_bytes([hi, lo]));
+    }
+    let mut i = at.saturating_add(2);
+    while i.checked_add(4).is_some_and(|e| e <= end) {
+        let Some([0xff, marker, hi, lo]) = bytes.array::<4>(i) else {
+            break;
+        };
+        let size = u64::from(u16::from_be_bytes([hi, lo]));
         match marker {
             0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
-                return jpeg.get(i + 5..i + 9).map_or(0, |d| {
+                if i.checked_add(9).is_none_or(|e| e > end) {
+                    return 0;
+                }
+                return bytes.array::<4>(i + 5).map_or(0, |d| {
                     u64::from(u16::from_be_bytes([d[0], d[1]]))
                         * u64::from(u16::from_be_bytes([d[2], d[3]]))
                 });
             }
             0xda | 0xd9 => return 0,
-            _ => i += 2 + size,
+            _ => match i.checked_add(2 + size) {
+                Some(next) => i = next,
+                None => return 0,
+            },
         }
     }
     0
