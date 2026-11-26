@@ -834,6 +834,47 @@ mod scenarios {
     }
 
     #[test]
+    fn a_scan_cancelled_before_matching_stops_without_bucketing_or_progress() -> Result<()> {
+        let f = fixture()?;
+        f.cat
+            .db_for_tests()
+            .execute_batch("DELETE FROM photo_checksums")?;
+        std::fs::write(f.root.join("Lisbon/new.dng"), bytes(81))?;
+        let inputs = f.cat.sync_inputs(SyncScope::All)?;
+
+        let cancel = AtomicBool::new(false);
+        let progress_calls = std::cell::Cell::new(0usize);
+        let stopped = scan(
+            &inputs,
+            &|_| {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+            Cancel::new(&cancel),
+            &|_| progress_calls.set(progress_calls.get() + 1),
+        );
+        assert!(stopped.is_err());
+        assert_eq!(progress_calls.get(), 0);
+
+        let states = [
+            (f.id("IMG_1001.dng"), super::super::FileState::Present),
+            (f.id("IMG_1002.dng"), super::super::FileState::Present),
+        ]
+        .into_iter()
+        .collect();
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            super::super::scan::unhashed_present_by_size(
+                &inputs,
+                &states,
+                Cancel::new(&cancelled),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn previous_import_is_the_last_add_or_synchronize() -> Result<()> {
         let mut f = fixture()?;
         assert_eq!(f.cat.previous_import()?.len(), 3);

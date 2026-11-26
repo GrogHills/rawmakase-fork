@@ -906,8 +906,6 @@ fn a_request_while_the_dying_worker_reports_its_failures_starts_a_new_worker() {
     assert!(matches!(states.last(), Some(State::Ready(_))), "{states:?}");
 }
 
-/// A result is filed under the file's identity, the model and its assembly version,
-/// the provider and the build, in the form the results already on disk have.
 #[test]
 fn stop_does_not_block_while_unload_drops_model() {
     let (started_tx, started_rx) = mpsc::channel();
@@ -930,19 +928,24 @@ fn stop_does_not_block_while_unload_drops_model() {
     started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("model drop started");
-    let stop_start = std::time::Instant::now();
-    let handle = f.service.stop();
-    assert!(
-        stop_start.elapsed() < Duration::from_millis(500),
-        "stop() blocked while model was dropping"
-    );
-    release_tx.send(()).unwrap();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let stop_service = f.service;
+    let stop_thread = std::thread::spawn(move || {
+        let handle = stop_service.stop();
+        let _ = stop_tx.send(());
+        handle
+    });
+    let stopped_in_time = stop_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    let _ = release_tx.send(());
     unloader.join().unwrap();
-    if let Some(handle) = handle {
+    if let Some(handle) = stop_thread.join().unwrap() {
         handle.join().unwrap();
     }
+    assert!(stopped_in_time, "stop() blocked while model was dropping");
 }
 
+/// A result is filed under the file's identity, the model and its assembly version,
+/// the provider and the build, in the form the results already on disk have.
 #[test]
 fn a_result_key_keeps_its_form() {
     let id = crate::storage::Identity {

@@ -54,6 +54,37 @@ pub(super) fn list(directory: &Path) -> Listing {
     Listing::Listed { files, directories }
 }
 
+/// Maps present photos whose stored checksum is missing or stale by file size
+/// so unknown files only hash candidate photos of matching size.
+pub(super) fn unhashed_present_by_size(
+    inputs: &SyncInputs,
+    states: &HashMap<PhotoId, FileState>,
+    cancel: Cancel<'_>,
+) -> Result<HashMap<u64, Vec<PhotoId>>> {
+    let mut by_size: HashMap<u64, Vec<PhotoId>> = HashMap::new();
+    for (id, state) in states {
+        if cancel.is_cancelled() {
+            bail!("Synchronization stopped");
+        }
+        if *state != FileState::Present {
+            continue;
+        }
+        let Some(path) = inputs.path_of(*id) else {
+            continue;
+        };
+        let Ok(now) = crate::storage::Stamp::read(&path) else {
+            continue;
+        };
+        let current = inputs.checksums.get(id).is_some_and(|c| {
+            now.size == c.identity.size && now.modified_ns == c.identity.modified_ns
+        });
+        if !current {
+            by_size.entry(now.size).or_default().push(*id);
+        }
+    }
+    Ok(by_size)
+}
+
 /// What one unknown file matched.
 enum Found {
     New,
@@ -275,29 +306,11 @@ pub fn scan(
     // Each unknown file matched with the checksums on record.
     // Present photos without a current checksum are mapped by file size and
     // hashed on demand only if an unknown file actually shares that size.
-    let mut unhashed_present_by_size: HashMap<u64, Vec<PhotoId>> = HashMap::new();
-    if !unknown.is_empty() {
-        for (id, state) in &states {
-            if *state != FileState::Present {
-                continue;
-            }
-            let Some(path) = inputs.path_of(*id) else {
-                continue;
-            };
-            let Ok(now) = crate::storage::Stamp::read(&path) else {
-                continue;
-            };
-            let current = inputs.checksums.get(id).is_some_and(|c| {
-                now.size == c.identity.size && now.modified_ns == c.identity.modified_ns
-            });
-            if !current {
-                unhashed_present_by_size
-                    .entry(now.size)
-                    .or_default()
-                    .push(*id);
-            }
-        }
-    }
+    let unhashed_present_by_size = if unknown.is_empty() {
+        HashMap::new()
+    } else {
+        unhashed_present_by_size(inputs, &states, cancel)?
+    };
     let mut matcher = Matching {
         inputs,
         online,

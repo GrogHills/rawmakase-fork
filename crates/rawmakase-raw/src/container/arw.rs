@@ -400,18 +400,28 @@ const PARALLEL_TILE_SAMPLES: usize = 4 << 20;
 fn ljpeg_tiles_within_budget<'a>(
     tiles: usize,
     strip: &(impl Fn(usize) -> Result<&'a [u8]> + Sync),
-) -> bool {
-    (0..tiles).all(|i| {
-        strip(i)
-            .ok()
-            .and_then(|tile| ljpeg::header(tile).ok())
-            .is_some_and(|h| {
-                let (mcus, rows) = h.mcus();
-                mcus.checked_mul(rows)
-                    .and_then(|n| n.checked_mul(h.samples_per_mcu()))
-                    .is_some_and(|n| n <= PARALLEL_TILE_SAMPLES)
-            })
-    })
+    cancel: Cancel<'_>,
+) -> Result<bool> {
+    for i in 0..tiles {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let Ok(tile) = strip(i) else {
+            return Ok(false);
+        };
+        let Ok(h) = ljpeg::header(tile) else {
+            return Ok(false);
+        };
+        let (mcus, rows) = h.mcus();
+        let within_budget = mcus
+            .checked_mul(rows)
+            .and_then(|n| n.checked_mul(h.samples_per_mcu()))
+            .is_some_and(|n| n <= PARALLEL_TILE_SAMPLES);
+        if !within_budget {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Small RAWs' lossless JPEG tiles of luma (sampled 2 × 1 or 2 × 2) and two
@@ -429,11 +439,14 @@ fn ycbcr_tiles<'a>(
     if plan.chunks.len() < tiles {
         return Err(corrupt("ARW tile count"));
     }
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     let can_parallel = tw
         .checked_mul(th)
         .and_then(|n| n.checked_mul(4))
         .is_some_and(|n| n <= PARALLEL_TILE_SAMPLES)
-        && ljpeg_tiles_within_budget(tiles, strip);
+        && ljpeg_tiles_within_budget(tiles, strip, cancel)?;
     let decode_band = |samples: &mut Vec<u16>, (row, band): (usize, &mut [u16])| -> Result<()> {
         let band_rows = band.len() / (width * 4);
         for col in 0..across {
@@ -497,10 +510,13 @@ fn ljpeg_tiles<'a>(
     if plan.chunks.len() < tiles {
         return Err(corrupt("ARW tile count"));
     }
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     let can_parallel = tw
         .checked_mul(th)
         .is_some_and(|n| n <= PARALLEL_TILE_SAMPLES)
-        && ljpeg_tiles_within_budget(tiles, strip);
+        && ljpeg_tiles_within_budget(tiles, strip, cancel)?;
     let decode_band = |samples: &mut Vec<u16>, (row, band): (usize, &mut [u16])| -> Result<()> {
         let band_rows = band.len() / width;
         for col in 0..across {
@@ -1006,5 +1022,37 @@ pub(crate) mod tests {
             }
             let _ = decode(&noisy);
         }
+    }
+
+    #[test]
+    fn ljpeg_tiles_budget_prepass_stops_on_cancellation() {
+        let planes: Vec<Vec<u16>> = (0..4).map(|_| vec![1000; 4]).collect();
+        let (tile, _) =
+            crate::codec::ljpeg::tests::encode_sampled(&planes, &[(1, 1); 4], 2, 2, false);
+
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let strip = |_: usize| -> crate::error::Result<&[u8]> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(&tile)
+        };
+        assert!(matches!(
+            super::ljpeg_tiles_within_budget(4, &strip, Cancel::new(&cancelled)),
+            Err(crate::error::Error::Cancelled)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
+        calls.store(0, std::sync::atomic::Ordering::Relaxed);
+        let cancel_on_first = |_: usize| -> crate::error::Result<&[u8]> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(&tile)
+        };
+        assert!(matches!(
+            super::ljpeg_tiles_within_budget(4, &cancel_on_first, Cancel::new(&cancelled)),
+            Err(crate::error::Error::Cancelled)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

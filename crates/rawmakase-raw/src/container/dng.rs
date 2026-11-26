@@ -719,7 +719,7 @@ pub(crate) fn decode(
             }
             Ok(())
         };
-        if tiles_can_parallel(plan, &file) {
+        if tiles_can_parallel(plan, &file, cancel)? {
             data.par_chunks_mut(th * image_row)
                 .enumerate()
                 .try_for_each_init(Vec::new, |decoded, band| decode_band(decoded, band))?;
@@ -960,14 +960,17 @@ const JPEG_XL: u32 = 52546;
 /// take `codec::jxl`'s allowance for its tile, or bound per-thread tile buffers.
 const PARALLEL_TILE_SAMPLES: usize = 4 << 20;
 
-fn tiles_can_parallel(plan: &DngPlan, file: &Bytes) -> bool {
+fn tiles_can_parallel(plan: &DngPlan, file: &Bytes, cancel: Cancel<'_>) -> Result<bool> {
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     let (width, height) = (plan.width as usize, plan.height as usize);
     let spp = plan.samples as usize;
     let [tw, th] = [plan.tile[0] as usize, plan.tile[1] as usize];
     let across = width.div_ceil(tw);
     let down = height.div_ceil(th);
     let Some(tile_count) = across.checked_mul(down) else {
-        return false;
+        return Ok(false);
     };
     if plan.tiles.len() < tile_count
         || tw
@@ -975,18 +978,21 @@ fn tiles_can_parallel(plan: &DngPlan, file: &Bytes) -> bool {
             .and_then(|n| n.checked_mul(spp))
             .is_none_or(|n| n > PARALLEL_TILE_SAMPLES)
     {
-        return false;
+        return Ok(false);
     }
     if plan.compression == 7 {
         for &(offset, len) in &plan.tiles[..tile_count] {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             let Ok(tile) = file.slice(offset, len) else {
-                return false;
+                return Ok(false);
             };
             if dct::is_dct(tile) {
-                return false;
+                return Ok(false);
             }
             let Ok(h) = ljpeg::header(tile) else {
-                return false;
+                return Ok(false);
             };
             let (mcus_across, mcus_down) = h.mcus();
             let within_budget = mcus_across
@@ -994,11 +1000,11 @@ fn tiles_can_parallel(plan: &DngPlan, file: &Bytes) -> bool {
                 .and_then(|n| n.checked_mul(h.samples_per_mcu()))
                 .is_some_and(|n| n <= PARALLEL_TILE_SAMPLES);
             if !within_budget {
-                return false;
+                return Ok(false);
             }
         }
     }
-    true
+    Ok(true)
 }
 
 /// Decodes JPEG XL tiles into `data`, the stored image: each row of tiles
@@ -2036,6 +2042,12 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let file = crate::io::Bytes::new(&ljpeg_huge, crate::io::Order::Little);
-        assert!(!super::tiles_can_parallel(&plan, &file));
+        assert!(!super::tiles_can_parallel(&plan, &file, Cancel::NEVER).unwrap());
+
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            super::tiles_can_parallel(&plan, &file, Cancel::new(&cancelled)),
+            Err(crate::Error::Cancelled)
+        ));
     }
 }

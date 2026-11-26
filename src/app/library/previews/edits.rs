@@ -384,8 +384,11 @@ pub(super) fn spawn_edited_with_ai(
     render: RenderEdited,
     render_ai: RenderWithAi,
 ) -> Worker<EditQueue, EditResult> {
-    spawn_edited_inner(cache_path, wanted, ctx, render, render_ai, None)
+    spawn_edited_inner(cache_path, wanted, ctx, render, render_ai, None, true)
 }
+/// Runs the edited-preview worker with a fixed `full_renders` cap and without
+/// Rayon worker pools so tests that block renders on a gate cannot deadlock via
+/// Rayon work-stealing during nested `AiCache::load` parallel reads.
 #[cfg(test)]
 pub(super) fn spawn_edited_with_ai_slots(
     cache_path: PathBuf,
@@ -402,6 +405,7 @@ pub(super) fn spawn_edited_with_ai_slots(
         render,
         render_ai,
         Some(full_renders),
+        false,
     )
 }
 fn spawn_edited_inner(
@@ -411,6 +415,7 @@ fn spawn_edited_inner(
     render: RenderEdited,
     render_ai: RenderWithAi,
     full_renders_override: Option<usize>,
+    use_pools: bool,
 ) -> Worker<EditQueue, EditResult> {
     let shared = Arc::<Shared>::default();
     let (tx, result_rx) = mpsc::channel();
@@ -424,8 +429,12 @@ fn spawn_edited_inner(
         let full_renders = full_renders_override
             .unwrap_or_else(|| full_renders(crate::platform::memory::total(), full_threads));
         let renders = Renders {
-            background: crate::raw::background_pool(2, "edited-preview").ok(),
-            full: crate::raw::background_pool(full_threads, "edited-preview-full").ok(),
+            background: use_pools
+                .then(|| crate::raw::background_pool(2, "edited-preview").ok())
+                .flatten(),
+            full: use_pools
+                .then(|| crate::raw::background_pool(full_threads, "edited-preview-full").ok())
+                .flatten(),
             cache: Arc::new(Mutex::new(PreviewCache::open(&cache_path).ok())),
             cache_path,
             wanted,
@@ -596,13 +605,7 @@ impl Renders {
             if state.closed {
                 return;
             }
-            let check_cache = matches!(
-                &state.jobs[index].job,
-                EditJob::Render { id, ahead: true, .. }
-                    if !state.jobs[index].dropped
-                        && state.pace != Pace::Background
-                        && !shown(&self.wanted, *id)
-            );
+            let check_cache = matches!(&state.jobs[index].job, EditJob::Render { ahead: true, .. });
             let unclassified = match &state.jobs[index].job {
                 EditJob::Render { source, .. } if state.jobs[index].renders_ai.is_none() => {
                     Some(source.clone())
