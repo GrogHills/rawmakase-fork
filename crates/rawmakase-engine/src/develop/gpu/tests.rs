@@ -754,7 +754,7 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
             .map(|(a, b)| (a - b).abs())
             .collect();
         let mean = d.iter().sum::<f32>() / d.len() as f32;
-        let mut sorted = d.clone();
+        let mut sorted = d;
         sorted.sort_by(f32::total_cmp);
         let (p999, max) = (sorted[sorted.len() * 999 / 1000], sorted[sorted.len() - 1]);
         eprintln!("recipe {i}: max {max:.6}, 99.9% {p999:.6}, mean {mean:.8}");
