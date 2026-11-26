@@ -3,7 +3,8 @@
 //! names, and matches them with the checksums on record. It reads files and
 //! the inputs captured from the catalog, and writes nothing.
 use super::{
-    Addition, Choice, FileState, Missing, Move, NotChecked, SyncInputs, SyncPlan, Target, state_of,
+    Addition, Choice, DirCheckCache, FileState, Missing, Move, NotChecked, SyncInputs, SyncPlan,
+    Target, state_of_cached,
 };
 use crate::catalog::ingest::{Matched, Place};
 use crate::catalog::{FolderId, PhotoId, RootId};
@@ -109,6 +110,7 @@ pub fn scan(
     // Unicode form a case-insensitive volume equates): by directory and
     // folded name.
     let mut aliases: HashSet<(PathBuf, String)> = HashSet::new();
+    let mut dir_cache = DirCheckCache::default();
     let in_scope: HashSet<FolderId> = inputs.scope.iter().copied().collect();
     for master in inputs.masters.values() {
         if !in_scope.contains(&master.folder) {
@@ -137,10 +139,11 @@ pub fn scan(
                     FileState::Unavailable
                 }
             }
-            Some(Listing::Absent) | Some(Listing::Failed(_)) => state_of(
+            Some(Listing::Absent) | Some(Listing::Failed(_)) => state_of_cached(
                 inputs.path_of(master.id).as_deref(),
                 folder.anchor.as_deref(),
                 online,
+                &mut dir_cache,
             ),
         };
         states.insert(master.id, state);
@@ -152,7 +155,7 @@ pub fn scan(
         let (Some(path), Some(anchor)) = (&folder.path, &folder.anchor) else {
             continue;
         };
-        let reachable = super::list_all(anchor).is_ok() && online(anchor);
+        let reachable = dir_cache.list_all(anchor).is_ok() && online(anchor);
         let reason = match listings.get(path) {
             Some(Listing::Absent) if !reachable => "not found; its location is offline",
             Some(Listing::Listed { .. }) if !online(anchor) => "its volume is offline",
@@ -271,33 +274,48 @@ pub fn scan(
     unknown.sort();
     // Each unknown file matched with the checksums on record.
     // Present photos without a current checksum are read now, so a copy
-    // of one is known as a copy.
-    let mut checksums = inputs.checksums.clone();
-    let mut by_quick = inputs.by_quick.clone();
-    for (id, state) in &states {
-        if *state != FileState::Present {
-            continue;
-        }
-        let Some(path) = inputs.path_of(*id) else {
-            continue;
-        };
-        let current = checksums.get(id).is_some_and(|c| {
-            crate::storage::Stamp::read(&path).is_ok_and(|now| {
-                now.size == c.identity.size && now.modified_ns == c.identity.modified_ns
-            })
-        });
-        if current {
-            continue;
-        }
-        if cancelled() {
-            bail!("Synchronization stopped");
-        }
-        if let Ok(ChecksumRead::Done(quick)) = FileChecksum::read_quick(&path, |_| !cancelled()) {
-            by_quick
-                .entry((quick.size, quick.quick.clone()))
-                .or_default()
-                .push(*id);
-            checksums.insert(*id, quick);
+    // of one is known as a copy. Only files whose size matches an unknown
+    // file can ever match it.
+    let mut extra_checksums: HashMap<PhotoId, FileChecksum> = HashMap::new();
+    let mut extra_by_quick: HashMap<(u64, String), Vec<PhotoId>> = HashMap::new();
+    if !unknown.is_empty() {
+        let unknown_sizes: HashSet<u64> = unknown
+            .iter()
+            .filter_map(|(path, _)| crate::storage::Stamp::read(path).ok().map(|s| s.size))
+            .collect();
+        if !unknown_sizes.is_empty() {
+            for (id, state) in &states {
+                if *state != FileState::Present {
+                    continue;
+                }
+                let Some(path) = inputs.path_of(*id) else {
+                    continue;
+                };
+                let Ok(now) = crate::storage::Stamp::read(&path) else {
+                    continue;
+                };
+                if !unknown_sizes.contains(&now.size) {
+                    continue;
+                }
+                let current = inputs.checksums.get(id).is_some_and(|c| {
+                    now.size == c.identity.size && now.modified_ns == c.identity.modified_ns
+                });
+                if current {
+                    continue;
+                }
+                if cancelled() {
+                    bail!("Synchronization stopped");
+                }
+                if let Ok(ChecksumRead::Done(quick)) =
+                    FileChecksum::read_quick(&path, |_| !cancelled())
+                {
+                    extra_by_quick
+                        .entry((quick.size, quick.quick.clone()))
+                        .or_default()
+                        .push(*id);
+                    extra_checksums.insert(*id, quick);
+                }
+            }
         }
     }
     let mut matcher = Matching {
@@ -305,8 +323,9 @@ pub fn scan(
         online,
         cancel,
         states,
-        checksums,
-        by_quick,
+        dir_cache,
+        extra_checksums,
+        extra_by_quick,
     };
     let mut found: Vec<(PathBuf, (RootId, String), Identity, Found)> = Vec::new();
     for (n, (file, place)) in unknown.into_iter().enumerate() {
@@ -478,9 +497,10 @@ struct Matching<'a> {
     online: &'a dyn Fn(&Path) -> bool,
     cancel: Cancel<'a>,
     states: HashMap<PhotoId, FileState>,
-    /// The checksums on record, with those of present photos read now.
-    checksums: HashMap<PhotoId, FileChecksum>,
-    by_quick: HashMap<(u64, String), Vec<PhotoId>>,
+    dir_cache: DirCheckCache,
+    /// Checksums of present photos read during this scan.
+    extra_checksums: HashMap<PhotoId, FileChecksum>,
+    extra_by_quick: HashMap<(u64, String), Vec<PhotoId>>,
 }
 
 impl Matching<'_> {
@@ -496,10 +516,11 @@ impl Matching<'_> {
             .get(&id)
             .and_then(|m| self.inputs.folders.get(&m.folder))
             .and_then(|f| f.anchor.clone());
-        let state = state_of(
+        let state = state_of_cached(
             self.inputs.path_of(id).as_deref(),
             anchor.as_deref(),
             self.online,
+            &mut self.dir_cache,
         );
         self.states.insert(id, state.clone());
         state
@@ -524,8 +545,12 @@ impl Matching<'_> {
             ChecksumRead::Cancelled => bail!("Synchronization stopped"),
         };
         let identity = quick.identity.clone();
+        let quick_key = (quick.size, quick.quick.clone());
         let mut hits: BTreeSet<PhotoId> = BTreeSet::new();
-        if let Some(ids) = self.by_quick.get(&(quick.size, quick.quick.clone())) {
+        if let Some(ids) = self.inputs.by_quick.get(&quick_key) {
+            hits.extend(ids);
+        }
+        if let Some(ids) = self.extra_by_quick.get(&quick_key) {
             hits.extend(ids);
         }
         if let Some(ids) = self
@@ -539,7 +564,11 @@ impl Matching<'_> {
         let mut missing: Vec<(PhotoId, bool)> = Vec::new();
         let mut present: Vec<PhotoId> = Vec::new();
         for id in hits {
-            let stored = self.checksums.get(&id).cloned();
+            let stored = self
+                .extra_checksums
+                .get(&id)
+                .or_else(|| self.inputs.checksums.get(&id))
+                .cloned();
             let stored = stored.as_ref();
             // A quick hash on record that differs rules it out.
             if stored.is_some_and(|c| c.size != quick.size || c.quick != quick.quick) {

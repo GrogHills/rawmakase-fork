@@ -21,6 +21,7 @@ use rawmakase_decode::ai::cache::{AiCache, AiEntry};
 use rawmakase_decode::ai::denoise::{AiBase, ModelOutput, PackedBayer, Unsupported, assemble};
 use rawmakase_inference::denoise::{GainReference, Grid, Output, TileModel, fit_gain, run};
 use rawmakase_inference::{InferenceError, Provider, RAWNIND};
+use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -546,11 +547,23 @@ impl Service {
                         queue.working = true;
                         break job;
                     }
-                    queue = self
-                        .shared
-                        .changed
-                        .wait(queue)
-                        .unwrap_or_else(|e| e.into_inner());
+                    if models.is_empty() {
+                        queue = self
+                            .shared
+                            .changed
+                            .wait(queue)
+                            .unwrap_or_else(|e| e.into_inner());
+                    } else {
+                        let (guard, timeout) = self
+                            .shared
+                            .changed
+                            .wait_timeout(queue, Duration::from_secs(60))
+                            .unwrap_or_else(|e| e.into_inner());
+                        queue = guard;
+                        if timeout.timed_out() && queue.pending.is_empty() {
+                            models.clear();
+                        }
+                    }
                 }
             };
             let cancel = self
@@ -615,8 +628,12 @@ impl Service {
             .clone()
             .ok_or_else(|| anyhow!("The AI Denoise model is not installed."))?;
         self.tell(job, |_| Some(State::Running(0.)));
-        let packed = (self.shared.source)(&job.path, cancel)?;
-        let layout = packed.layout;
+        let PackedBayer {
+            layout,
+            planes: packed_planes,
+            reference: packed_reference,
+            clipped,
+        } = (self.shared.source)(&job.path, cancel)?;
         let model = match models.entry((model_dir.clone(), job.provider)) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -643,13 +660,13 @@ impl Service {
         let reference = GainReference {
             width: layout.packed_width,
             height: layout.packed_height,
-            rgb: &packed.reference,
-            clipped: &packed.clipped,
+            rgb: &packed_reference,
+            clipped: &clipped,
         };
         let planes = rawmakase_inference::denoise::Planes {
             width: layout.packed_width,
             height: layout.packed_height,
-            data: &packed.planes,
+            data: &packed_planes,
         };
         let mut last = 0usize;
         run(
@@ -667,7 +684,7 @@ impl Service {
                             .flat_map(|y| (0..layout.packed_width).map(move |x| (x, y)))
                             .map(|(x, y)| out.is_done(x, y))
                             .collect();
-                        let mut rgb: Vec<f32> = out.data.iter().map(|v| v * gain).collect();
+                        let mut rgb: Vec<f32> = out.data.par_iter().map(|v| v * gain).collect();
                         rawmakase_inference::denoise::correct_dark(&mut rgb, &reference);
                         self.tell(job, |plain| {
                             let image = assemble(
@@ -675,7 +692,7 @@ impl Service {
                                     layout,
                                     rgb: &rgb,
                                     done: Some(&done_mask),
-                                    clipped: &packed.clipped,
+                                    clipped: &clipped,
                                 },
                                 plain,
                                 cancel,
@@ -698,12 +715,12 @@ impl Service {
             }
             e => anyhow!("AI Denoise failed: {e}"),
         })?;
+        drop(packed_planes);
         let gain = fit_gain(&out, &reference).map_err(|why| anyhow!("AI Denoise failed: {why}"))?;
         let mut rgb = out.data;
-        for v in &mut rgb {
-            *v *= gain;
-        }
+        rgb.par_iter_mut().for_each(|v| *v *= gain);
         rawmakase_inference::denoise::correct_dark(&mut rgb, &reference);
+        drop(packed_reference);
         // Rejected when the file or the model changed during the run.
         let now = crate::storage::Identity::read(&job.path).ok();
         if now.as_ref() != Some(&job.identity) {
@@ -724,7 +741,7 @@ impl Service {
             layout,
             gain,
             rgb,
-            clipped: packed.clipped,
+            clipped,
         };
         // A result that cannot be stored at half precision is not one.
         match self.shared.cache.store(&job.key, &entry) {

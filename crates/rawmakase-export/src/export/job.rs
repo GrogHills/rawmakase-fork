@@ -73,12 +73,14 @@ pub fn run(
         format.supports(settings.output_space()?)?;
     }
     let prepared = prepare(&photo, settings, cancel, &progress)?;
+    // Drop the full-resolution decoded input image and services before encoding.
+    let Photo { source, .. } = photo;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
     super::export_pixels(
         target,
-        &photo.source,
+        &source,
         &prepared.rendered,
         &prepared.metadata,
         &prepared.options,

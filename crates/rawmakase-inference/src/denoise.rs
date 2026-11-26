@@ -167,12 +167,13 @@ fn mirror(i: isize, n: usize) -> usize {
     (if i >= n as isize { period - i } else { i }) as usize
 }
 
-/// The model's input for `tile`: the tile's core with `overlap` pixels of context, real
-/// where the photo has them and mirrored past its edges.
-pub fn tile_input(planes: Planes<'_>, grid: &Grid, tile: Tile) -> Vec<f32> {
+/// Fills `input` (`4 * grid.tile * grid.tile`) with the model's input for `tile`: the
+/// tile's core with `overlap` pixels of context, real where the photo has them and
+/// mirrored past its edges.
+fn tile_input_into(planes: Planes<'_>, grid: &Grid, tile: Tile, input: &mut [f32]) {
     let side = grid.tile;
+    assert_eq!(input.len(), 4 * side * side);
     let plane = planes.width * planes.height;
-    let mut input = vec![0.; 4 * side * side];
     let x0 = tile.left as isize - grid.overlap as isize;
     let y0 = tile.top as isize - grid.overlap as isize;
     let columns: Vec<usize> = (0..side)
@@ -189,6 +190,14 @@ pub fn tile_input(planes: Planes<'_>, grid: &Grid, tile: Tile) -> Vec<f32> {
             }
         }
     }
+}
+
+/// The model's input for `tile`: the tile's core with `overlap` pixels of context, real
+/// where the photo has them and mirrored past its edges.
+pub fn tile_input(planes: Planes<'_>, grid: &Grid, tile: Tile) -> Vec<f32> {
+    let side = grid.tile;
+    let mut input = vec![0.; 4 * side * side];
+    tile_input_into(planes, grid, tile, &mut input);
     input
 }
 
@@ -217,12 +226,13 @@ pub fn run(
     }
     let side = grid.tile;
     let (w, h) = (out.width, out.height);
+    let mut tile_buf = vec![0f32; 4 * side * side];
     for (index, &tile) in tiles.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(InferenceError::Cancelled);
         }
-        let input = tile_input(planes, grid, tile);
-        let result = model.run(&input, cancel)?;
+        tile_input_into(planes, grid, tile, &mut tile_buf);
+        let result = model.run(&tile_buf, cancel)?;
         let o = 2 * side;
         if result.len() != 3 * o * o {
             return Err(InferenceError::OutputInvalid(format!(
@@ -375,26 +385,39 @@ pub fn correct_dark(rgb: &mut [f32], reference: &GainReference<'_>) {
             let (x0, y0) = (bx * DARK_BLOCK, by * DARK_BLOCK);
             let (x1, y1) = ((x0 + DARK_BLOCK).min(pw), (y0 + DARK_BLOCK).min(ph));
             let mut r = [0f64; 3];
-            let mut o = [0f64; 3];
             for y in y0..y1 {
                 for x in x0..x1 {
                     let reference = reference.rgb[y * pw + x];
                     for c in 0..3 {
                         r[c] += f64::from(reference[c]);
-                        for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                            o[c] += f64::from(rgb[c * plane + (2 * y + dy) * w + 2 * x + dx]) / 4.;
-                        }
                     }
                 }
             }
             let n = ((x1 - x0) * (y1 - y0)) as f64;
             let r = r.map(|v| (v / n).max(0.) as f32);
-            let o = o.map(|v| (v / n) as f32);
             let level = r.iter().copied().fold(f32::INFINITY, f32::min);
             let weight = ((DARK_NONE - level) / (DARK_NONE - DARK_FULL)).clamp(0., 1.);
             if weight == 0. {
                 continue;
             }
+            let mut o = [0f64; 3];
+            for c in 0..3 {
+                let plane_rgb = &rgb[c * plane..(c + 1) * plane];
+                let mut sum = 0f64;
+                for y in y0..y1 {
+                    let row0 = &plane_rgb[2 * y * w..(2 * y + 1) * w];
+                    let row1 = &plane_rgb[(2 * y + 1) * w..(2 * y + 2) * w];
+                    for x in x0..x1 {
+                        let px = 2 * x;
+                        sum += f64::from(row0[px]) / 4.
+                            + f64::from(row0[px + 1]) / 4.
+                            + f64::from(row1[px]) / 4.
+                            + f64::from(row1[px + 1]) / 4.;
+                    }
+                }
+                o[c] = sum;
+            }
+            let o = o.map(|v| (v / n) as f32);
             scale[by * bw + bx] = std::array::from_fn(|c| {
                 let s = if o[c] > 0. { (r[c] / o[c]).min(1.) } else { 1. };
                 1. + weight * (s - 1.)
@@ -404,31 +427,34 @@ pub fn correct_dark(rgb: &mut [f32], reference: &GainReference<'_>) {
     if scale.iter().all(|s| *s == [1.; 3]) {
         return;
     }
-    // Interpolated between block centres, in sensor pixels.
+    // Interpolated between block centres, in sensor pixels, one plane at a time.
     let side = (2 * DARK_BLOCK) as f32;
-    let at = |bx: isize, by: isize| {
-        scale[(by.clamp(0, bh as isize - 1) as usize) * bw + bx.clamp(0, bw as isize - 1) as usize]
-    };
-    for y in 0..h {
-        let fy = (y as f32 + 0.5) / side - 0.5;
-        let by = fy.floor();
-        let ty = fy - by;
-        for x in 0..w {
-            let fx = (x as f32 + 0.5) / side - 0.5;
-            let bx = fx.floor();
-            let tx = fx - bx;
-            let (bx, by) = (bx as isize, by as isize);
-            let (a, b, c, d) = (
-                at(bx, by),
-                at(bx + 1, by),
-                at(bx, by + 1),
-                at(bx + 1, by + 1),
-            );
-            for k in 0..3 {
-                let s = (a[k] * (1. - tx) + b[k] * tx) * (1. - ty)
-                    + (c[k] * (1. - tx) + d[k] * tx) * ty;
+    let max_bx = bw as isize - 1;
+    let max_by = bh as isize - 1;
+    for k in 0..3 {
+        let plane_rgb = &mut rgb[k * plane..(k + 1) * plane];
+        for y in 0..h {
+            let fy = (y as f32 + 0.5) / side - 0.5;
+            let by_f = fy.floor();
+            let ty = fy - by_f;
+            let by_i = by_f as isize;
+            let by0 = by_i.clamp(0, max_by) as usize;
+            let by1 = (by_i + 1).clamp(0, max_by) as usize;
+            let row = &mut plane_rgb[y * w..(y + 1) * w];
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let fx = (x as f32 + 0.5) / side - 0.5;
+                let bx_f = fx.floor();
+                let tx = fx - bx_f;
+                let bx_i = bx_f as isize;
+                let bx0 = bx_i.clamp(0, max_bx) as usize;
+                let bx1 = (bx_i + 1).clamp(0, max_bx) as usize;
+                let a = scale[by0 * bw + bx0][k];
+                let b = scale[by0 * bw + bx1][k];
+                let c = scale[by1 * bw + bx0][k];
+                let d = scale[by1 * bw + bx1][k];
+                let s = (a * (1. - tx) + b * tx) * (1. - ty) + (c * (1. - tx) + d * tx) * ty;
                 if s != 1. {
-                    rgb[k * plane + y * w + x] *= s;
+                    *pixel *= s;
                 }
             }
         }

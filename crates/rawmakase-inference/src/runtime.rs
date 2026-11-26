@@ -11,8 +11,7 @@ use rawmakase_cancel::Cancel;
 use std::env;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use ort::environment::Environment;
@@ -758,19 +757,28 @@ fn guarded<T>(
     work: impl FnOnce(&RunOptions) -> Result<T, InferenceError>,
 ) -> Result<T, InferenceError> {
     let options = RunOptions::new().map_err(failed)?;
-    let done = AtomicBool::new(false);
+    let state = (Mutex::new(false), Condvar::new());
     let result = std::thread::scope(|scope| {
         scope.spawn(|| {
-            while !done.load(Ordering::Acquire) {
+            let (lock, cvar) = &state;
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while !*done {
                 if cancel.is_cancelled() {
                     let _ = options.terminate();
                     return;
                 }
-                std::thread::sleep(CANCEL_POLL);
+                done = cvar
+                    .wait_timeout(done, CANCEL_POLL)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
             }
         });
         let result = catch_unwind(AssertUnwindSafe(|| work(&options)));
-        done.store(true, Ordering::Release);
+        {
+            let (lock, cvar) = &state;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cvar.notify_all();
+        }
         result
     });
     if cancel.is_cancelled() {

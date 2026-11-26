@@ -172,7 +172,9 @@ impl PreviewCache {
                 "Unsupported preview cache format"
             );
         }
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-32000; PRAGMA temp_store=MEMORY;",
+        )?;
         db.execute_batch(SIZED_SCHEMA)?;
         let mut cache = Self {
             db,
@@ -193,18 +195,17 @@ impl PreviewCache {
         let key = tagged(path, tag);
         let row = self
             .db
-            .query_row(
+            .prepare_cached(
                 "SELECT source_size,modified_ns,generation,jpeg FROM previews WHERE source_path=?",
-                [&key],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, Vec<u8>>(3)?,
-                    ))
-                },
-            )
+            )?
+            .query_row([&key], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })
             .optional()?;
         let Some((size, modified, generation, jpeg)) = row else {
             return Ok(None);
@@ -216,7 +217,8 @@ impl PreviewCache {
         let forget = || {
             let _ = self
                 .db
-                .execute("DELETE FROM previews WHERE source_path=?", [&key]);
+                .prepare_cached("DELETE FROM previews WHERE source_path=?")
+                .and_then(|mut s| s.execute([&key]));
         };
         if generation != self::generation(path) || stale {
             forget();
@@ -229,10 +231,10 @@ impl PreviewCache {
                 return Ok(None);
             }
         };
-        let _ = self.db.execute(
-            "UPDATE previews SET last_used=? WHERE source_path=?",
-            params![now(), &key],
-        );
+        let _ = self
+            .db
+            .prepare_cached("UPDATE previews SET last_used=? WHERE source_path=?")
+            .and_then(|mut s| s.execute(params![now(), &key]));
         Ok(Some(image))
     }
     pub fn store(&mut self, path: &Path, stamp: &Stamp, image: &image::RgbImage) -> Result<()> {
@@ -261,7 +263,9 @@ impl PreviewCache {
             image::ExtendedColorType::Rgb8,
         )?;
         // prefix_hash, which needed the file's first 64 KB, is no longer checked.
-        self.db.execute("INSERT INTO previews VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path) DO UPDATE SET source_size=excluded.source_size,modified_ns=excluded.modified_ns,prefix_hash=excluded.prefix_hash,generation=excluded.generation,width=excluded.width,height=excluded.height,jpeg=excluded.jpeg,last_used=excluded.last_used",params![tagged(path, tag),stamp.size as i64,stamp.modified_ns.to_string(),"",generation(path),image.width(),image.height(),jpeg,now()])?;
+        self.db
+            .prepare_cached("INSERT INTO previews VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path) DO UPDATE SET source_size=excluded.source_size,modified_ns=excluded.modified_ns,prefix_hash=excluded.prefix_hash,generation=excluded.generation,width=excluded.width,height=excluded.height,jpeg=excluded.jpeg,last_used=excluded.last_used")?
+            .execute(params![tagged(path, tag),stamp.size as i64,stamp.modified_ns.to_string(),"",generation(path),image.width(),image.height(),jpeg,now()])?;
         self.writes += 1;
         if self.writes.is_multiple_of(32) {
             self.prune(LIMIT)?;
@@ -280,30 +284,31 @@ impl PreviewCache {
         let source = key(path);
         let row = self
             .db
-            .query_row(
+            .prepare_cached(
                 "SELECT source_size,modified_ns,generation,width,height,jpeg FROM sized_previews WHERE source_path=? AND identity=? AND kind=?",
-                params![&source, identity, kind.code()],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, u32>(3)?,
-                        r.get::<_, u32>(4)?,
-                        r.get::<_, Vec<u8>>(5)?,
-                    ))
-                },
-            )
+            )?
+            .query_row(params![&source, identity, kind.code()], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, u32>(3)?,
+                    r.get::<_, u32>(4)?,
+                    r.get::<_, Vec<u8>>(5)?,
+                ))
+            })
             .optional()?;
         let Some((size, modified, generation, width, height, jpeg)) = row else {
             return Ok(None);
         };
         // Best effort, as for thumbnails: a failed delete still misses.
         let forget = || {
-            let _ = self.db.execute(
-                "DELETE FROM sized_previews WHERE source_path=? AND identity=? AND kind=?",
-                params![&source, identity, kind.code()],
-            );
+            let _ = self
+                .db
+                .prepare_cached(
+                    "DELETE FROM sized_previews WHERE source_path=? AND identity=? AND kind=?",
+                )
+                .and_then(|mut s| s.execute(params![&source, identity, kind.code()]));
         };
         if generation != SIZED_GENERATION || stale(path, size, &modified) {
             forget();
@@ -316,10 +321,12 @@ impl PreviewCache {
                 return Ok(None);
             }
         };
-        let _ = self.db.execute(
-            "UPDATE sized_previews SET last_used=? WHERE source_path=? AND identity=? AND kind=?",
-            params![now(), &source, identity, kind.code()],
-        );
+        let _ = self
+            .db
+            .prepare_cached(
+                "UPDATE sized_previews SET last_used=? WHERE source_path=? AND identity=? AND kind=?",
+            )
+            .and_then(|mut s| s.execute(params![now(), &source, identity, kind.code()]));
         Ok(Some(image))
     }
     /// Whether a usable preview exists without reading its pixels: the file is
@@ -335,18 +342,17 @@ impl PreviewCache {
     ) -> Result<bool> {
         let row = self
             .db
-            .query_row(
+            .prepare_cached(
                 "SELECT source_size,modified_ns,generation,requested_edge FROM sized_previews WHERE source_path=? AND identity=? AND kind=?",
-                params![key(path), identity, kind.code()],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, u32>(3)?,
-                    ))
-                },
-            )
+            )?
+            .query_row(params![key(path), identity, kind.code()], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, u32>(3)?,
+                ))
+            })
             .optional()?;
         Ok(row.is_some_and(|(size, modified, generation, edge)| {
             generation == SIZED_GENERATION
@@ -380,9 +386,9 @@ impl PreviewCache {
             image.height(),
             image::ExtendedColorType::Rgb8,
         )?;
-        self.db.execute(
-            "INSERT OR REPLACE INTO sized_previews VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            params![
+        self.db
+            .prepare_cached("INSERT OR REPLACE INTO sized_previews VALUES(?,?,?,?,?,?,?,?,?,?,?)")?
+            .execute(params![
                 key(path),
                 identity,
                 kind.code(),
@@ -394,8 +400,7 @@ impl PreviewCache {
                 image.height(),
                 jpeg,
                 now()
-            ],
-        )?;
+            ])?;
         self.sized_writes += 1;
         if self.sized_writes.is_multiple_of(8) {
             for kind in PreviewKind::ALL {
@@ -550,30 +555,65 @@ impl PreviewCache {
     }
     /// Evicts the least recently used rows of `kind` alone.
     fn prune_sized(&mut self, kind: PreviewKind, budget: i64) -> Result<()> {
-        while self.sized_bytes(kind)? > budget {
-            self.db.execute(
-                "DELETE FROM sized_previews WHERE rowid IN (SELECT rowid FROM sized_previews WHERE kind=?1 ORDER BY last_used,source_path LIMIT 8)",
-                [kind.code()],
+        let rows: Vec<(i64, i64)> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT rowid, length(jpeg) FROM sized_previews WHERE kind=?1 ORDER BY last_used ASC, source_path ASC",
             )?;
+            stmt.query_map([kind.code()], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let to_delete = evict_prefix(rows, budget);
+        if !to_delete.is_empty() {
+            let tx = self.db.transaction()?;
+            {
+                let mut del = tx.prepare_cached("DELETE FROM sized_previews WHERE rowid=?")?;
+                for rowid in to_delete {
+                    del.execute([rowid])?;
+                }
+            }
+            tx.commit()?;
+            self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
         }
-        self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
         Ok(())
     }
     fn prune(&mut self, budget: i64) -> Result<()> {
-        loop {
-            let bytes: i64 = self.db.query_row(
-                "SELECT COALESCE(sum(length(jpeg)),0) FROM previews",
-                [],
-                |r| r.get(0),
+        let rows: Vec<(i64, i64)> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT rowid, length(jpeg) FROM previews ORDER BY last_used ASC, source_path ASC",
             )?;
-            if bytes <= budget {
-                break;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let to_delete = evict_prefix(rows, budget);
+        if !to_delete.is_empty() {
+            let tx = self.db.transaction()?;
+            {
+                let mut del = tx.prepare_cached("DELETE FROM previews WHERE rowid=?")?;
+                for rowid in to_delete {
+                    del.execute([rowid])?;
+                }
             }
-            self.db.execute("DELETE FROM previews WHERE source_path IN (SELECT source_path FROM previews ORDER BY last_used,source_path LIMIT 32)",[])?;
+            tx.commit()?;
+            self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
         }
-        self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
         Ok(())
     }
+}
+
+fn evict_prefix(rows: Vec<(i64, i64)>, budget: i64) -> Vec<i64> {
+    let mut total: i64 = rows.iter().map(|(_, len)| *len).sum();
+    if total <= budget {
+        return Vec::new();
+    }
+    let mut to_delete = Vec::new();
+    for (rowid, len) in rows {
+        if total <= budget {
+            break;
+        }
+        total -= len;
+        to_delete.push(rowid);
+    }
+    to_delete
 }
 #[cfg(test)]
 mod tests {

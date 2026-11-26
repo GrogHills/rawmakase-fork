@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS folders (
     root INTEGER NOT NULL REFERENCES roots(id),
     relative_path TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS folders_root ON folders(root);
 
 CREATE TABLE IF NOT EXISTS photos (
     id INTEGER PRIMARY KEY,
@@ -46,6 +47,8 @@ CREATE TABLE IF NOT EXISTS photos (
 
 CREATE INDEX IF NOT EXISTS photos_folder ON photos(folder);
 
+CREATE INDEX IF NOT EXISTS photos_folder_filename ON photos(folder, filename);
+
 CREATE INDEX IF NOT EXISTS photos_captured ON photos(captured);
 
 CREATE INDEX IF NOT EXISTS photos_master ON photos(master_id);
@@ -63,6 +66,7 @@ CREATE TABLE IF NOT EXISTS collection_photos (
     position TEXT,
     PRIMARY KEY(collection,photo)
 );
+CREATE INDEX IF NOT EXISTS collection_photos_photo ON collection_photos(photo);
 
 CREATE TABLE IF NOT EXISTS keywords (
     id INTEGER PRIMARY KEY,
@@ -196,6 +200,7 @@ CREATE TABLE IF NOT EXISTS photo_imports (
     photo INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     batch INTEGER NOT NULL REFERENCES import_batches(id)
 );
+CREATE INDEX IF NOT EXISTS photo_imports_batch ON photo_imports(batch);
 -- Batches added with Stack Camera Bursts on, whose bursts are not stacked
 -- yet: a row goes in the transaction that stacks them. `seconds` is the
 -- longest gap between frames a camera didn't number (continuous drive).
@@ -218,6 +223,7 @@ CREATE TABLE IF NOT EXISTS photo_import_facts (
     size INTEGER,
     exif_read INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS photo_import_facts_exif_read ON photo_import_facts(exif_read, photo);
 
 -- Numbers the catalog hands out once, by name: `import_number`, the last
 -- Import # an Import Photos run took.
