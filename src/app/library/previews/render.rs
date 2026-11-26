@@ -51,18 +51,23 @@ pub(super) fn finished_entry(
     let (file, key) = finished_ai(path, ai)?;
     Some((file, ai?.load(&key)?))
 }
-/// The tags a preview of `source` at `path` may be kept under, in the order it is
-/// looked for: the plain render of an edit with AI Denoise only while no finished
-/// result is there to render from instead. An offline photo shows whichever it has.
-pub(super) fn preview_tags(path: &Path, source: &EditSource, ai: Option<&AiCache>) -> Vec<String> {
+/// Whether `source` renders AI Denoise and the cache tags a preview of `source` at `path`
+/// may be kept under, in the order looked for: the plain render of an edit with AI Denoise
+/// only while no finished result is there to render from instead. An offline photo shows
+/// whichever it has.
+pub(super) fn preview_tags(
+    path: &Path,
+    source: &EditSource,
+    ai: Option<&AiCache>,
+) -> (bool, Vec<String>) {
     if !source.renders_ai() {
-        return vec![source.preview_tag(PreviewAi::Off)];
+        return (false, vec![source.preview_tag(PreviewAi::Off)]);
     }
     let mut tags = vec![source.preview_tag(PreviewAi::Finished)];
     if finished_ai(path, ai).is_none() {
         tags.push(source.preview_tag(PreviewAi::Plain));
     }
-    tags
+    (true, tags)
 }
 /// The file at `path` as it is now and the key of a finished AI Denoise result
 /// for it in `cache`, if there is one.

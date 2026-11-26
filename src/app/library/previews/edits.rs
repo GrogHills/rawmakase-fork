@@ -105,8 +105,9 @@ struct State {
 }
 struct Queued {
     job: EditJob,
-    /// Whether this job's edit enables AI Denoise (computed outside `State`'s lock).
-    renders_ai: bool,
+    /// Whether this job's edit enables AI Denoise, filled once on the worker thread
+    /// outside `State`'s mutex during cache lookup (or start).
+    renders_ai: Option<bool>,
     /// The cache had no preview for it when asked; it waits for a render.
     missed: bool,
     /// Asked ahead for a list no longer shown: answered without a render
@@ -115,7 +116,10 @@ struct Queued {
 }
 impl Queued {
     fn new(job: EditJob) -> Self {
-        let renders_ai = matches!(&job, EditJob::Render { source, .. } if source.renders_ai());
+        let renders_ai = match &job {
+            EditJob::Render { .. } => None,
+            EditJob::Store { .. } => Some(false),
+        };
         Self {
             job,
             renders_ai,
@@ -431,7 +435,7 @@ impl Renders {
                 EditJob::Store { .. } => unreachable!("stores are not looked up"),
             }
         };
-        let tags = preview_tags(&path, &source, ai.as_ref());
+        let (renders_ai, tags) = preview_tags(&path, &source, ai.as_ref());
         let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let cache = cache(&self.cache);
             let cache = cache.as_ref()?;
@@ -449,11 +453,18 @@ impl Renders {
                 drop(state);
                 self.results.send(self.answer(id, ticket, ahead, image));
             }
-            None if render => {
-                drop(state);
-                self.start(index);
+            None => {
+                state.jobs[index].renders_ai = Some(renders_ai);
+                let allow_ai = !renders_ai
+                    || state.ai.is_none()
+                    || state.running.iter().filter(|r| r.ai).count() < MAX_CONCURRENT_AI_RENDERS;
+                if render && allow_ai {
+                    drop(state);
+                    self.start(index);
+                } else {
+                    state.jobs[index].missed = true;
+                }
             }
-            None => state.jobs[index].missed = true,
         }
     }
     /// A preview for photo `id`: shown, unless it was asked ahead and the
@@ -467,19 +478,27 @@ impl Renders {
     /// to keep it in (rendered when shown).
     fn start(&self, index: usize) {
         let shared = &self.results.shared;
-        let check_cache = {
+        let (check_cache, unclassified) = {
             let state = shared.lock();
             if state.closed {
                 return;
             }
-            matches!(
+            let check_cache = matches!(
                 &state.jobs[index].job,
                 EditJob::Render { id, ahead: true, .. }
                     if !state.jobs[index].dropped
                         && state.pace != Pace::Background
                         && !shown(&self.wanted, *id)
-            )
+            );
+            let unclassified = match &state.jobs[index].job {
+                EditJob::Render { source, .. } if state.jobs[index].renders_ai.is_none() => {
+                    Some(source.clone())
+                }
+                _ => None,
+            };
+            (check_cache, unclassified)
         };
+        let computed_ai = unclassified.map(|source| source.renders_ai());
         let no_cache = check_cache && cache(&self.cache).is_none();
         let mut state = shared.lock();
         // Closed since it was looked up: nothing is rendered, nor answered.
@@ -487,7 +506,7 @@ impl Renders {
             return;
         }
         let queued = state.jobs.remove(index);
-        let renders_ai = queued.renders_ai;
+        let renders_ai = queued.renders_ai.or(computed_ai).unwrap_or(false);
         let EditJob::Render {
             id,
             ticket,
@@ -675,7 +694,9 @@ fn next_step(shared: &Shared, wanted: &Wanted, full_renders: usize) -> Step {
         // wait on a gate while nested Rayon work may be running inside the pool.
         let ai_running = state.running.iter().filter(|r| r.ai).count();
         let ai_allowed = |q: &Queued| {
-            ai_running < MAX_CONCURRENT_AI_RENDERS || !(q.renders_ai && state.ai.is_some())
+            ai_running < MAX_CONCURRENT_AI_RENDERS
+                || state.ai.is_none()
+                || q.renders_ai != Some(true)
         };
         // Photos shown, the latest first: from the cache whether or not a
         // render could start, rendered when one can.

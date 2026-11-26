@@ -253,8 +253,15 @@ fn photos_shown_go_before_the_ones_asked_ahead() {
 
 #[test]
 fn ai_renders_are_bounded_by_scheduler_even_with_four_slots() {
+    fn unexpected_render(
+        _: &Path,
+        _: &EditSource,
+        _: Cancel<'_>,
+    ) -> anyhow::Result<image::RgbImage> {
+        panic!("scheduler must not start a third AI render while two are active")
+    }
     let directory = tempfile::tempdir().unwrap();
-    let shared = Shared::default();
+    let shared = Arc::<Shared>::default();
     let wanted = Wanted::default();
     wanted.lock().unwrap().extend([PhotoId(1), PhotoId(2)]);
     let mut ai_recipe = crate::model::recipe::Recipe::default();
@@ -267,6 +274,11 @@ fn ai_renders_are_bounded_by_scheduler_even_with_four_slots() {
         source: EditSource::Recipe(serde_json::to_string(&ai_recipe).unwrap()),
         ahead: false,
     };
+    // Enqueueing stays O(1) without deserializing the recipe on the UI thread.
+    let queued_plain = Queued::new(render_job(1, &directory.path().join("plain.png"), false));
+    let queued_ai = Queued::new(ai_job);
+    assert_eq!(queued_plain.renders_ai, None);
+    assert_eq!(queued_ai.renders_ai, None);
     {
         let mut state = shared.lock();
         state.pace = Pace::Full;
@@ -280,23 +292,48 @@ fn ai_renders_are_bounded_by_scheduler_even_with_four_slots() {
                 path: directory.path().join(format!("busy-{slot}.ARW")),
             });
         }
-        state.jobs = vec![
-            Queued::new(render_job(1, &directory.path().join("plain.png"), false)),
-            Queued::new(ai_job),
-        ];
+        state.jobs = vec![queued_plain, queued_ai];
     }
-    // Latest visible job is AI-enabled, so it looks up in cache without starting a render.
+    let (tx, _rx) = mpsc::channel();
+    let renders = Renders {
+        background: None,
+        full: None,
+        cache: Arc::new(Mutex::new(None)),
+        cache_path: PathBuf::new(),
+        wanted: wanted.clone(),
+        results: Results {
+            tx,
+            shared: shared.clone(),
+            ctx: egui::Context::default(),
+        },
+        render: unexpected_render,
+        render_ai: render_edited_with_ai,
+    };
+    // Latest visible job has not been classified yet: look checks the cache and classifies
+    // outside `State`'s mutex, then holds it at `missed` without starting a 3rd AI render.
     assert!(matches!(
         next_step(&shared, &wanted, 4),
-        Step::Look(1, false)
+        Step::Look(1, true)
     ));
-    shared.lock().jobs[1].missed = true;
+    renders.look(1, true);
+    {
+        let state = shared.lock();
+        assert_eq!(state.running.len(), MAX_CONCURRENT_AI_RENDERS);
+        assert_eq!(state.jobs[1].renders_ai, Some(true));
+        assert!(state.jobs[1].missed);
+    }
     // The non-AI job still looks up and renders beside the two AI renders.
     assert!(matches!(
         next_step(&shared, &wanted, 4),
         Step::Look(0, true)
     ));
-    shared.lock().jobs[0].missed = true;
+    // Classify synchronously via look(..., false) before verifying next_step picks Render(0).
+    renders.look(0, false);
+    {
+        let state = shared.lock();
+        assert_eq!(state.jobs[0].renders_ai, Some(false));
+        assert!(state.jobs[0].missed);
+    }
     assert!(matches!(next_step(&shared, &wanted, 4), Step::Render(0)));
     // Once the non-AI job leaves and one AI slot frees up, the waiting AI job renders.
     shared.lock().jobs.remove(0);
