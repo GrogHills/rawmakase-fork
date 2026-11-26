@@ -96,24 +96,148 @@ impl HdrDecoding {
     }
     /// An image's samples as light, row by row.
     fn apply(self, image: DynamicImage, cancel: Cancel<'_>) -> Result<Vec<[f32; 3]>> {
-        let width = image.width() as usize;
-        let samples = image.into_rgb32f().into_raw();
-        let mut out = vec![[0f32; 3]; samples.len() / 3];
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        let mut out = vec![[0f32; 3]; width * height];
         if out.is_empty() {
             return Ok(out);
         }
-        samples
-            .par_chunks(width * 3)
-            .zip(out.par_chunks_mut(width))
-            .try_for_each(|(from, to)| {
-                anyhow::ensure!(!cancel.is_cancelled(), "Opening cancelled");
-                for (to, px) in to.iter_mut().zip(from.as_chunks::<3>().0) {
-                    *to = self.light(*px);
-                }
-                Ok(())
-            })?;
+        let u8_f = |v: u8| f32::from(v) / 255.;
+        let u16_f = |v: u16| f32::from(v) / 65535.;
+        let apply = |rgb| self.light(rgb);
+        match image {
+            DynamicImage::ImageLuma8(img) => {
+                convert_rows(
+                    img.as_raw(),
+                    width,
+                    1,
+                    &mut out,
+                    cancel,
+                    |p| [u8_f(p[0]); 3],
+                    apply,
+                )?;
+            }
+            DynamicImage::ImageLumaA8(img) => {
+                convert_rows(
+                    img.as_raw(),
+                    width,
+                    2,
+                    &mut out,
+                    cancel,
+                    |p| [u8_f(p[0]); 3],
+                    apply,
+                )?;
+            }
+            DynamicImage::ImageRgb8(img) => convert_rows(
+                img.as_raw(),
+                width,
+                3,
+                &mut out,
+                cancel,
+                |p| [u8_f(p[0]), u8_f(p[1]), u8_f(p[2])],
+                apply,
+            )?,
+            DynamicImage::ImageRgba8(img) => convert_rows(
+                img.as_raw(),
+                width,
+                4,
+                &mut out,
+                cancel,
+                |p| [u8_f(p[0]), u8_f(p[1]), u8_f(p[2])],
+                apply,
+            )?,
+            DynamicImage::ImageLuma16(img) => {
+                convert_rows(
+                    img.as_raw(),
+                    width,
+                    1,
+                    &mut out,
+                    cancel,
+                    |p| [u16_f(p[0]); 3],
+                    apply,
+                )?;
+            }
+            DynamicImage::ImageLumaA16(img) => {
+                convert_rows(
+                    img.as_raw(),
+                    width,
+                    2,
+                    &mut out,
+                    cancel,
+                    |p| [u16_f(p[0]); 3],
+                    apply,
+                )?;
+            }
+            DynamicImage::ImageRgb16(img) => convert_rows(
+                img.as_raw(),
+                width,
+                3,
+                &mut out,
+                cancel,
+                |p| [u16_f(p[0]), u16_f(p[1]), u16_f(p[2])],
+                apply,
+            )?,
+            DynamicImage::ImageRgba16(img) => convert_rows(
+                img.as_raw(),
+                width,
+                4,
+                &mut out,
+                cancel,
+                |p| [u16_f(p[0]), u16_f(p[1]), u16_f(p[2])],
+                apply,
+            )?,
+            DynamicImage::ImageRgb32F(img) => convert_rows(
+                img.as_raw(),
+                width,
+                3,
+                &mut out,
+                cancel,
+                |p| [p[0], p[1], p[2]],
+                apply,
+            )?,
+            DynamicImage::ImageRgba32F(img) => convert_rows(
+                img.as_raw(),
+                width,
+                4,
+                &mut out,
+                cancel,
+                |p| [p[0], p[1], p[2]],
+                apply,
+            )?,
+            other => {
+                let samples = other.into_rgb32f().into_raw();
+                convert_rows(
+                    &samples,
+                    width,
+                    3,
+                    &mut out,
+                    cancel,
+                    |p| [p[0], p[1], p[2]],
+                    apply,
+                )?;
+            }
+        }
         Ok(out)
     }
+}
+
+fn convert_rows<T: Sync>(
+    raw: &[T],
+    width: usize,
+    channels: usize,
+    out: &mut [[f32; 3]],
+    cancel: Cancel<'_>,
+    pixel: impl Fn(&[T]) -> [f32; 3] + Sync,
+    light: impl Fn([f32; 3]) -> [f32; 3] + Sync,
+) -> Result<()> {
+    raw.par_chunks(width * channels)
+        .zip(out.par_chunks_mut(width))
+        .try_for_each(|(from, to)| {
+            anyhow::ensure!(!cancel.is_cancelled(), "Opening cancelled");
+            for (to, px) in to.iter_mut().zip(from.chunks_exact(channels)) {
+                *to = light(pixel(px));
+            }
+            Ok(())
+        })
 }
 
 /// How an HDR file's light decodes exactly, if it does:
@@ -563,19 +687,18 @@ pub(crate) fn open(path: &Path, cancel: Cancel<'_>) -> Result<CameraImage> {
             let profile = profile.unwrap_or_else(ColorProfile::new_srgb);
             let samples = map.decode(&mut std::fs::File::open(path)?, orientation)?;
             let base = in_own_primaries(&profile, &image, cancel)?;
-            let alternate =
+            let mut alternate =
                 gain_map::reconstruct(&base, width, height, &samples, &map.metadata, cancel)?;
+            drop(base);
+            drop(samples);
             let to_pro_photo = colorants_to_pro_photo(&profile)
                 .ok_or_else(|| Unsupported("table-profile gain-map".into()))?;
-            let light = rawmakase_model::camera_data::HdrLight::from_gain_map(
-                width,
-                height,
-                alternate
-                    .par_iter()
-                    .map(|p| rawmakase_model::color::mul(to_pro_photo, *p))
-                    .collect(),
-            )
-            .context("Could not decode the gain map")?;
+            alternate
+                .par_iter_mut()
+                .for_each(|p| *p = rawmakase_model::color::mul(to_pro_photo, *p));
+            let light =
+                rawmakase_model::camera_data::HdrLight::from_gain_map(width, height, alternate)
+                    .context("Could not decode the gain map")?;
             let linear = to_linear(&profile, image.color())?;
             (Some(light), linear.apply(image, cancel)?)
         }
@@ -1059,11 +1182,31 @@ impl ToSrgb {
     fn apply(&self, image: DynamicImage) -> Result<RgbImage> {
         let mut out = RgbImage::new(image.width(), image.height());
         let gray = |layout: &Layout| *layout == Layout::Gray;
+        let eight =
+            |src: &[u8], t: &(dyn TransformExecutor<u8> + Send + Sync), out: &mut RgbImage| {
+                rows_with(src, t, out, |_| (), |_, t, from, to| t.transform(from, to))
+            };
+        let sixteen =
+            |src: &[u16], t: &(dyn TransformExecutor<u16> + Send + Sync), out: &mut RgbImage| {
+                rows_with(
+                    src,
+                    t,
+                    out,
+                    |n| vec![0u16; n],
+                    |row, t, from, to| {
+                        t.transform(from, row)?;
+                        for (to, &v) in to.iter_mut().zip(row.iter()) {
+                            *to = to_8(v);
+                        }
+                        Ok(())
+                    },
+                )
+            };
         match self {
-            Self::Eight(t, l) if gray(l) => rows(&image.into_luma8(), &**t, &mut out, |v| v),
-            Self::Eight(t, _) => rows(&image.into_rgb8(), &**t, &mut out, |v| v),
-            Self::Sixteen(t, l) if gray(l) => rows(&image.into_luma16(), &**t, &mut out, to_8),
-            Self::Sixteen(t, _) => rows(&image.into_rgb16(), &**t, &mut out, to_8),
+            Self::Eight(t, l) if gray(l) => eight(&image.into_luma8(), &**t, &mut out),
+            Self::Eight(t, _) => eight(&image.into_rgb8(), &**t, &mut out),
+            Self::Sixteen(t, l) if gray(l) => sixteen(&image.into_luma16(), &**t, &mut out),
+            Self::Sixteen(t, _) => sixteen(&image.into_rgb16(), &**t, &mut out),
         }?;
         Ok(out)
     }
@@ -1076,11 +1219,18 @@ fn to_8(v: u16) -> u8 {
 
 /// Converts `source` into `out`, which has as many rows, a row at a time, so a
 /// 16-bit image never needs a second full-size 16-bit copy.
-fn rows<T: Copy + Default + Send + Sync>(
+fn rows_with<T: Sync, S>(
     source: &[T],
     transform: &(dyn TransformExecutor<T> + Send + Sync),
     out: &mut RgbImage,
-    quantise: impl Fn(T) -> u8 + Sync,
+    init: impl Fn(usize) -> S + Sync,
+    op: impl Fn(
+        &mut S,
+        &(dyn TransformExecutor<T> + Send + Sync),
+        &[T],
+        &mut [u8],
+    ) -> std::result::Result<(), moxcms::CmsError>
+    + Sync,
 ) -> Result<()> {
     let height = out.height() as usize;
     if height == 0 || out.is_empty() {
@@ -1090,14 +1240,10 @@ fn rows<T: Copy + Default + Send + Sync>(
     source
         .par_chunks(source.len() / height)
         .zip(out.par_chunks_mut(out_row))
-        .try_for_each(|(from, to)| {
-            let mut row = vec![T::default(); to.len()];
-            transform.transform(from, &mut row)?;
-            for (to, v) in to.iter_mut().zip(row) {
-                *to = quantise(v);
-            }
-            Ok(())
-        })
+        .try_for_each_init(
+            || init(out_row),
+            |scratch, (from, to)| op(scratch, transform, from, to),
+        )
         .map_err(|e: moxcms::CmsError| anyhow!("Could not convert the image to sRGB: {e}"))
 }
 

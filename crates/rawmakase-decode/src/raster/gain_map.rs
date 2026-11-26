@@ -49,15 +49,19 @@ struct Channel {
 }
 
 impl Channel {
-    /// The alternate rendition of linear base value `base`, where the map's sample
-    /// is `sample` (0–1), at the map's full weight.
-    fn apply(&self, base: f32, sample: f32) -> f32 {
+    #[inline]
+    fn gain(&self, sample: f32) -> f32 {
         let mut v = sample.clamp(0., 1.);
         if self.gamma != 1. {
             v = v.powf(1. / self.gamma);
         }
-        let stops = self.min + (self.max - self.min) * v;
-        (base + self.base_offset) * stops.exp2() - self.alternate_offset
+        (self.min + (self.max - self.min) * v).exp2()
+    }
+
+    /// The alternate rendition of linear base value `base`, where the map's sample
+    /// is `sample` (0–1), at the map's full weight.
+    fn apply(&self, base: f32, sample: f32) -> f32 {
+        (base + self.base_offset) * self.gain(sample) - self.alternate_offset
     }
 }
 
@@ -624,15 +628,38 @@ pub(super) fn reconstruct(
         base.len() == width as usize * height as usize,
         "The gain map's base has the wrong size"
     );
+    let ch0 = metadata.channels[0];
+    let same_gain = metadata.channels[1..]
+        .iter()
+        .all(|c| c.min == ch0.min && c.max == ch0.max && c.gamma == ch0.gamma);
     out.par_chunks_mut(width as usize)
         .zip(base.par_chunks(width as usize))
         .enumerate()
         .try_for_each(|(y, (to, from))| {
             anyhow::ensure!(!cancel.is_cancelled(), "Opening cancelled");
-            for (x, (to, from)) in to.iter_mut().zip(from).enumerate() {
-                for c in 0..3 {
-                    let sample = map.at(x as u32, y as u32, width, height, c);
-                    to[c] = metadata.channels[c].apply(from[c], sample);
+            if map.channels == 1 {
+                if same_gain {
+                    for (x, (to, from)) in to.iter_mut().zip(from).enumerate() {
+                        let gain = ch0.gain(map.at(x as u32, y as u32, width, height, 0));
+                        for c in 0..3 {
+                            let ch = metadata.channels[c];
+                            to[c] = (from[c] + ch.base_offset) * gain - ch.alternate_offset;
+                        }
+                    }
+                } else {
+                    for (x, (to, from)) in to.iter_mut().zip(from).enumerate() {
+                        let sample = map.at(x as u32, y as u32, width, height, 0);
+                        for c in 0..3 {
+                            to[c] = metadata.channels[c].apply(from[c], sample);
+                        }
+                    }
+                }
+            } else {
+                for (x, (to, from)) in to.iter_mut().zip(from).enumerate() {
+                    for c in 0..3 {
+                        let sample = map.at(x as u32, y as u32, width, height, c);
+                        to[c] = metadata.channels[c].apply(from[c], sample);
+                    }
                 }
             }
             Ok(())

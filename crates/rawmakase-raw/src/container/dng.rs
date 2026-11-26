@@ -642,79 +642,86 @@ pub(crate) fn decode(
             Order::Big
         },
     );
-    let mut decoded = Vec::new();
-    let tiles = if plan.compression == JPEG_XL {
+    if plan.compression == JPEG_XL {
         jpeg_xl(plan, &file, &mut data, cancel)?;
-        0
     } else {
-        across * height.div_ceil(th)
-    };
-    for (i, &(offset, len)) in plan.tiles.iter().enumerate().take(tiles) {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let (tx, ty) = ((i % across) * tw, (i / across) * th);
-        let tile = file.slice(offset, len)?;
-        // The tile's samples in raster order, `tile_row` per row.
-        let float = plan.sample_format == 3;
-        let samples: &[u16] = match plan.compression {
-            1 if float => {
-                floats(tile, plan, tile_row * th, plan.little, &mut decoded)?;
-                &decoded
-            }
-            1 => {
-                unpack(tile, plan.bps, tile_row, th, plan.little, &mut decoded)?;
-                &decoded
-            }
-            8 => {
-                let bytes_per = (plan.bps as usize).div_ceil(8);
-                let limit = tile_row * th * bytes_per;
-                let mut bytes =
-                    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(tile, limit)
-                        .map_err(|_| corrupt("DNG Deflate tile"))?;
-                bytes.resize(limit, 0);
-                if float && plan.predictor != 1 {
-                    // The predictor leaves big-endian samples.
-                    unpredict_float(&mut bytes, tw, bytes_per, plan.predictor)?;
-                    floats(&bytes, plan, tw * th, false, &mut decoded)?;
-                } else if float {
-                    floats(&bytes, plan, tile_row * th, plan.little, &mut decoded)?;
-                } else {
-                    unpack(&bytes, plan.bps, tile_row, th, plan.little, &mut decoded)?;
-                    if plan.predictor == 2 {
-                        // Differences of the pixel before's same sample,
-                        // wrapping at the samples' precision.
-                        let mask = ((1u32 << plan.bps.clamp(1, 16)) - 1) as u16;
-                        for row in decoded.chunks_mut(tile_row) {
-                            for i in spp..row.len() {
-                                row[i] = row[i].wrapping_add(row[i - spp]) & mask;
+        data.par_chunks_mut(th * image_row)
+            .enumerate()
+            .try_for_each_init(Vec::new, |decoded, (row, band)| -> Result<()> {
+                let band_rows = band.len() / image_row;
+                for col in 0..across {
+                    if cancel.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    let &(offset, len) = plan
+                        .tiles
+                        .get(row * across + col)
+                        .ok_or_else(|| corrupt("DNG tile count"))?;
+                    let tile = file.slice(offset, len)?;
+                    // The tile's samples in raster order, `tile_row` per row.
+                    let float = plan.sample_format == 3;
+                    match plan.compression {
+                        1 if float => {
+                            floats(tile, plan, tile_row * th, plan.little, decoded)?;
+                        }
+                        1 => {
+                            unpack(tile, plan.bps, tile_row, th, plan.little, decoded)?;
+                        }
+                        8 => {
+                            let bytes_per = (plan.bps as usize).div_ceil(8);
+                            let limit = tile_row * th * bytes_per;
+                            let mut bytes =
+                                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+                                    tile, limit,
+                                )
+                                .map_err(|_| corrupt("DNG Deflate tile"))?;
+                            bytes.resize(limit, 0);
+                            if float && plan.predictor != 1 {
+                                // The predictor leaves big-endian samples.
+                                unpredict_float(&mut bytes, tw, bytes_per, plan.predictor)?;
+                                floats(&bytes, plan, tw * th, false, decoded)?;
+                            } else if float {
+                                floats(&bytes, plan, tile_row * th, plan.little, decoded)?;
+                            } else {
+                                unpack(&bytes, plan.bps, tile_row, th, plan.little, decoded)?;
+                                if plan.predictor == 2 {
+                                    // Differences of the pixel before's same sample,
+                                    // wrapping at the samples' precision.
+                                    let mask = ((1u32 << plan.bps.clamp(1, 16)) - 1) as u16;
+                                    for r in decoded.chunks_mut(tile_row) {
+                                        for i in spp..r.len() {
+                                            r[i] = r[i].wrapping_add(r[i - spp]) & mask;
+                                        }
+                                    }
+                                }
                             }
+                        }
+                        // Lossless JPEG; some writers (Blackmagic) store DCT JPEG under
+                        // the same code.
+                        7 if dct::is_dct(tile) => {
+                            dct::decode_into(tile, cancel, decoded)?;
+                        }
+                        7 => {
+                            ljpeg::decode_into(&ljpeg::header(tile)?, tile, cancel, decoded)?;
+                        }
+                        c => return Err(Error::Unsupported(format!("DNG compression {c}"))),
+                    }
+                    let x_start = col * tile_row;
+                    let copy_max = image_row.saturating_sub(x_start).min(tile_row);
+                    if copy_max > 0 {
+                        for (dst_row, src_row) in band
+                            .chunks_exact_mut(image_row)
+                            .take(band_rows)
+                            .zip(decoded.chunks(tile_row))
+                        {
+                            let copy_len = src_row.len().min(copy_max);
+                            dst_row[x_start..x_start + copy_len]
+                                .copy_from_slice(&src_row[..copy_len]);
                         }
                     }
                 }
-                &decoded
-            }
-            // Lossless JPEG; some writers (Blackmagic) store DCT JPEG under
-            // the same code.
-            7 if dct::is_dct(tile) => {
-                dct::decode_into(tile, cancel, &mut decoded)?;
-                &decoded
-            }
-            7 => {
-                ljpeg::decode_into(&ljpeg::header(tile)?, tile, cancel, &mut decoded)?;
-                &decoded
-            }
-            c => return Err(Error::Unsupported(format!("DNG compression {c}"))),
-        };
-        for (k, &v) in samples.iter().enumerate() {
-            let (y, x) = (ty + k / tile_row, tx * spp + k % tile_row);
-            if k / tile_row >= th {
-                break;
-            }
-            if y < height && x < image_row {
-                data[y * image_row + x] = v;
-            }
-        }
+                Ok(())
+            })?;
     }
     // OpcodeList1 works on the stored image.
     let mut stored = opcodes::Image {

@@ -6,6 +6,7 @@ use super::{Cfa, Header, Sensor};
 use anyhow::{Result, ensure};
 use rawmakase_cancel::Cancel;
 use rawmakase_raw::RawInfo;
+use rayon::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -206,28 +207,36 @@ impl Own {
 /// (raw − black) / (white − black), negative below black (noise is clipped only
 /// after demosaicing, where interpolated samples carry less of it), each sample's black that of
 /// channel `channel(y, x)` plus its position's in the black pattern.
-fn visible(s: &rawmakase_raw::Sensor, channel: impl Fn(usize, usize) -> usize) -> Vec<f32> {
+fn visible(s: &rawmakase_raw::Sensor, channel: impl Fn(usize, usize) -> usize + Sync) -> Vec<f32> {
     let [left, top, w, h] = s.area.map(|v| v as usize);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
     let (rows, cols, ref values) = s.black_pattern;
-    let pattern_black = |y: usize, x: usize| {
-        if rows > 0 && cols > 0 {
-            values
-                .get((y % rows as usize) * cols as usize + x % cols as usize)
-                .copied()
-                .unwrap_or(0)
-        } else {
-            0
-        }
-    };
     let white = s.white as f32;
+    let black_f = s.black.map(|b| b as f32);
+    let range = black_f.map(|b| (white - b).max(1.));
     let mut data = vec![0f32; w * h];
-    for y in 0..h {
-        let src = &s.data[(y + top) * s.width as usize + left..][..w];
-        for (x, (dst, &v)) in data[y * w..(y + 1) * w].iter_mut().zip(src).enumerate() {
-            let mut black = s.black[channel(y, x)] as f32;
-            black += pattern_black(y, x) as f32;
-            *dst = (f32::from(v) - black) / (white - black).max(1.);
-        }
+    if rows > 0 && cols > 0 {
+        let (rows, cols) = (rows as usize, cols as usize);
+        data.par_chunks_mut(w).enumerate().for_each(|(y, dst_row)| {
+            let src = &s.data[(y + top) * s.width as usize + left..][..w];
+            let pat_y = (y % rows) * cols;
+            for (x, (dst, &v)) in dst_row.iter_mut().zip(src).enumerate() {
+                let c = channel(y, x);
+                let pat = values.get(pat_y + x % cols).copied().unwrap_or(0);
+                let black = black_f[c] + pat as f32;
+                *dst = (f32::from(v) - black) / (white - black).max(1.);
+            }
+        });
+    } else {
+        data.par_chunks_mut(w).enumerate().for_each(|(y, dst_row)| {
+            let src = &s.data[(y + top) * s.width as usize + left..][..w];
+            for (x, (dst, &v)) in dst_row.iter_mut().zip(src).enumerate() {
+                let c = channel(y, x);
+                *dst = (f32::from(v) - black_f[c]) / range[c];
+            }
+        });
     }
     data
 }

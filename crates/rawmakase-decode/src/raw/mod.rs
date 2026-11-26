@@ -414,6 +414,7 @@ impl Raw {
             .own
             .cfa(cancel)?
             .ok_or_else(|| anyhow::anyhow!("Sensor data RAWmakase cannot develop"))?;
+        drop(self);
         ensure!(!cancel.is_cancelled(), "Development cancelled");
         Ok(crate::ai::denoise::PackedBayer::pack(
             cfa.width as usize,
@@ -445,15 +446,17 @@ impl Raw {
         Ok(crate::ai::denoise::PackedBayer::pack(w, h, &data, [0, 0]))
     }
     pub fn develop(self, decode: Decode, cancel: Cancel<'_>) -> Result<CameraImage> {
+        let Self { own, metadata, .. } = self;
         // Small RAWs develop at full size in either mode, as they always have.
-        if let Some((width, height, pixels)) = self.own.rgb(self.metadata.wb, cancel)? {
+        if let Some((width, height, pixels)) = own.rgb(metadata.wb, cancel)? {
+            drop(own);
             ensure!(!cancel.is_cancelled(), "Development cancelled");
             return Ok(CameraImage {
                 recovered: Default::default(),
                 width,
                 height,
                 pixels,
-                metadata: self.metadata,
+                metadata,
                 fast: decode == Decode::Half,
                 // Developed in floating point: nothing is scaled down to
                 // integers, so nothing saturates.
@@ -462,15 +465,16 @@ impl Raw {
                 hdr: Default::default(),
             });
         }
-        let cfa = self.own.cfa(cancel)?;
-        self.develop_mosaic(cfa, decode == Decode::Half, cancel)?
+        let cfa = own.cfa(cancel)?;
+        drop(own);
+        Self::develop_mosaic(cfa, metadata, decode == Decode::Half, cancel)?
             .ok_or_else(|| anyhow::anyhow!("Sensor data RAWmakase cannot develop"))
     }
     /// The mosaic white balanced and demosaiced, or at half size (`half`,
     /// `demosaic::half`); `None` without a mosaic.
     fn develop_mosaic(
-        &self,
         cfa: Option<Cfa>,
+        metadata: Metadata,
         half: bool,
         cancel: Cancel<'_>,
     ) -> Result<Option<CameraImage>> {
@@ -484,7 +488,7 @@ impl Raw {
             return Ok(None);
         };
         ensure!(!cancel.is_cancelled(), "Development cancelled");
-        let wb = self.metadata.wb;
+        let wb = metadata.wb;
         let (width, height) = (w as usize, h as usize);
         let clipped = data
             .par_chunks_mut(width)
@@ -518,7 +522,7 @@ impl Raw {
             width: w,
             height: h,
             pixels,
-            metadata: self.metadata.clone(),
+            metadata,
             fast: half,
             scale_factor: 1.,
             scale_clipped: clipped,

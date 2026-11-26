@@ -116,38 +116,69 @@ pub(crate) fn demosaic(cfa: &Cfa) -> Vec<[f32; 3]> {
         // here: an interpolated sample averages its neighbours' noise, so the
         // mean of a dark noisy area rises less than clipping each sample would
         // (Camera Raw's dark noisy patches sit at that lower bias).
-        let mut out = colour_difference(cfa, &green_bayer(cfa));
-        for px in &mut out {
-            for v in px {
-                *v = v.max(0.);
-            }
-        }
-        out
+        colour_difference(cfa, &green_bayer(cfa))
     } else {
-        let data: Vec<f32> = cfa.data.iter().map(|v| v.max(0.)).collect();
-        xtrans::demosaic(&Cfa {
-            data: &data,
-            ..*cfa
-        })
+        xtrans::demosaic(cfa)
     }
 }
 
 fn green_bayer(cfa: &Cfa) -> Vec<f32> {
     let (w, h) = (cfa.width, cfa.height);
     let mut g = vec![0f32; w * h];
+    if w == 0 || h == 0 {
+        return g;
+    }
+    let cell = [
+        [cfa.color(0, 0), cfa.color(1, 0)],
+        [cfa.color(0, 1), cfa.color(1, 1)],
+    ];
+    let border_pixel = |x: usize, y: usize| -> f32 {
+        let (xi, yi) = (x as isize, y as isize);
+        let c = cfa.at(xi, yi);
+        if cfa.color(x, y) == 1 {
+            return c;
+        }
+        let (l, r) = (cfa.at(xi - 1, yi), cfa.at(xi + 1, yi));
+        let (u, d) = (cfa.at(xi, yi - 1), cfa.at(xi, yi + 1));
+        let lap_h = 2. * c - cfa.at(xi - 2, yi) - cfa.at(xi + 2, yi);
+        let lap_v = 2. * c - cfa.at(xi, yi - 2) - cfa.at(xi, yi + 2);
+        let gh = (l + r) * 0.5 + lap_h * 0.25;
+        let gv = (u + d) * 0.5 + lap_v * 0.25;
+        let dh = (l - r).abs() + lap_h.abs();
+        let dv = (u - d).abs() + lap_v.abs();
+        // Blend by inverse gradient instead of a hard switch, avoiding zipper edges.
+        let (wh, wv) = (1. / (dh + 1e-5), 1. / (dv + 1e-5));
+        let est = (gh * wh + gv * wv) / (wh + wv);
+        // Keep the estimate within the neighbouring greens (no overshoot halos).
+        let lo = l.min(r).min(u).min(d);
+        let hi = l.max(r).max(u).max(d);
+        est.clamp(lo, hi)
+    };
     g.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        let y = y as isize;
-        for (x, out) in row.iter_mut().enumerate() {
-            let xi = x as isize;
-            let c = cfa.at(xi, y);
-            if cfa.color(x, y as usize) == 1 {
+        if y < 2 || y + 2 >= h || w < 5 {
+            for (x, out) in row.iter_mut().enumerate() {
+                *out = border_pixel(x, y);
+            }
+            return;
+        }
+        row[0] = border_pixel(0, y);
+        row[1] = border_pixel(1, y);
+        let row_colors = cell[y & 1];
+        let r_m2 = &cfa.data[(y - 2) * w + 2..(y - 1) * w - 2];
+        let r_m1 = &cfa.data[(y - 1) * w + 2..y * w - 2];
+        let r_0 = &cfa.data[y * w..(y + 1) * w];
+        let r_p1 = &cfa.data[(y + 1) * w + 2..(y + 2) * w - 2];
+        let r_p2 = &cfa.data[(y + 2) * w + 2..(y + 3) * w - 2];
+        for (i, out) in row[2..w - 2].iter_mut().enumerate() {
+            let c = r_0[i + 2];
+            if row_colors[i & 1] == 1 {
                 *out = c;
                 continue;
             }
-            let (l, r) = (cfa.at(xi - 1, y), cfa.at(xi + 1, y));
-            let (u, d) = (cfa.at(xi, y - 1), cfa.at(xi, y + 1));
-            let lap_h = 2. * c - cfa.at(xi - 2, y) - cfa.at(xi + 2, y);
-            let lap_v = 2. * c - cfa.at(xi, y - 2) - cfa.at(xi, y + 2);
+            let (l, r) = (r_0[i + 1], r_0[i + 3]);
+            let (u, d) = (r_m1[i], r_p1[i]);
+            let lap_h = 2. * c - r_0[i] - r_0[i + 4];
+            let lap_v = 2. * c - r_m2[i] - r_p2[i];
             let gh = (l + r) * 0.5 + lap_h * 0.25;
             let gv = (u + d) * 0.5 + lap_v * 0.25;
             let dh = (l - r).abs() + lap_h.abs();
@@ -160,50 +191,108 @@ fn green_bayer(cfa: &Cfa) -> Vec<f32> {
             let hi = l.max(r).max(u).max(d);
             *out = est.clamp(lo, hi);
         }
+        row[w - 2] = border_pixel(w - 2, y);
+        row[w - 1] = border_pixel(w - 1, y);
     });
     g
 }
 
 fn colour_difference(cfa: &Cfa, green: &[f32]) -> Vec<[f32; 3]> {
     let (w, h) = (cfa.width, cfa.height);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
     let g = |x: isize, y: isize| green[Cfa::reflect(y, h) * w + Cfa::reflect(x, w)];
+    let border_pixel = |x: usize, y: usize| -> [f32; 3] {
+        let (xi, yi) = (x as isize, y as isize);
+        let gc = g(xi, yi);
+        let own = cfa.color(x, y);
+        let mut px = [0f32; 3];
+        px[1] = gc.max(0.);
+        for c in [0u8, 2] {
+            if own == c {
+                px[c as usize] = cfa.at(xi, yi).max(0.);
+                continue;
+            }
+            // Nearest same-colour samples within radius 1, else 2, weighted by
+            // inverse distance, interpolating their difference to green.
+            let mut sum = 0.;
+            let mut total = 0.;
+            for radius in 1..=2isize {
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        if dx.abs().max(dy.abs()) != radius || cfa.color_at(xi + dx, yi + dy) != c {
+                            continue;
+                        }
+                        let wgt = 1. / ((dx * dx + dy * dy) as f32).sqrt();
+                        sum += (cfa.at(xi + dx, yi + dy) - g(xi + dx, yi + dy)) * wgt;
+                        total += wgt;
+                    }
+                }
+                if total > 0. {
+                    break;
+                }
+            }
+            px[c as usize] = (gc + if total > 0. { sum / total } else { 0. }).max(0.);
+        }
+        px
+    };
+    let cell = [
+        [cfa.color(0, 0), cfa.color(1, 0)],
+        [cfa.color(0, 1), cfa.color(1, 1)],
+    ];
+    let bayer = cfa.is_bayer()
+        && ((cell[0][0] == 1
+            && cell[1][1] == 1
+            && ((cell[0][1] == 0 && cell[1][0] == 2) || (cell[0][1] == 2 && cell[1][0] == 0)))
+            || (cell[0][1] == 1
+                && cell[1][0] == 1
+                && ((cell[0][0] == 0 && cell[1][1] == 2) || (cell[0][0] == 2 && cell[1][1] == 0))));
+    let diag_wgt = 1. / 2f32.sqrt();
+    let diag_total = ((diag_wgt + diag_wgt) + diag_wgt) + diag_wgt;
     let mut out = vec![[0f32; 3]; w * h];
     out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        let yi = y as isize;
-        for (x, px) in row.iter_mut().enumerate() {
-            let xi = x as isize;
-            let gc = g(xi, yi);
-            let own = cfa.color(x, y);
-            px[1] = gc;
-            for c in [0u8, 2] {
-                if own == c {
-                    px[c as usize] = cfa.at(xi, yi);
-                    continue;
-                }
-                // Nearest same-colour samples within radius 1, else 2, weighted by
-                // inverse distance, interpolating their difference to green.
-                let mut sum = 0.;
-                let mut total = 0.;
-                for radius in 1..=2isize {
-                    for dy in -radius..=radius {
-                        for dx in -radius..=radius {
-                            if dx.abs().max(dy.abs()) != radius
-                                || cfa.color_at(xi + dx, yi + dy) != c
-                            {
-                                continue;
-                            }
-                            let wgt = 1. / ((dx * dx + dy * dy) as f32).sqrt();
-                            sum += (cfa.at(xi + dx, yi + dy) - g(xi + dx, yi + dy)) * wgt;
-                            total += wgt;
-                        }
-                    }
-                    if total > 0. {
-                        break;
-                    }
-                }
-                px[c as usize] = gc + if total > 0. { sum / total } else { 0. };
+        if !bayer || y == 0 || y + 1 >= h || w < 3 {
+            for (x, px) in row.iter_mut().enumerate() {
+                *px = border_pixel(x, y);
+            }
+            return;
+        }
+        row[0] = border_pixel(0, y);
+        let yp = y & 1;
+        let row_cells = cell[yp];
+        let adj_cells = cell[yp ^ 1];
+        let cfa_u = &cfa.data[(y - 1) * w..y * w];
+        let cfa_c = &cfa.data[y * w..(y + 1) * w];
+        let cfa_d = &cfa.data[(y + 1) * w..(y + 2) * w];
+        let g_u = &green[(y - 1) * w..y * w];
+        let g_c = &green[y * w..(y + 1) * w];
+        let g_d = &green[(y + 1) * w..(y + 2) * w];
+        for (i, px) in row[1..w - 1].iter_mut().enumerate() {
+            let x = i + 1;
+            let xp = x & 1;
+            let own = row_cells[xp];
+            let gc = g_c[x];
+            px[1] = gc.max(0.);
+            if own == 1 {
+                let ch = usize::from(row_cells[xp ^ 1]);
+                let cv = usize::from(adj_cells[xp]);
+                let hc = ((cfa_c[x - 1] - g_c[x - 1]) + (cfa_c[x + 1] - g_c[x + 1])) * 0.5;
+                let vc = ((cfa_u[x] - g_u[x]) + (cfa_d[x] - g_d[x])) * 0.5;
+                px[ch] = (gc + hc).max(0.);
+                px[cv] = (gc + vc).max(0.);
+            } else {
+                let opp = usize::from(2 - own);
+                let d0 = cfa_u[x - 1] - g_u[x - 1];
+                let d1 = cfa_u[x + 1] - g_u[x + 1];
+                let d2 = cfa_d[x - 1] - g_d[x - 1];
+                let d3 = cfa_d[x + 1] - g_d[x + 1];
+                px[usize::from(own)] = cfa_c[x].max(0.);
+                let sum = ((d0 * diag_wgt + d1 * diag_wgt) + d2 * diag_wgt) + d3 * diag_wgt;
+                px[opp] = (gc + sum / diag_total).max(0.);
             }
         }
+        row[w - 1] = border_pixel(w - 1, y);
     });
     out
 }

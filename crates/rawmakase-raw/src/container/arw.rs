@@ -16,6 +16,7 @@ use crate::sensor::Sensor;
 use crate::variant::{Plan, Variant};
 use crate::vendor::sony;
 use rawmakase_cancel::Cancel;
+use rayon::prelude::*;
 
 /// Where an ARW's sensor data is and how it is coded.
 #[derive(Clone, Debug, Default)]
@@ -309,49 +310,58 @@ pub(crate) fn decode(
         Variant::ArwCurve => {
             crate::codec::sony::arw2(strip(0)?, width, height, &mut data, cancel)?;
             let curve = crate::codec::sony::tone_curve(plan.curve);
-            for v in &mut data {
-                *v = curve[usize::from(*v) * 2];
-            }
+            data.par_chunks_mut(65_536).for_each(|chunk| {
+                for v in chunk {
+                    *v = curve[usize::from(*v) * 2];
+                }
+            });
         }
         Variant::ArwUncompressed => {
             let src = strip(0)?;
-            for (y, (row, dst)) in src
-                .chunks(width * 2)
-                .zip(data.chunks_exact_mut(width))
+            src.par_chunks(width * 2)
+                .zip(data.par_chunks_exact_mut(width))
                 .enumerate()
-            {
-                if y % 256 == 0 && cancel.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                for (d, c) in dst.iter_mut().zip(row.as_chunks::<2>().0) {
-                    *d = if plan.little {
-                        u16::from_le_bytes(*c)
+                .try_for_each(|(y, (row, dst))| {
+                    if y % 64 == 0 && cancel.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    if plan.little {
+                        for (d, c) in dst.iter_mut().zip(row.as_chunks::<2>().0) {
+                            *d = u16::from_le_bytes(*c);
+                        }
                     } else {
-                        u16::from_be_bytes(*c)
-                    };
-                }
-            }
+                        for (d, c) in dst.iter_mut().zip(row.as_chunks::<2>().0) {
+                            *d = u16::from_be_bytes(*c);
+                        }
+                    }
+                    Ok(())
+                })?;
         }
         Variant::ArwPacked => {
             let src = strip(0)?;
-            for (y, (row, dst)) in src
-                .chunks(width / 2 * 3)
-                .zip(data.chunks_exact_mut(width))
-                .enumerate()
-            {
-                if y % 256 == 0 && cancel.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                crate::codec::sony::packed12(row, dst);
+            let row_bytes = width / 2 * 3;
+            if row_bytes > 0 {
+                src.par_chunks(row_bytes)
+                    .zip(data.par_chunks_exact_mut(width))
+                    .enumerate()
+                    .try_for_each(|(y, (row, dst))| {
+                        if y % 64 == 0 && cancel.is_cancelled() {
+                            return Err(Error::Cancelled);
+                        }
+                        crate::codec::sony::packed12(row, dst);
+                        Ok(())
+                    })?;
             }
         }
         Variant::ArwLosslessJpeg => ljpeg_tiles(plan, &strip, &mut data, cancel)?,
         Variant::ArwV6 => {
             crate::codec::arw6::decode(strip(0)?, width, height, &mut data, cancel)?;
             let curve = crate::codec::arw6::curve();
-            for v in &mut data {
-                *v = curve[usize::from(*v).min(4095)];
-            }
+            data.par_chunks_mut(65_536).for_each(|chunk| {
+                for v in chunk {
+                    *v = curve[usize::from(*v).min(4095)];
+                }
+            });
         }
         Variant::ArwV1 => crate::codec::sony::arw1(strip(0)?, width, height, &mut data, cancel)?,
         Variant::ArwYcbcr => ycbcr_tiles(plan, &strip, &mut data, cancel)?,
@@ -389,54 +399,54 @@ pub(crate) fn decode(
 /// chroma samples per MCU, as red, green, blue and an empty fourth channel.
 fn ycbcr_tiles<'a>(
     plan: &ArwPlan,
-    strip: &impl Fn(usize) -> Result<&'a [u8]>,
+    strip: &(impl Fn(usize) -> Result<&'a [u8]> + Sync),
     rgb: &mut [u16],
     cancel: Cancel<'_>,
 ) -> Result<()> {
-    let (width, height) = (plan.width as usize, plan.height as usize);
+    let width = plan.width as usize;
     let [tw, th] = plan.tile.map(|v| v as usize);
     let across = width.div_ceil(tw);
-    let tiles = across * height.div_ceil(th);
+    let tiles = across * (plan.height as usize).div_ceil(th);
     if plan.chunks.len() < tiles {
         return Err(corrupt("ARW tile count"));
     }
-    let mut samples = Vec::new();
-    for i in 0..tiles {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let tile = strip(i)?;
-        let mut h = ljpeg::header(tile)?;
-        h.block_rows = true;
-        let [luma, cb, cr] = h.components[..] else {
-            return Err(Error::Unsupported("ARW YCbCr tile components".into()));
-        };
-        let (bw, bh) = (usize::from(luma.h), usize::from(luma.v));
-        if [cb.h, cb.v, cr.h, cr.v] != [1; 4] || bw > 2 || bh > 2 {
-            return Err(Error::Unsupported("ARW YCbCr sampling".into()));
-        }
-        ljpeg::decode_into(&h, tile, cancel, &mut samples)?;
-        let (mcus, _) = h.mcus();
-        let per = h.samples_per_mcu();
-        let (x0, y0) = ((i % across) * tw, (i / across) * th);
-        for ty in 0..th.min(usize::from(h.height)) {
-            let y = y0 + ty;
-            if y >= height {
-                break;
-            }
-            for tx in 0..tw.min(usize::from(h.width)) {
-                let x = x0 + tx;
-                if x >= width {
-                    break;
+    rgb.par_chunks_mut(th * width * 4)
+        .enumerate()
+        .try_for_each_init(Vec::new, |samples, (row, band)| -> Result<()> {
+            let band_rows = band.len() / (width * 4);
+            for col in 0..across {
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
                 }
-                let mcu = &samples[((ty / bh) * mcus + tx / bw) * per..][..per];
-                let luma = mcu[(ty % bh) * bw + tx % bw];
-                let [r, g, b] = crate::codec::sony::ycbcr_rgb(luma, mcu[bw * bh], mcu[bw * bh + 1]);
-                rgb[(y * width + x) * 4..][..3].copy_from_slice(&[r, g, b]);
+                let tile = strip(row * across + col)?;
+                let mut h = ljpeg::header(tile)?;
+                h.block_rows = true;
+                let [luma, cb, cr] = h.components[..] else {
+                    return Err(Error::Unsupported("ARW YCbCr tile components".into()));
+                };
+                let (bw, bh) = (usize::from(luma.h), usize::from(luma.v));
+                if [cb.h, cb.v, cr.h, cr.v] != [1; 4] || bw > 2 || bh > 2 {
+                    return Err(Error::Unsupported("ARW YCbCr sampling".into()));
+                }
+                ljpeg::decode_into(&h, tile, cancel, samples)?;
+                let (mcus, _) = h.mcus();
+                let per = h.samples_per_mcu();
+                let x0 = col * tw;
+                let w = tw.min(usize::from(h.width)).min(width - x0);
+                for ty in 0..band_rows.min(usize::from(h.height)) {
+                    let dst_row = &mut band[ty * width * 4..(ty + 1) * width * 4];
+                    for tx in 0..w {
+                        let x = x0 + tx;
+                        let mcu = &samples[((ty / bh) * mcus + tx / bw) * per..][..per];
+                        let luma = mcu[(ty % bh) * bw + tx % bw];
+                        let [r, g, b] =
+                            crate::codec::sony::ycbcr_rgb(luma, mcu[bw * bh], mcu[bw * bh + 1]);
+                        dst_row[x * 4..][..3].copy_from_slice(&[r, g, b]);
+                    }
+                }
             }
-        }
-    }
-    Ok(())
+            Ok(())
+        })
 }
 
 /// Lossless JPEG tiles: each a frame half the tile's width and height whose
@@ -444,49 +454,53 @@ fn ycbcr_tiles<'a>(
 /// bottom left, bottom right).
 fn ljpeg_tiles<'a>(
     plan: &ArwPlan,
-    strip: &impl Fn(usize) -> Result<&'a [u8]>,
+    strip: &(impl Fn(usize) -> Result<&'a [u8]> + Sync),
     data: &mut [u16],
     cancel: Cancel<'_>,
 ) -> Result<()> {
-    let (width, height) = (plan.width as usize, plan.height as usize);
+    let width = plan.width as usize;
     let [tw, th] = plan.tile.map(|v| v as usize);
     let across = width.div_ceil(tw);
-    let tiles = across * height.div_ceil(th);
+    let tiles = across * (plan.height as usize).div_ceil(th);
     if plan.chunks.len() < tiles {
         return Err(corrupt("ARW tile count"));
     }
-    let mut samples = Vec::new();
-    for i in 0..tiles {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let tile = strip(i)?;
-        let h = ljpeg::header(tile)?;
-        if h.components.len() != 4 || h.samples_per_mcu() != 4 {
-            return Err(Error::Unsupported(
-                "ARW lossless JPEG tile without four components".into(),
-            ));
-        }
-        ljpeg::decode_into(&h, tile, cancel, &mut samples)?;
-        let (fw, fh) = (usize::from(h.width), usize::from(h.height));
-        let (x0, y0) = ((i % across) * tw, (i / across) * th);
-        for fy in 0..fh.min(th / 2) {
-            for k in 0..4 {
-                let y = y0 + 2 * fy + (k >> 1);
-                if y >= height {
-                    continue;
+    data.par_chunks_mut(th * width)
+        .enumerate()
+        .try_for_each_init(Vec::new, |samples, (row, band)| -> Result<()> {
+            let band_rows = band.len() / width;
+            for col in 0..across {
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
                 }
-                let row = &mut data[y * width..(y + 1) * width];
-                for fx in 0..fw.min(tw / 2) {
-                    let x = x0 + 2 * fx + (k & 1);
-                    if x < width {
-                        row[x] = samples[(fy * fw + fx) * 4 + k];
+                let tile = strip(row * across + col)?;
+                let h = ljpeg::header(tile)?;
+                if h.components.len() != 4 || h.samples_per_mcu() != 4 {
+                    return Err(Error::Unsupported(
+                        "ARW lossless JPEG tile without four components".into(),
+                    ));
+                }
+                ljpeg::decode_into(&h, tile, cancel, samples)?;
+                let (fw, fh) = (usize::from(h.width), usize::from(h.height));
+                let x0 = col * tw;
+                for fy in 0..fh.min(th / 2) {
+                    for k in 0..4 {
+                        let ly = 2 * fy + (k >> 1);
+                        if ly >= band_rows {
+                            continue;
+                        }
+                        let dst_row = &mut band[ly * width..(ly + 1) * width];
+                        for fx in 0..fw.min(tw / 2) {
+                            let x = x0 + 2 * fx + (k & 1);
+                            if x < width {
+                                dst_row[x] = samples[(fy * fw + fx) * 4 + k];
+                            }
+                        }
                     }
                 }
             }
-        }
-    }
-    Ok(())
+            Ok(())
+        })
 }
 
 #[cfg(test)]
