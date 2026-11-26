@@ -309,7 +309,7 @@ impl Editor {
             raw,
             source,
             from_editable_preview: self.document.opened_from_preview(),
-            recipe: self.document.edit.recipe().clone(),
+            recipe: Arc::clone(self.document.edit.recipe_arc()),
             export: self.document.export.clone(),
             history: self
                 .document
@@ -403,24 +403,23 @@ impl Editor {
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
-    pub(in crate::app) fn effective_recipe(&self) -> Recipe {
+    pub(in crate::app) fn effective_recipe(&self) -> Arc<Recipe> {
         let mut r = if self.view.compare.renders_before_alone() {
-            self.before_settings()
+            Arc::new(self.before_settings())
+        } else if let Some(preview) = &self.presets.preview {
+            Arc::new(preview.clone())
         } else {
-            self.presets
-                .preview
-                .as_ref()
-                .unwrap_or(self.document.edit.recipe())
-                .clone()
+            Arc::clone(self.document.edit.recipe_arc())
         };
         if self.view.is(crate::app::develop::state::Tool::Crop) {
             // The whole photo, white areas included, around the crop being drawn.
-            r.crop = [0., 0., 1., 1.];
-            r.constrain_crop = false;
+            let crop = Arc::make_mut(&mut r);
+            crop.crop = [0., 0., 1., 1.];
+            crop.constrain_crop = false;
         }
         // Switched-off panels as rendered, so viewport geometry matches the photo shown.
         if !r.panels.all_on() {
-            r = r.as_rendered().into_owned();
+            r = Arc::new(r.as_rendered().into_owned());
         }
         r
     }
@@ -499,20 +498,20 @@ impl Editor {
         if let Some(image) = image {
             self.yield_before();
             self.yield_magnifier();
-            let region = self.region();
+            let mut recipe = self.effective_recipe();
+            let geometry = Geometry::new(&image, &recipe, 0);
+            let region = self.region_in(&geometry);
             self.preview.last_region = region;
-            let geometry = Geometry::new(&image, &self.effective_recipe(), 0);
             let RenderEdges { fit, max_edge } = self.render_edges(&geometry);
             self.preview.last_fit_edge = fit;
             // Visualize Range renders the selected swatch's selection instead of its
             // adjustment; never as the photo's thumbnail.
-            let mut recipe = self.effective_recipe();
             let visualize = self
                 .visualized_swatch()
                 .and_then(|i| crate::model::point_color::visualize_range(&recipe.point_colors, i));
             let thumbnail = region.is_none() && self.shows_library_edit() && visualize.is_none();
             if let Some(list) = visualize {
-                recipe.point_colors = list;
+                Arc::make_mut(&mut recipe).point_colors = list;
             }
             let view = crate::app::develop::state::RenderView {
                 image: Arc::downgrade(&image),
@@ -527,7 +526,9 @@ impl Editor {
                 Change::Edit => last.is_some_and(|v| v.same(&view)),
                 Change::Pan => {
                     last.is_some_and(|v| v.panned(&view))
-                        && self.preview.pending.recipe.as_ref() == Some(&recipe)
+                        && self.preview.pending.recipe.as_ref().is_some_and(|pending| {
+                            Arc::ptr_eq(pending, &recipe) || *pending == recipe
+                        })
                 }
             };
             self.preview.last_view = Some(view);
@@ -542,7 +543,7 @@ impl Editor {
             let (id, cancel) = self.preview.start(
                 let_finish,
                 crate::app::develop::state::Pending {
-                    recipe: Some(recipe.clone()),
+                    recipe: Some(Arc::clone(&recipe)),
                     mode: region.map_or(
                         crate::app::develop::state::TextureMode::Whole,
                         crate::app::develop::state::TextureMode::Region,

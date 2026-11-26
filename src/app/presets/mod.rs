@@ -484,7 +484,7 @@ impl Editor {
                 .as_ref()
                 .map(|m| m as &dyn crate::xmp::PhotoMeasures),
         )?;
-        let before = self.document.edit.replace(recipe);
+        let before = std::sync::Arc::unwrap_or_clone(self.document.edit.replace(recipe));
         self.ensure_analysis();
         // The settings before it are kept once, and every Amount is computed
         // from them again, so dragging never drifts.

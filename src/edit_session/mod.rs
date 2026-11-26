@@ -6,6 +6,7 @@ pub(crate) mod save_state;
 use crate::model::recipe::Recipe;
 use history::{History, Step};
 use save_state::SaveState;
+use std::sync::Arc;
 
 /// Whether a drag, a wheel scroll or a dial turn is still changing the settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,10 +19,15 @@ pub(crate) enum Gesture {
 
 /// The settings as a frame of the editor found them, from [`EditSession::begin`].
 pub(crate) struct Frame {
-    before: Recipe,
+    before: Arc<Recipe>,
 }
 impl Frame {
+    #[cfg(test)]
     pub(crate) fn before(&self) -> &Recipe {
+        &self.before
+    }
+    #[cfg(test)]
+    pub(crate) fn before_arc(&self) -> &Arc<Recipe> {
         &self.before
     }
 }
@@ -38,7 +44,7 @@ pub(crate) enum FrameOutcome {
 /// came to be, and whether they still need saving.
 #[derive(Default)]
 pub(crate) struct EditSession {
-    recipe: Recipe,
+    recipe: Arc<Recipe>,
     history: History,
     save: SaveState,
     /// An editor frame is open (see [`EditSession::begin`]): the settings may be
@@ -52,6 +58,14 @@ impl EditSession {
     pub(crate) fn recipe(&self) -> &Recipe {
         &self.recipe
     }
+    /// The current settings snapshot as a shared allocation.
+    pub(crate) fn recipe_arc(&self) -> &Arc<Recipe> {
+        &self.recipe
+    }
+    /// Whether the current settings match `frame`'s initial snapshot.
+    pub(crate) fn unchanged(&self, frame: &Frame) -> bool {
+        history::same_recipe(&self.recipe, &frame.before)
+    }
     /// The settings to change in place, while an editor frame is open: the frame
     /// records the change as a History step, marks it for saving and turns on a
     /// switched-off panel it changed. Outside a frame, [`Self::change`] does that.
@@ -60,13 +74,13 @@ impl EditSession {
             self.frame_open,
             "the settings change in place only inside an editor frame; use change()"
         );
-        &mut self.recipe
+        Arc::make_mut(&mut self.recipe)
     }
     /// The settings, for a test to set up the photo it then edits; records
     /// nothing.
     #[cfg(test)]
     pub(crate) fn setup_mut(&mut self) -> &mut Recipe {
-        &mut self.recipe
+        Arc::make_mut(&mut self.recipe)
     }
     /// Changes the settings outside an editor frame (a command, a preset, a result
     /// computed off the UI thread) as one History step, `step` or one named for what
@@ -76,23 +90,29 @@ impl EditSession {
         step: Option<Step>,
         edit: impl FnOnce(&mut Recipe) -> T,
     ) -> T {
-        let before = self.recipe.clone();
-        let out = edit(&mut self.recipe);
+        let before = Arc::clone(&self.recipe);
+        let out = edit(Arc::make_mut(&mut self.recipe));
         // A change that changed nothing is no step, and names none.
-        if self.recipe != before {
+        if !history::same_recipe(&self.recipe, &before) {
             self.commit(before, step);
+        } else {
+            self.recipe = before;
         }
         out
     }
     /// The settings, to store what was analysed from the photo (Upright's
     /// corrections, Guided's solution) rather than an edit: no History step.
     pub(crate) fn analysed_mut(&mut self) -> &mut Recipe {
-        &mut self.recipe
+        Arc::make_mut(&mut self.recipe)
     }
     /// Starts over with `recipe`, recording nothing: a photo opened, a snapshot or
     /// History state shown, settings read back. History and save state are the
     /// caller's to set alongside, as the case needs.
-    pub(crate) fn replace(&mut self, recipe: Recipe) -> Recipe {
+    pub(crate) fn replace(&mut self, recipe: Recipe) -> Arc<Recipe> {
+        self.replace_arc(Arc::new(recipe))
+    }
+    /// Starts over with a shared `recipe` snapshot, recording nothing.
+    pub(crate) fn replace_arc(&mut self, recipe: Arc<Recipe>) -> Arc<Recipe> {
         self.set_whole(|s| std::mem::replace(&mut s.recipe, recipe))
     }
     /// Counts the times setting the settings as a whole (a photo, preset, snapshot
@@ -104,9 +124,9 @@ impl EditSession {
     }
     /// Sets the settings as a whole with `set`, counting a change of masks.
     fn set_whole<T>(&mut self, set: impl FnOnce(&mut Self) -> T) -> T {
-        let masks = self.recipe.masks.clone();
+        let before = Arc::clone(&self.recipe);
         let out = set(self);
-        if self.recipe.masks != masks {
+        if !Arc::ptr_eq(&before, &self.recipe) && self.recipe.masks != before.masks {
             self.mask_lists += 1;
         }
         out
@@ -133,7 +153,7 @@ impl EditSession {
         let Some(before) = self.history.drop_gesture() else {
             return false;
         };
-        let changed = before != self.recipe;
+        let changed = !history::same_recipe(&before, &self.recipe);
         self.set_whole(|s| s.recipe = before);
         changed
     }
@@ -142,7 +162,7 @@ impl EditSession {
     /// its own.
     pub(crate) fn finish_gesture_before(&mut self, frame: &Frame) {
         if self.history.in_gesture() {
-            self.history.finish_gesture(frame.before());
+            self.history.finish_gesture(&frame.before);
             self.save.mark_changed();
         }
     }
@@ -161,16 +181,16 @@ impl EditSession {
     }
     /// Returns the settings to `target`, the state History has at `at`, as the step
     /// `step` (Undo of a catalog command, say).
-    pub(crate) fn restore(&mut self, at: history::Mark, target: &Recipe, step: Step) {
-        let changed = self.recipe != *target;
+    pub(crate) fn restore(&mut self, at: history::Mark, target: &Arc<Recipe>, step: Step) {
+        let changed = !history::same_recipe(&self.recipe, target);
         self.set_whole(|s| s.history.restore(at, target, &mut s.recipe, step));
         if changed {
             self.save.mark_changed();
         }
     }
     /// Sets the settings to `target` as History step `step`, to be saved.
-    pub(crate) fn set(&mut self, target: &Recipe, step: Step) {
-        let changed = self.recipe != *target;
+    pub(crate) fn set(&mut self, target: &Arc<Recipe>, step: Step) {
+        let changed = !history::same_recipe(&self.recipe, target);
         self.set_whole(|s| s.history.set(target, &mut s.recipe, step));
         if changed {
             self.save.mark_changed();
@@ -179,7 +199,7 @@ impl EditSession {
     /// The settings and every state History keeps, to bring all up to date at once
     /// (Upright's analysis arriving, say).
     pub(crate) fn states_mut(&mut self) -> impl Iterator<Item = &mut Recipe> {
-        std::iter::once(&mut self.recipe).chain(self.history.states_mut())
+        std::iter::once(Arc::make_mut(&mut self.recipe)).chain(self.history.states_mut())
     }
     /// The History of how the settings came to be.
     pub(crate) fn history(&self) -> &History {
@@ -216,8 +236,14 @@ impl EditSession {
     /// Records the change from `before` to the current settings as one History
     /// step, named `step` or for what changed, to be saved. Returns whether the
     /// settings changed.
-    pub(crate) fn commit(&mut self, before: Recipe, step: Option<Step>) -> bool {
-        crate::model::edit::turn_on_edited_panel(&before, &mut self.recipe);
+    pub(crate) fn commit(&mut self, before: impl Into<Arc<Recipe>>, step: Option<Step>) -> bool {
+        let before = before.into();
+        if !history::same_recipe(&before, &self.recipe)
+            && !before.panels.all_on()
+            && !self.recipe.panels.all_on()
+        {
+            crate::model::edit::turn_on_edited_panel(&before, Arc::make_mut(&mut self.recipe));
+        }
         if let Some(step) = step {
             self.history.label(step);
         }
@@ -232,7 +258,7 @@ impl EditSession {
         self.frame_open = true;
         self.history.begin_frame();
         Frame {
-            before: self.recipe.clone(),
+            before: Arc::clone(&self.recipe),
         }
     }
     /// Ends `frame`: an edit made while a `gesture` is held is recorded once it is
@@ -240,8 +266,19 @@ impl EditSession {
     /// edit that changed only a switched-off panel turns it on.
     pub(crate) fn finish(&mut self, frame: Frame, gesture: Gesture) -> FrameOutcome {
         self.frame_open = false;
-        if !self.history.is_replaying() {
-            crate::model::edit::turn_on_edited_panel(&frame.before, &mut self.recipe);
+        let unchanged = history::same_recipe(&frame.before, &self.recipe);
+        if unchanged {
+            if !self.history.is_replaying() && !Arc::ptr_eq(&frame.before, &self.recipe) {
+                self.recipe = Arc::clone(&frame.before);
+            }
+        } else if !self.history.is_replaying()
+            && !frame.before.panels.all_on()
+            && !self.recipe.panels.all_on()
+        {
+            crate::model::edit::turn_on_edited_panel(
+                &frame.before,
+                Arc::make_mut(&mut self.recipe),
+            );
         }
         let held = gesture == Gesture::Held;
         if self.history.observe(frame.before, &self.recipe, held) {
@@ -338,10 +375,10 @@ mod tests {
         assert!(session.jump(0));
         assert!(session.save_state().needs_save());
         session.save_state_mut().saved();
-        let target = Recipe {
+        let target = Arc::new(Recipe {
             exposure: 2.,
             ..session.recipe().clone()
-        };
+        });
         session.set(&target, Step::new("Undo", ""));
         assert!(session.save_state().needs_save());
         // Setting what is already there needs no save.
@@ -377,8 +414,8 @@ mod tests {
     #[test]
     fn a_discarded_gesture_leaves_the_settings_and_history_as_they_were() {
         let mut session = EditSession::default();
-        let before = session.recipe.clone();
-        session.recipe.exposure = 0.3;
+        let before = Arc::clone(&session.recipe);
+        session.setup_mut().exposure = 0.3;
         session.commit(before, None);
         let frame = session.begin();
         session.recipe_mut().exposure = 1.;
@@ -406,8 +443,8 @@ mod tests {
     #[test]
     fn a_commit_is_one_named_step_to_save() {
         let mut session = EditSession::default();
-        let before = session.recipe.clone();
-        session.recipe.exposure = 1.;
+        let before = Arc::clone(&session.recipe);
+        session.setup_mut().exposure = 1.;
         assert!(session.commit(before, Some(Step::new("Auto Settings", ""))));
         let (steps, applied) = session.history.steps();
         assert_eq!((steps[0].name.as_str(), applied), ("Auto Settings", 1));
@@ -417,13 +454,13 @@ mod tests {
     #[test]
     fn a_commit_that_changes_nothing_records_and_saves_nothing() {
         let mut session = EditSession::default();
-        let before = session.recipe.clone();
+        let before = Arc::clone(&session.recipe);
         assert!(!session.commit(before, Some(Step::new("Straighten", "Auto"))));
         assert_eq!(session.history.steps().1, 0);
         assert!(!session.save.needs_save());
         // Its name is not left for the next edit.
-        let before = session.recipe.clone();
-        session.recipe.exposure = 1.;
+        let before = Arc::clone(&session.recipe);
+        session.setup_mut().exposure = 1.;
         session.commit(before, None);
         assert_ne!(session.history.steps().0[0].name, "Straighten");
     }
@@ -432,15 +469,133 @@ mod tests {
     fn a_gesture_is_saved_as_it_goes_and_recorded_once_it_ends() {
         let mut session = EditSession::default();
         let frame = session.begin();
-        session.recipe.exposure = 0.5;
+        session.recipe_mut().exposure = 0.5;
         assert_eq!(session.finish(frame, Gesture::Held), FrameOutcome::Edited);
         assert!(session.save.needs_save());
         assert_eq!(session.history.steps().1, 0);
         let frame = session.begin();
-        session.recipe.exposure = 1.;
+        session.recipe_mut().exposure = 1.;
         session.finish(frame, Gesture::Released);
         assert_eq!(session.history.steps().1, 1);
         assert!(session.history.undo(&mut session.recipe));
         assert_eq!(session.recipe.exposure, 0.);
+    }
+
+    #[test]
+    fn unchanged_frames_and_history_navigation_share_recipe_arcs() {
+        let mut session = EditSession::default();
+        let initial = Arc::clone(session.recipe_arc());
+
+        // Untouched frame keeps the exact same Arc allocation.
+        let frame = session.begin();
+        assert!(Arc::ptr_eq(frame.before_arc(), &initial));
+        assert_eq!(
+            session.finish(frame, Gesture::Released),
+            FrameOutcome::Unchanged
+        );
+        assert!(Arc::ptr_eq(session.recipe_arc(), &initial));
+
+        // Even if recipe_mut() detached via COW for a no-op write, finishing unchanged restores sharing.
+        let frame = session.begin();
+        let exposure = session.recipe().exposure;
+        session.recipe_mut().exposure = exposure;
+        assert!(!Arc::ptr_eq(session.recipe_arc(), frame.before_arc()));
+        assert_eq!(
+            session.finish(frame, Gesture::Released),
+            FrameOutcome::Unchanged
+        );
+        assert!(Arc::ptr_eq(session.recipe_arc(), &initial));
+
+        // Recording a step shares before/after Arcs into History and Recorded, and navigation reuses them.
+        let frame = session.begin();
+        session.recipe_mut().exposure = 0.75;
+        let edited = Arc::clone(session.recipe_arc());
+        assert_eq!(
+            session.finish(frame, Gesture::Released),
+            FrameOutcome::Edited
+        );
+        assert!(Arc::ptr_eq(session.recipe_arc(), &edited));
+
+        let recorded = session.take_recorded();
+        assert_eq!(recorded.len(), 1);
+        assert!(Arc::ptr_eq(&recorded[0].before, &initial));
+        assert!(Arc::ptr_eq(&recorded[0].after, &edited));
+
+        assert!(session.undo());
+        assert!(Arc::ptr_eq(session.recipe_arc(), &initial));
+        assert!(session.jump(1));
+        assert!(Arc::ptr_eq(session.recipe_arc(), &edited));
+
+        let target = Arc::new(Recipe {
+            contrast: 0.4,
+            ..Default::default()
+        });
+        session.set(&target, Step::new("Preset", "Test"));
+        assert!(Arc::ptr_eq(session.recipe_arc(), &target));
+
+        // Restoring an earlier mark in History returns to the exact shared Arc.
+        session.restore(recorded[0].at_before, &initial, Step::new("Undo", ""));
+        assert!(Arc::ptr_eq(session.recipe_arc(), &initial));
+
+        // Discarding a held gesture restores the shared initial Arc.
+        let frame = session.begin();
+        session.recipe_mut().exposure = 1.5;
+        session.finish(frame, Gesture::Held);
+        assert!(session.discard_gesture());
+        assert!(Arc::ptr_eq(session.recipe_arc(), &initial));
+    }
+
+    #[test]
+    fn mutating_via_recipe_mut_triggers_cow_without_mutating_frame_or_history() {
+        let mut session = EditSession::default();
+        let initial = Arc::clone(session.recipe_arc());
+
+        // Mutating inside a frame leaves Frame::before untouched via COW.
+        let frame = session.begin();
+        assert!(Arc::ptr_eq(frame.before_arc(), &initial));
+        session.recipe_mut().exposure = 1.25;
+        assert!(!Arc::ptr_eq(session.recipe_arc(), frame.before_arc()));
+        assert_eq!(frame.before().exposure, 0.);
+        assert_eq!(initial.exposure, 0.);
+        assert_eq!(
+            session.finish(frame, Gesture::Released),
+            FrameOutcome::Edited
+        );
+
+        let after_step_1 = Arc::clone(session.recipe_arc());
+        let recorded = session.take_recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].before.exposure, 0.);
+        assert_eq!(recorded[0].after.exposure, 1.25);
+
+        // Undoing back to `initial` and mutating in a new frame leaves stored History and Recorded intact.
+        assert!(session.undo());
+        assert!(Arc::ptr_eq(session.recipe_arc(), &initial));
+        let frame = session.begin();
+        session.recipe_mut().exposure = -0.5;
+        assert!(!Arc::ptr_eq(session.recipe_arc(), &initial));
+        assert_eq!(initial.exposure, 0.);
+        assert_eq!(recorded[0].before.exposure, 0.);
+        assert_eq!(recorded[0].after.exposure, 1.25);
+        assert_eq!(after_step_1.exposure, 1.25);
+        assert_eq!(
+            session.finish(frame, Gesture::Released),
+            FrameOutcome::Edited
+        );
+
+        // states_mut() and analysed_mut() detach shared snapshots rather than mutating Recorded in place.
+        let recorded_2 = session.take_recorded();
+        assert_eq!(recorded_2[0].before.exposure, 0.);
+        assert_eq!(recorded_2[0].after.exposure, -0.5);
+        session.analysed_mut().upright.corrections = vec![[1.; 9]];
+        assert!(recorded_2[0].after.upright.corrections.is_empty());
+        for state in session.states_mut() {
+            state.upright.corrections = vec![[2.; 9]];
+        }
+        assert!(recorded_2[0].before.upright.corrections.is_empty());
+        assert!(recorded_2[0].after.upright.corrections.is_empty());
+        assert!(session.undo());
+        assert_eq!(session.recipe().exposure, 0.);
+        assert_eq!(session.recipe().upright.corrections, vec![[2.; 9]]);
     }
 }

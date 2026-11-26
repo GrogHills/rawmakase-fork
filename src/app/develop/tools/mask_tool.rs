@@ -682,9 +682,10 @@ impl Editor {
     fn developed_lab(&self, pos: Pos2, rect: Rect) -> Option<[f32; 3]> {
         let im = self.document.full()?;
         let mut r = self.effective_recipe();
+        let r = std::sync::Arc::make_mut(&mut r);
         r.masks.clear();
         r.sharpening = 0.;
-        let g = crate::develop::Geometry::new(im, &r, 0);
+        let g = crate::develop::Geometry::new(im, r, 0);
         let (w, h) = (3.min(g.width), 3.min(g.height));
         let u = ((pos.x - rect.left()) / rect.width()).clamp(0., 1.);
         let v = ((pos.y - rect.top()) / rect.height()).clamp(0., 1.);

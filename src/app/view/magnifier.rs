@@ -81,7 +81,7 @@ impl Magnifier {
 #[derive(Clone)]
 struct MagnifierJob {
     image: Arc<CameraImage>,
-    recipe: Recipe,
+    recipe: Arc<Recipe>,
     /// The AI Denoise source the render captured: a newer result renders again.
     ai: Option<crate::develop::AiSource>,
     region: [u32; 4],
@@ -91,7 +91,7 @@ struct MagnifierJob {
 impl PartialEq for MagnifierJob {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.image, &other.image)
-            && self.recipe == other.recipe
+            && (Arc::ptr_eq(&self.recipe, &other.recipe) || self.recipe == other.recipe)
             && self.ai == other.ai
             && self.region == other.region
             && self.monitor == other.monitor
@@ -447,7 +447,7 @@ impl Editor {
     fn schedule_magnifier(
         &mut self,
         image: Arc<CameraImage>,
-        recipe: Recipe,
+        recipe: Arc<Recipe>,
         region: [u32; 4],
         max_edge: u32,
     ) {
@@ -455,7 +455,7 @@ impl Editor {
         let recipe = if recipe.panels.all_on() {
             recipe
         } else {
-            recipe.as_rendered().into_owned()
+            Arc::new(recipe.as_rendered().into_owned())
         };
         let ai = self.shown_ai_source(&image, &recipe.ai_denoise);
         let job = MagnifierJob {

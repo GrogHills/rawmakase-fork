@@ -3,8 +3,15 @@
 use crate::model::recipe::Recipe;
 use crate::model::saved_history::{SavedHistory, SavedStep};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 const LIMIT: usize = 100;
+
+/// Whether two recipes are identical, short-circuiting when they refer to the same allocation.
+#[inline]
+pub(super) fn same_recipe(a: &Recipe, b: &Recipe) -> bool {
+    std::ptr::eq(a, b) || a == b
+}
 
 /// A History panel entry: what changed, and its new value when there is one.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -40,8 +47,8 @@ pub(crate) struct Mark {
 pub(crate) struct Recorded {
     /// Orders it among Library commands made in the same frame.
     pub sequence: u64,
-    pub before: Recipe,
-    pub after: Recipe,
+    pub before: Arc<Recipe>,
+    pub after: Arc<Recipe>,
     pub at_before: Mark,
     pub at_after: Mark,
 }
@@ -57,10 +64,10 @@ pub(crate) struct History {
     /// Changes not yet handed to the shared undo log.
     recorded: Vec<Recorded>,
     /// States before each step, oldest first, with the step that left them.
-    undo: VecDeque<(Recipe, Step)>,
+    undo: VecDeque<(Arc<Recipe>, Step)>,
     /// States after each undone step, the next one last.
-    redo: Vec<(Recipe, Step)>,
-    gesture: Option<Recipe>,
+    redo: Vec<(Arc<Recipe>, Step)>,
+    gesture: Option<Arc<Recipe>>,
     replaying: bool,
     /// The name for the next recorded step; otherwise it is derived.
     label: Option<Step>,
@@ -93,18 +100,21 @@ impl History {
     /// A drag still in progress is saved as the step it will become, without being
     /// recorded yet, so a save that fails leaves the drag going.
     pub(crate) fn saved(&self, current: &Recipe) -> SavedHistory {
-        let gesture = self.gesture.as_ref().filter(|before| *before != current);
+        let gesture = self
+            .gesture
+            .as_ref()
+            .filter(|before| !same_recipe(before, current));
         let mut done: Vec<_> = self
             .undo
             .iter()
-            .map(|(r, step)| (r, step.clone()))
+            .map(|(r, step)| (r.as_ref(), step.clone()))
             .collect();
         if let Some(before) = gesture {
             let step = self
                 .label
                 .clone()
                 .unwrap_or_else(|| describe(before, current));
-            done.push((before, step));
+            done.push((before.as_ref(), step));
         }
         let mut steps: Vec<SavedStep> = done
             .iter()
@@ -112,7 +122,7 @@ impl History {
             .map(|(i, (_, step))| SavedStep {
                 name: step.name.clone(),
                 value: step.value.clone(),
-                recipe: done.get(i + 1).map_or(current, |(r, _)| r).clone(),
+                recipe: done.get(i + 1).map_or(current, |(r, _)| *r).clone(),
             })
             .collect();
         // Finishing the drag will drop the steps undone before it.
@@ -120,7 +130,7 @@ impl History {
             steps.extend(self.redo.iter().rev().map(|(r, step)| SavedStep {
                 name: step.name.clone(),
                 value: step.value.clone(),
-                recipe: r.clone(),
+                recipe: (**r).clone(),
             }));
         }
         SavedHistory {
@@ -137,8 +147,8 @@ impl History {
             .undo
             .iter()
             .chain(&self.redo)
-            .map(|(r, _)| r)
-            .chain(&self.gesture)
+            .map(|(r, _)| r.as_ref())
+            .chain(self.gesture.as_deref())
             .chain(std::iter::once(current))
         {
             for id in recipe.mask_asset_ids() {
@@ -156,39 +166,42 @@ impl History {
         let mut history = Self::default();
         let SavedHistory {
             origin,
-            steps,
+            mut steps,
             applied,
         } = saved;
         let applied = applied.min(steps.len());
         // Oldest steps beyond the limit are dropped, as when they were recorded.
         let skip = applied.saturating_sub(LIMIT);
         let mut before = if skip == 0 {
-            origin
+            Arc::new(origin)
         } else {
-            steps[skip - 1].recipe.clone()
+            let mut skipped = steps.drain(..skip);
+            Arc::new(skipped.next_back().expect("skip <= steps.len()").recipe)
         };
         let mut redo = Vec::new();
-        for (i, saved) in steps.into_iter().enumerate().skip(skip) {
+        for (i, saved) in steps.into_iter().enumerate() {
             let step = Step {
                 name: saved.name,
                 value: saved.value,
                 state: next_state(),
             };
-            if i < applied {
+            let recipe = Arc::new(saved.recipe);
+            if skip + i < applied {
                 history
                     .undo
-                    .push_back((std::mem::replace(&mut before, saved.recipe), step));
+                    .push_back((std::mem::replace(&mut before, recipe), step));
             } else {
-                redo.push((saved.recipe, step));
+                redo.push((recipe, step));
             }
         }
         history.dropped = skip;
         history.origin = next_state();
         history.redo = redo.into_iter().rev().collect();
-        if before != *current {
-            let mut shown = before;
-            let step = describe(&shown, current);
-            history.set(current, &mut shown, step);
+        if !same_recipe(&before, current) {
+            let step = describe(&before, current);
+            history.replaying = true;
+            history.label(step);
+            history.push(before, current);
         }
         history
     }
@@ -207,15 +220,15 @@ impl History {
         std::mem::take(&mut self.recorded)
     }
     /// A click on a History step: `go_to`, recorded as one change.
-    pub(crate) fn jump(&mut self, applied: usize, current: &mut Recipe) -> bool {
-        let (before, at_before) = (current.clone(), self.mark());
+    pub(crate) fn jump(&mut self, applied: usize, current: &mut Arc<Recipe>) -> bool {
+        let (before, at_before) = (Arc::clone(current), self.mark());
         if !self.go_to(applied, current) {
             return false;
         }
         self.recorded.push(Recorded {
             sequence: super::sequence(),
             before,
-            after: current.clone(),
+            after: Arc::clone(current),
             at_before,
             at_after: self.mark(),
         });
@@ -223,7 +236,13 @@ impl History {
     }
     /// Undo or redo from the shared log: back to state `at` when it is still
     /// here; otherwise `target` is set as a new step named `step`.
-    pub(crate) fn restore(&mut self, at: Mark, target: &Recipe, current: &mut Recipe, step: Step) {
+    pub(crate) fn restore(
+        &mut self,
+        at: Mark,
+        target: &Arc<Recipe>,
+        current: &mut Arc<Recipe>,
+        step: Step,
+    ) {
         // Not an edit of the user's for `observe` to record.
         self.replaying = true;
         // History's own states are kept up to date (e.g. by Upright's
@@ -252,9 +271,9 @@ impl History {
     }
     /// Sets `target` as a new step named `step`, without handing it to the
     /// shared undo log.
-    pub(crate) fn set(&mut self, target: &Recipe, current: &mut Recipe, step: Step) {
+    pub(crate) fn set(&mut self, target: &Arc<Recipe>, current: &mut Arc<Recipe>, step: Step) {
         self.replaying = true;
-        let before = std::mem::replace(current, target.clone());
+        let before = std::mem::replace(current, Arc::clone(target));
         self.label(step);
         self.push(before, current);
     }
@@ -278,19 +297,19 @@ impl History {
     pub(crate) fn state(&self, applied: usize, current: &Recipe) -> Option<Recipe> {
         let now = self.undo.len();
         match applied.cmp(&now) {
-            std::cmp::Ordering::Less => Some(self.undo[applied].0.clone()),
+            std::cmp::Ordering::Less => Some((*self.undo[applied].0).clone()),
             std::cmp::Ordering::Equal => Some(current.clone()),
             std::cmp::Ordering::Greater => self
                 .redo
                 .iter()
                 .rev()
                 .nth(applied - now - 1)
-                .map(|(r, _)| r.clone()),
+                .map(|(r, _)| (**r).clone()),
         }
     }
     /// Undoes or redoes until `applied` steps are applied, as clicking a
     /// History step in Lightroom does. Later steps stay until a new edit.
-    pub(crate) fn go_to(&mut self, applied: usize, current: &mut Recipe) -> bool {
+    pub(crate) fn go_to(&mut self, applied: usize, current: &mut Arc<Recipe>) -> bool {
         let mut moved = false;
         while self.undo.len() > applied && self.undo(current) {
             moved = true;
@@ -314,14 +333,14 @@ impl History {
     /// Records a pointer gesture still in progress, up to `current`, so a step made
     /// outside the UI (an asynchronous result) lands after it; the rest of the drag
     /// becomes a step of its own.
-    pub(crate) fn finish_gesture(&mut self, current: &Recipe) {
+    pub(crate) fn finish_gesture(&mut self, current: &Arc<Recipe>) {
         if let Some(before) = self.gesture.take() {
             self.record(before, current);
         }
     }
     /// Forgets a pointer gesture still in progress, recording nothing, and
     /// returns the settings it began from.
-    pub(crate) fn drop_gesture(&mut self) -> Option<Recipe> {
+    pub(crate) fn drop_gesture(&mut self) -> Option<Arc<Recipe>> {
         self.gesture.take()
     }
     /// Undo, redo or a History click changed the recipe this frame, not an edit.
@@ -332,25 +351,25 @@ impl History {
         self.replaying = false;
     }
 
-    pub(crate) fn record(&mut self, before: Recipe, after: &Recipe) -> bool {
+    pub(crate) fn record(&mut self, before: Arc<Recipe>, after: &Arc<Recipe>) -> bool {
         let at_before = self.mark();
-        let recorded = before.clone();
+        let recorded = Arc::clone(&before);
         if !self.push(before, after) {
             return false;
         }
         self.recorded.push(Recorded {
             sequence: super::sequence(),
             before: recorded,
-            after: after.clone(),
+            after: Arc::clone(after),
             at_before,
             at_after: self.mark(),
         });
         true
     }
     /// Adds a step without handing it to the shared undo log.
-    fn push(&mut self, before: Recipe, after: &Recipe) -> bool {
+    fn push(&mut self, before: Arc<Recipe>, after: &Recipe) -> bool {
         let label = self.label.take();
-        if before == *after {
+        if same_recipe(&before, after) {
             return false;
         }
         let mut step = label.unwrap_or_else(|| describe(&before, after));
@@ -365,7 +384,7 @@ impl History {
         self.redo.clear();
         true
     }
-    pub(crate) fn undo(&mut self, current: &mut Recipe) -> bool {
+    pub(crate) fn undo(&mut self, current: &mut Arc<Recipe>) -> bool {
         self.replaying = true;
         self.gesture = None;
         let Some((previous, step)) = self.undo.pop_back() else {
@@ -374,7 +393,7 @@ impl History {
         self.redo.push((std::mem::replace(current, previous), step));
         true
     }
-    pub(crate) fn redo(&mut self, current: &mut Recipe) -> bool {
+    pub(crate) fn redo(&mut self, current: &mut Arc<Recipe>) -> bool {
         self.replaying = true;
         self.gesture = None;
         let Some((next, step)) = self.redo.pop() else {
@@ -390,12 +409,17 @@ impl History {
         self.undo
             .iter_mut()
             .chain(self.redo.iter_mut())
-            .map(|(r, _)| r)
-            .chain(self.gesture.as_mut())
+            .map(|(r, _)| Arc::make_mut(r))
+            .chain(self.gesture.as_mut().map(Arc::make_mut))
     }
     /// Observe UI edits after drawing. Undo/redo must not create a new undo entry.
-    pub(crate) fn observe(&mut self, before: Recipe, after: &Recipe, pointer_down: bool) -> bool {
-        let changed = before != *after;
+    pub(crate) fn observe(
+        &mut self,
+        before: Arc<Recipe>,
+        after: &Arc<Recipe>,
+        pointer_down: bool,
+    ) -> bool {
+        let changed = !same_recipe(&before, after);
         if changed && !self.replaying {
             if pointer_down {
                 self.gesture.get_or_insert(before);
@@ -620,9 +644,11 @@ mod tests {
     fn a_panel_switch_is_one_step_named_as_lightroom_names_it() {
         use crate::model::panels::{Panel, PanelState};
         let mut history = History::default();
-        let mut recipe = Recipe::default();
-        let before = recipe.clone();
-        recipe.panels.set(Panel::ToneCurve, PanelState::Off);
+        let mut recipe = Arc::new(Recipe::default());
+        let before = Arc::clone(&recipe);
+        Arc::make_mut(&mut recipe)
+            .panels
+            .set(Panel::ToneCurve, PanelState::Off);
         history.record(before, &recipe);
         assert_eq!(history.undo.len(), 1);
         let step = &history.undo[0].1;
@@ -630,8 +656,10 @@ mod tests {
             (step.name.as_str(), step.value.as_str()),
             ("Enable Tone Curve", "No")
         );
-        let off = recipe.clone();
-        recipe.panels.set(Panel::ColorMixer, PanelState::Off);
+        let off = Arc::clone(&recipe);
+        Arc::make_mut(&mut recipe)
+            .panels
+            .set(Panel::ColorMixer, PanelState::Off);
         assert_eq!(
             describe(&off, &recipe),
             Step::new("Enable Color Adjustments", "No")
@@ -644,17 +672,17 @@ mod tests {
     #[test]
     fn drag_is_one_undo_step_and_replay_does_not_record_itself() {
         let mut history = History::default();
-        let mut recipe = Recipe::default();
-        let original = recipe.clone();
+        let mut recipe = Arc::new(Recipe::default());
+        let original = Arc::clone(&recipe);
         for value in [0.25, 0.5, 1.] {
             history.begin_frame();
-            let before = recipe.clone();
-            recipe.exposure = value;
+            let before = Arc::clone(&recipe);
+            Arc::make_mut(&mut recipe).exposure = value;
             assert!(history.observe(before, &recipe, true));
         }
-        history.observe(recipe.clone(), &recipe, false);
+        history.observe(Arc::clone(&recipe), &recipe, false);
         assert_eq!(history.undo.len(), 1);
-        let before = recipe.clone();
+        let before = Arc::clone(&recipe);
         assert!(history.undo(&mut recipe));
         assert_eq!(recipe, original);
         history.observe(before, &recipe, false);
@@ -666,16 +694,16 @@ mod tests {
     #[test]
     fn new_edit_discards_redo_and_history_is_bounded() {
         let mut history = History::default();
-        let mut recipe = Recipe::default();
+        let mut recipe = Arc::new(Recipe::default());
         for step in 1..=150 {
-            let before = recipe.clone();
-            recipe.exposure = step as f32 / 100.;
+            let before = Arc::clone(&recipe);
+            Arc::make_mut(&mut recipe).exposure = step as f32 / 100.;
             history.record(before, &recipe);
         }
         assert_eq!(history.undo.len(), LIMIT);
         history.undo(&mut recipe);
-        let before = recipe.clone();
-        recipe.exposure = -1.;
+        let before = Arc::clone(&recipe);
+        Arc::make_mut(&mut recipe).exposure = -1.;
         history.record(before, &recipe);
         assert!(!history.can_redo());
         for _ in 0..LIMIT {
@@ -687,18 +715,18 @@ mod tests {
     #[test]
     fn unchanged_gesture_and_document_reset_leave_no_history() {
         let mut history = History::default();
-        let recipe = Recipe::default();
-        let mut changed = recipe.clone();
-        changed.exposure = 1.;
-        history.observe(recipe.clone(), &changed, true);
+        let recipe = Arc::new(Recipe::default());
+        let mut changed = Arc::clone(&recipe);
+        Arc::make_mut(&mut changed).exposure = 1.;
+        history.observe(Arc::clone(&recipe), &changed, true);
         history.observe(changed, &recipe, false);
         assert!(!history.can_undo());
         history.observe(
-            recipe.clone(),
-            &Recipe {
+            Arc::clone(&recipe),
+            &Arc::new(Recipe {
                 exposure: 1.,
                 ..Default::default()
-            },
+            }),
             true,
         );
         history = History::default();
@@ -765,12 +793,12 @@ mod tests {
     #[test]
     fn saved_history_restores_steps_position_and_redo() {
         let mut history = History::default();
-        let mut recipe = Recipe::default();
-        let original = recipe.clone();
+        let mut recipe = Arc::new(Recipe::default());
+        let original = Arc::clone(&recipe);
         for (name, value) in [("Exposure", 0.5), ("Exposure", 1.), ("Exposure", 1.5)] {
             history.label(Step::new(name, format!("{value:+.2}")));
-            let before = recipe.clone();
-            recipe.exposure = value;
+            let before = Arc::clone(&recipe);
+            Arc::make_mut(&mut recipe).exposure = value;
             history.record(before, &recipe);
         }
         history.undo(&mut recipe);
@@ -787,8 +815,8 @@ mod tests {
         assert_eq!(recipe, original);
         // Editing an earlier state starts a new branch, as before.
         restored.go_to(1, &mut recipe);
-        let before = recipe.clone();
-        recipe.contrast = 0.2;
+        let before = Arc::clone(&recipe);
+        Arc::make_mut(&mut recipe).contrast = 0.2;
         restored.record(before, &recipe);
         assert_eq!(restored.steps().0.len(), 2);
         assert!(!restored.can_redo());
@@ -796,9 +824,9 @@ mod tests {
     #[test]
     fn an_edit_changed_elsewhere_becomes_the_latest_step() {
         let mut history = History::default();
-        let mut recipe = Recipe::default();
-        let before = recipe.clone();
-        recipe.exposure = 0.5;
+        let mut recipe = Arc::new(Recipe::default());
+        let before = Arc::clone(&recipe);
+        Arc::make_mut(&mut recipe).exposure = 0.5;
         history.record(before, &recipe);
         let saved = history.saved(&recipe);
         // Changed by Undo while another photo was open.
@@ -811,23 +839,23 @@ mod tests {
         let (steps, applied) = restored.steps();
         assert_eq!(applied, 2);
         assert_eq!(steps[1].name, "White Balance");
-        let mut current = pasted;
+        let mut current = Arc::new(pasted);
         assert!(restored.undo(&mut current));
         assert_eq!(current, recipe);
     }
     #[test]
     fn each_state_reads_back_done_or_undone_without_moving() {
         let mut history = History::default();
-        let mut recipe = Recipe::default();
-        let mut states = vec![recipe.clone()];
+        let mut recipe = Arc::new(Recipe::default());
+        let mut states = vec![(*recipe).clone()];
         for value in [0.5, 1., 1.5] {
-            let before = recipe.clone();
-            recipe.exposure = value;
+            let before = Arc::clone(&recipe);
+            Arc::make_mut(&mut recipe).exposure = value;
             history.record(before, &recipe);
-            states.push(recipe.clone());
+            states.push((*recipe).clone());
         }
         history.undo(&mut recipe);
-        let shown = recipe.clone();
+        let shown = Arc::clone(&recipe);
         for (applied, state) in states.iter().enumerate() {
             assert_eq!(history.state(applied, &recipe).as_ref(), Some(state));
         }
@@ -839,14 +867,14 @@ mod tests {
     #[test]
     fn steps_are_named_and_go_to_moves_between_them() {
         let mut history = History::default();
-        let mut recipe = Recipe::default();
-        let original = recipe.clone();
+        let mut recipe = Arc::new(Recipe::default());
+        let original = Arc::clone(&recipe);
         history.label(Step::new("Exposure", "+0.50"));
-        let before = recipe.clone();
-        recipe.exposure = 0.5;
+        let before = Arc::clone(&recipe);
+        Arc::make_mut(&mut recipe).exposure = 0.5;
         history.record(before, &recipe);
-        let before = recipe.clone();
-        recipe.temperature += 100.;
+        let before = Arc::clone(&recipe);
+        Arc::make_mut(&mut recipe).temperature += 100.;
         history.record(before, &recipe);
         let (steps, applied) = history.steps();
         let names: Vec<_> = steps.iter().map(|s| s.name.as_str()).collect();
@@ -879,20 +907,20 @@ mod tests {
                     ..Default::default()
                 });
             }
-            recipe
+            Arc::new(recipe)
         };
         let mut history = History::default();
         let mut current = with_masks(&["shared", "a"]);
-        let before = current.clone();
+        let before = Arc::clone(&current);
         current = with_masks(&["shared", "b"]);
         history.record(before, &current);
-        let before = current.clone();
+        let before = Arc::clone(&current);
         current = with_masks(&["c"]);
         history.record(before, &current);
         assert!(history.undo(&mut current));
         history.begin_frame();
         let gesture_after = with_masks(&["d"]);
-        history.observe(current.clone(), &gesture_after, true);
+        history.observe(Arc::clone(&current), &gesture_after, true);
         current = gesture_after;
         let ids = history.mask_asset_ids(&current);
         let expected: std::collections::HashSet<String> = ["shared", "a", "b", "c", "d"]
@@ -900,5 +928,76 @@ mod tests {
             .map(str::to_owned)
             .collect();
         assert_eq!(ids, expected);
+    }
+    #[test]
+    fn record_undo_redo_and_go_to_share_arc_pointers() {
+        let mut history = History::default();
+        let s0 = Arc::new(Recipe::default());
+        let mut s1 = Arc::clone(&s0);
+        Arc::make_mut(&mut s1).exposure = 0.5;
+        assert!(history.record(Arc::clone(&s0), &s1));
+
+        let mut s2 = Arc::clone(&s1);
+        Arc::make_mut(&mut s2).contrast = 0.2;
+        assert!(history.record(Arc::clone(&s1), &s2));
+
+        let recorded = history.take_recorded();
+        assert_eq!(recorded.len(), 2);
+        assert!(Arc::ptr_eq(&recorded[0].before, &s0));
+        assert!(Arc::ptr_eq(&recorded[0].after, &s1));
+        assert!(Arc::ptr_eq(&recorded[1].before, &s1));
+        assert!(Arc::ptr_eq(&recorded[1].after, &s2));
+        assert!(Arc::ptr_eq(&history.undo[0].0, &s0));
+        assert!(Arc::ptr_eq(&history.undo[1].0, &s1));
+
+        let mut current = Arc::clone(&s2);
+        assert!(history.undo(&mut current));
+        assert!(Arc::ptr_eq(&current, &s1));
+        assert!(Arc::ptr_eq(&history.redo[0].0, &s2));
+
+        assert!(history.undo(&mut current));
+        assert!(Arc::ptr_eq(&current, &s0));
+        assert!(Arc::ptr_eq(&history.redo[1].0, &s1));
+
+        assert!(history.redo(&mut current));
+        assert!(Arc::ptr_eq(&current, &s1));
+
+        assert!(history.jump(2, &mut current));
+        assert!(Arc::ptr_eq(&current, &s2));
+        let jumped = history.take_recorded();
+        assert_eq!(jumped.len(), 1);
+        assert!(Arc::ptr_eq(&jumped[0].before, &s1));
+        assert!(Arc::ptr_eq(&jumped[0].after, &s2));
+
+        assert!(history.go_to(0, &mut current));
+        assert!(Arc::ptr_eq(&current, &s0));
+    }
+    #[test]
+    fn gesture_observe_and_release_share_arc_pointers() {
+        let mut history = History::default();
+        let start = Arc::new(Recipe::default());
+        let mut mid = Arc::clone(&start);
+        Arc::make_mut(&mut mid).exposure = 0.25;
+        history.begin_frame();
+        assert!(history.observe(Arc::clone(&start), &mid, true));
+        assert!(
+            history
+                .gesture
+                .as_ref()
+                .is_some_and(|g| Arc::ptr_eq(g, &start))
+        );
+
+        let mut end = Arc::clone(&mid);
+        Arc::make_mut(&mut end).exposure = 0.75;
+        history.begin_frame();
+        assert!(history.observe(mid, &end, false));
+
+        assert!(!history.in_gesture());
+        assert_eq!(history.undo.len(), 1);
+        assert!(Arc::ptr_eq(&history.undo[0].0, &start));
+        let recorded = history.take_recorded();
+        assert_eq!(recorded.len(), 1);
+        assert!(Arc::ptr_eq(&recorded[0].before, &start));
+        assert!(Arc::ptr_eq(&recorded[0].after, &end));
     }
 }

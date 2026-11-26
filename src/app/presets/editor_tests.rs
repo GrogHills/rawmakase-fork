@@ -228,9 +228,9 @@ fn preset_amount_scales_the_preset_from_the_settings_before_it() {
     assert_ne!(steps[applied - 1].name, "Preset Amount");
     // Undo ends it too.
     let frame = editor.begin_edit_frame();
-    let mut recipe = editor.document.edit.recipe().clone();
+    let mut recipe = std::sync::Arc::clone(editor.document.edit.recipe_arc());
     editor.document.edit.history_mut().undo(&mut recipe);
-    editor.document.edit.replace(recipe);
+    editor.document.edit.replace_arc(recipe);
     editor.finish_edit_frame(frame, &ctx);
     assert!(editor.presets.amount.is_none());
     // An edit earlier in the frame the slider moves in (a mask's name kept as the

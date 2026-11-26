@@ -160,7 +160,7 @@ pub(in crate::app) fn to_after(pos: Pos2, before: Rect, after: Rect) -> Pos2 {
 #[derive(Clone)]
 struct BeforeJob {
     image: Arc<CameraImage>,
-    recipe: Recipe,
+    recipe: Arc<Recipe>,
     /// The AI Denoise source the render captured: a newer result renders again.
     ai: Option<crate::develop::AiSource>,
     region: Option<[u32; 4]>,
@@ -179,7 +179,7 @@ pub(in crate::app) struct SecondSide<'a> {
 impl PartialEq for BeforeJob {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.image, &other.image)
-            && self.recipe == other.recipe
+            && (Arc::ptr_eq(&self.recipe, &other.recipe) || self.recipe == other.recipe)
             && self.ai == other.ai
             && self.region == other.region
             && self.max_edge == other.max_edge
@@ -343,22 +343,28 @@ impl Editor {
     }
     /// What the side beside the edit renders: Before, or the reference photo, with
     /// the zoom it is shown at.
-    fn second_side(&self) -> Option<(Arc<CameraImage>, Recipe, crate::app::view::navigator::Zoom)> {
+    fn second_side(
+        &self,
+    ) -> Option<(
+        Arc<CameraImage>,
+        Arc<Recipe>,
+        crate::app::view::navigator::Zoom,
+    )> {
         if !self.view.compare.two_up() {
             return None;
         }
         let (image, recipe, zoom) = if self.view.compare.reference() {
             let side = self.reference_side()?;
-            (side.image, side.recipe, self.reference.zoom)
+            (side.image, Arc::new(side.recipe), self.reference.zoom)
         } else {
             let image = self.document.full()?.clone();
-            (image, self.before_settings(), self.view.zoom)
+            (image, Arc::new(self.before_settings()), self.view.zoom)
         };
         // Switched-off panels left out, as the edit's.
         let recipe = if recipe.panels.all_on() {
             recipe
         } else {
-            recipe.as_rendered().into_owned()
+            Arc::new(recipe.as_rendered().into_owned())
         };
         Some((image, recipe, zoom))
     }

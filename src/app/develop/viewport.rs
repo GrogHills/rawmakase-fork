@@ -533,7 +533,12 @@ impl Editor {
             && rect.contains(pos)
         {
             // And the final render, not a reduced draft of it.
-            if self.preview.samples_recipe.as_ref() == Some(&self.effective_recipe())
+            let effective = self.effective_recipe();
+            if self
+                .preview
+                .samples_recipe
+                .as_ref()
+                .is_some_and(|s| std::sync::Arc::ptr_eq(s, &effective) || *s == effective)
                 && !self.preview.task.is_running()
             {
                 let u = (pos.x - rect.left()) / rect.width();
@@ -552,7 +557,12 @@ impl Editor {
             && rect.contains(pos)
         {
             // The samples must come from the settings the pick is mapped through.
-            let current = self.preview.samples_recipe.as_ref() == Some(&self.effective_recipe())
+            let effective = self.effective_recipe();
+            let current = self
+                .preview
+                .samples_recipe
+                .as_ref()
+                .is_some_and(|s| std::sync::Arc::ptr_eq(s, &effective) || *s == effective)
                 && self.document.full().is_some();
             match self.shown_color(pos, rect, region_rect).filter(|_| current) {
                 Some(rgb) => match develop::pick_fringe(self.document.edit.recipe_mut(), rgb) {

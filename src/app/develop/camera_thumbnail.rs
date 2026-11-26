@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(e.view.compare, Compare::CameraThumbnail);
         assert!(e.view.compare.before_only(), "the panels are disabled");
         assert_eq!(
-            e.effective_recipe(),
+            *e.effective_recipe(),
             *e.document.edit.recipe(),
             "the photo is still the edit, not Before"
         );

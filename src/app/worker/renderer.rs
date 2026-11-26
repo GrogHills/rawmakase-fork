@@ -74,7 +74,7 @@ fn same_ai(cached: &Option<SameImage>, job: &Option<develop::AiSource>) -> bool 
 struct Shown {
     image: SameImage,
     ai: Option<SameImage>,
-    recipe: Recipe,
+    recipe: Arc<Recipe>,
     max_edge: u32,
     region: Option<[u32; 4]>,
     clipping: crate::rendered::ClipOverlay,
@@ -98,7 +98,7 @@ impl Shown {
         Self {
             image: SameImage::of(&job.image),
             ai: job.ai.as_ref().map(|a| SameImage::of(a.image())),
-            recipe: job.recipe.clone(),
+            recipe: Arc::clone(&job.recipe),
             max_edge: job.max_edge,
             region: job.region,
             clipping: job.clipping,
@@ -114,7 +114,7 @@ impl Shown {
             && same_ai(&self.ai, &job.ai)
             && self.max_edge == job.max_edge
             && self.region == job.region
-            && self.recipe == job.recipe
+            && (Arc::ptr_eq(&self.recipe, &job.recipe) || self.recipe == job.recipe)
             && self.overlay == job.overlay;
         match &self.out {
             Shot::Pixels(_) => same,
@@ -577,7 +577,8 @@ fn render(
                         && zoomed.as_ref().is_some_and(|s| {
                             s.image.matches(&job.image)
                                 && same_ai(&s.ai, &job.ai)
-                                && s.recipe.ai_denoise == job.recipe.ai_denoise
+                                && (Arc::ptr_eq(&s.recipe, &job.recipe)
+                                    || s.recipe.ai_denoise == job.recipe.ai_denoise)
                         });
                     if editing && !*quick_region {
                         let out = processor.render_region_preview_to(
@@ -672,7 +673,7 @@ fn render(
 type Histogram = Box<crate::rendered::Histogram>;
 /// A whole photo's histogram and what it was rendered from: the image, its AI Denoise
 /// source and the edit.
-type WholeHistogram = (SameImage, Option<SameImage>, Recipe, Histogram);
+type WholeHistogram = (SameImage, Option<SameImage>, Arc<Recipe>, Histogram);
 
 /// At 100% the view shows a region, but the histogram describes the whole
 /// photo, as Lightroom's does: from the Fit render of the same edit when there
@@ -686,8 +687,10 @@ fn whole_histogram(
     tx: &Sender<Event>,
     ctx: &egui::Context,
 ) -> anyhow::Result<()> {
-    let same = |image: &SameImage, ai: &Option<SameImage>, recipe: &Recipe| {
-        image.matches(&job.image) && same_ai(ai, &job.ai) && *recipe == job.recipe
+    let same = |image: &SameImage, ai: &Option<SameImage>, recipe: &Arc<Recipe>| {
+        image.matches(&job.image)
+            && same_ai(ai, &job.ai)
+            && (Arc::ptr_eq(recipe, &job.recipe) || *recipe == job.recipe)
     };
     let histogram =
         if let Some((.., histogram)) = whole.as_ref().filter(|(i, a, r, _)| same(i, a, r)) {
@@ -711,7 +714,7 @@ fn whole_histogram(
     *whole = Some((
         SameImage::of(&job.image),
         job.ai.as_ref().map(|a| SameImage::of(a.image())),
-        job.recipe.clone(),
+        Arc::clone(&job.recipe),
         histogram.clone(),
     ));
     if !job.cancel.load(Ordering::Relaxed) {
@@ -802,7 +805,7 @@ mod tests {
             image: image.clone(),
             max_edge,
             cancel: Arc::new(AtomicBool::new(false)),
-            recipe: recipe.clone(),
+            recipe: Arc::new(recipe.clone()),
             region,
             monitor: None,
             clipping: crate::rendered::ClipOverlay::NONE,
@@ -1031,7 +1034,7 @@ mod tests {
             image: Arc::new(broken),
             max_edge: 60,
             cancel: Arc::new(AtomicBool::new(false)),
-            recipe: recipe.clone(),
+            recipe: Arc::new(recipe.clone()),
             region: None,
             monitor: None,
             clipping: crate::rendered::ClipOverlay::NONE,
@@ -1069,7 +1072,7 @@ mod tests {
                 image: image.clone(),
                 max_edge: 60,
                 cancel: Arc::new(AtomicBool::new(false)),
-                recipe: recipe.clone(),
+                recipe: Arc::new(recipe.clone()),
                 region,
                 monitor: None,
                 clipping: crate::rendered::ClipOverlay::NONE,

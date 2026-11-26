@@ -77,7 +77,7 @@ pub(in crate::app) struct Document {
     /// Basic panel does not rebuild what Auto measures on every frame.
     ///
     /// [`Editor::auto_in_effect`]: crate::app::Editor::auto_in_effect
-    pub(in crate::app) auto_effect: std::cell::RefCell<Option<(Recipe, bool)>>,
+    pub(in crate::app) auto_effect: std::cell::RefCell<Option<(Arc<Recipe>, bool)>>,
     /// The Transform panel's Upright analysis for this photo.
     pub(in crate::app) upright: crate::app::task::Task,
     /// The Crop panel's Auto straighten analysis for this photo.
@@ -173,7 +173,7 @@ impl From<egui::TextureHandle> for Picture {
 pub(in crate::app) struct Pending {
     /// What the pixels are rendered with, Visualize Range included, so a picker
     /// never takes a gray preview for the photo.
-    pub(in crate::app) recipe: Option<Recipe>,
+    pub(in crate::app) recipe: Option<Arc<Recipe>>,
     pub(in crate::app) mode: TextureMode,
     pub(in crate::app) crop: [f32; 4],
     /// The AI Denoise result the render was given.
@@ -236,7 +236,7 @@ pub(in crate::app) struct PreviewState {
     /// Whether renders keep their samples: while a loupe or the readout reads them.
     pub(in crate::app) samples_requested: bool,
     /// The recipe the shown samples were rendered with.
-    pub(in crate::app) samples_recipe: Option<Recipe>,
+    pub(in crate::app) samples_recipe: Option<Arc<Recipe>>,
     /// What the latest render was asked for, applied to its result when it lands.
     pub(in crate::app) pending: Pending,
     /// Earlier renders an edit let finish (see `Task::supersede`), oldest first: those

@@ -133,7 +133,7 @@ fn red_eye_tool_adds_moves_and_deletes_one_history_step_each() {
     assert_eq!(ops.len(), 1);
     assert_eq!(names.last().unwrap(), "Delete Red Eye Correction");
     // Undo brings it back where it was.
-    let mut recipe = editor.document.edit.recipe().clone();
+    let mut recipe = Arc::clone(editor.document.edit.recipe_arc());
     assert!(editor.document.edit.history_mut().undo(&mut recipe));
     assert_eq!(recipe.red_eye.len(), 2);
     assert!((recipe.red_eye[0].center[0] - 0.35).abs() < 0.005);

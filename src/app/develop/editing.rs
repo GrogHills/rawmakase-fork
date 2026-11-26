@@ -95,7 +95,7 @@ impl Editor {
                 .iter()
                 .any(|e| matches!(e, egui::Event::PointerButton { .. }))
         });
-        let edit = if *self.document.edit.recipe() == *frame.edit.before() && !clicked {
+        let edit = if self.document.edit.unchanged(&frame.edit) && !clicked {
             crate::app::develop::tools::brush_scroll::Edit::Unchanged
         } else {
             crate::app::develop::tools::brush_scroll::Edit::Changed
@@ -105,7 +105,7 @@ impl Editor {
         }
         if self.automation.has_turn()
             && !frame.command_adjust
-            && (*self.document.edit.recipe() != *frame.edit.before() || clicked)
+            && (!self.document.edit.unchanged(&frame.edit) || clicked)
         {
             self.automation.end_turn();
             self.document.edit.finish_gesture_before(&frame.edit);
@@ -142,7 +142,7 @@ impl Editor {
         }
         // A conversion waiting for the photo, once it is decoded and nothing else
         // changed this frame (any edit drops it below).
-        if *self.document.edit.recipe() == *frame.edit.before() {
+        if self.document.edit.unchanged(&frame.edit) {
             self.finish_pending_treatment();
         }
         // A wheel scroll sizing a spot is a gesture like a drag: one step once it pauses.
@@ -184,7 +184,7 @@ impl Editor {
     /// for what changed, with what an edit frame does after a slider moves.
     pub(in crate::app) fn commit_edit(
         &mut self,
-        before: Recipe,
+        before: impl Into<std::sync::Arc<Recipe>>,
         step: Option<crate::app::history::Step>,
     ) {
         if self.document.edit.commit(before, step) {
@@ -201,9 +201,10 @@ impl Editor {
         step: Option<crate::app::history::Step>,
         edit: impl FnOnce(&mut Recipe) -> T,
     ) -> T {
-        let before = self.document.edit.recipe().clone();
+        let before = std::sync::Arc::clone(self.document.edit.recipe_arc());
         let out = self.document.edit.change(step, edit);
-        if *self.document.edit.recipe() != before {
+        let current = self.document.edit.recipe_arc();
+        if !std::sync::Arc::ptr_eq(current, &before) && **current != *before {
             self.edited();
         }
         self.end_stale_preset_amount();

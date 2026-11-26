@@ -422,7 +422,7 @@ pub(crate) struct RenderJob {
     pub image: Arc<CameraImage>,
     pub max_edge: u32,
     pub cancel: Arc<AtomicBool>,
-    pub recipe: Recipe,
+    pub recipe: Arc<Recipe>,
     pub region: Option<[u32; 4]>,
     pub monitor: Option<PathBuf>,
     /// The clipping warnings painted over the shown pixels.
