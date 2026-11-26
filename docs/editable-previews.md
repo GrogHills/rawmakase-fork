@@ -278,9 +278,51 @@ dependency direction changes, and the measurement in
 ## Risks
 
 - **Measured tone.** The scene tone stage and Auto measure the photo from a
-  full-resolution copy (`Toned::measured`). From an editable preview the measures
-  are of 2560 px, so Auto and the default black may differ slightly from the
-  original's. Measure how much and say so; never re-bless references for it.
+  full-resolution copy (`Toned::measured`), and from an editable preview that copy
+  is of the 2560 px image. Both read reduced copies (the stage 512 px and 128 px,
+  Auto 1024 px of at most 2048), so the difference is small. Measured 2026-11-07
+  (`editable_preview::measured_tone`) on 25 CC0 RAWs from 11 makes of
+  `tests/corpus/pixls.json`, chosen by the rule that test states. Decision 3's own
+  list was not recorded, so this set is a reconstruction, not necessarily the same
+  files. Each preview was built as the app builds it and read back as Develop opens
+  an offline photo. Both were developed with the built-in profile from
+  `Recipe::for_metadata`, not with user defaults, an installed DCP or a fitted Camera
+  Look. Lossless and Smaller give the same Auto values; other figures are
+  Lossless's, with Smaller's where they differ.
+  - Auto estimates Exposure, Highlights, Shadows, Whites, Blacks and Saturation
+    (Contrast and Vibrance are constants). From the editable preview it sets the
+    same values as from the original on every photo, except Whites on one photo,
+    which is 1 lower (mean |Δ| 0.04, p95 0, max 1). Exposure differs by 0.00 EV on
+    every photo.
+  - The test compares the same reductions of both images, by luminance of camera
+    RGB, a proxy for the stage's own values, which are internal. They hold the same
+    light: the 0.1th percentile, which the default black follows, differs by at most
+    0.04 stops (0.16 with Smaller's dither), and the brightest channel by at most
+    0.03. The 99th percentile, which Whites reads, differs by at most 0.13 stops, on
+    one photo (p95 0.003). The darkest level, which Blacks reads, differs by at most
+    0.22 stops (p95 0.06, mean 0.03). In the default render, the darkest 0.1% of
+    16 px blocks differ by at most 0.27 L* (mean 0.05).
+  - Rendered at 2560 px with detail off, the original and the preview differ by
+    ΔE2000 0.18 on average over 16 px blocks for the default edit (p99 1.43 at the
+    p95 photo, 1.67 on the worst). For the Auto edit the difference is 0.22 (p99
+    1.48 at the p95 photo). That changes by at most 0.001 on average when both
+    images take the original's Auto values (0.03 on the one photo whose Whites
+    differs), so the Auto values add almost nothing. The measures can't be swapped between the two images, so their share is
+    bounded rather than isolated. A different measure moves tone in flat areas as
+    much as anywhere. In flat blocks (L* deviation under 2 within the block), the
+    default edit differs by 0.05 on average, p99 at most 0.66 on the worst photo.
+    The Auto edit, whose Blacks reads the darkest level, differs there by 0.08,
+    p99 0.55 at the p95 photo (Smaller 0.63). The largest differences are in blocks
+    of fine detail, which a 2560 px image renders differently from a full-size one.
+    Per pixel, that detail makes renders of the default edit differ more (mean 1.2,
+    worst photo's p99 14.5).
+
+  So the measured tone of an offline edit differs from its original's by about the
+  flat-block figures above: for the default edit, under 1 ΔE2000 in 99% of flat
+  blocks on every photo; for the Auto edit, p99 0.55 at the p95 photo. Single flat
+  blocks reach 1.24 (default edit) and 1.64 (Auto edit). Auto gives the same values
+  beyond its own rounding. Nothing about measured tone needs to
+  change, and no reference was re-blessed.
 - **Size on disk.** The measurement in decision 3 may force the lossy option
   into the first release.
 - **Format permanence.** Version 1 is a commitment; review its layout as
