@@ -89,6 +89,8 @@ pub(in crate::app::library) struct EditQueue(Arc<Shared>);
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    #[cfg(test)]
+    waited: Condvar,
 }
 #[derive(Default)]
 struct State {
@@ -102,6 +104,8 @@ struct State {
     /// Where AI Denoise's results are, which an edit with it renders from once
     /// finished; none until the app sets it.
     ai: Option<AiCache>,
+    #[cfg(test)]
+    parked: bool,
 }
 struct Queued {
     job: EditJob,
@@ -226,6 +230,44 @@ impl EditQueue {
         }
         drop(state);
     }
+    #[cfg(test)]
+    fn wait_until(&self, ready: impl Fn(&State) -> bool) {
+        let mut state = self.0.lock();
+        let started = std::time::Instant::now();
+        while !ready(&state) {
+            let remaining = std::time::Duration::from_secs(20)
+                .checked_sub(started.elapsed())
+                .expect("timed out waiting for edited preview scheduler");
+            let (next, timed_out) = self
+                .0
+                .waited
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            if ready(&state) {
+                return;
+            }
+            assert!(
+                !timed_out.timed_out(),
+                "timed out waiting for edited preview scheduler"
+            );
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn wait_until_parked(&self) {
+        self.wait_until(|state| state.parked);
+    }
+    #[cfg(test)]
+    pub(super) fn wait_until_deferred_ai_parked(&self, target: PhotoId) {
+        self.wait_until(|state| {
+            state.parked
+                && state.jobs.iter().any(|q| {
+                    matches!(q.job, EditJob::Render { id, .. } if id == target)
+                        && q.renders_ai == Some(true)
+                        && !q.missed
+                })
+        });
+    }
     /// Cancels the renders under way and ends the worker once they stop;
     /// jobs not started are dropped.
     pub(in crate::app::library) fn close(&self) {
@@ -342,6 +384,34 @@ pub(super) fn spawn_edited_with_ai(
     render: RenderEdited,
     render_ai: RenderWithAi,
 ) -> Worker<EditQueue, EditResult> {
+    spawn_edited_inner(cache_path, wanted, ctx, render, render_ai, None)
+}
+#[cfg(test)]
+pub(super) fn spawn_edited_with_ai_slots(
+    cache_path: PathBuf,
+    wanted: Wanted,
+    ctx: egui::Context,
+    render: RenderEdited,
+    render_ai: RenderWithAi,
+    full_renders: usize,
+) -> Worker<EditQueue, EditResult> {
+    spawn_edited_inner(
+        cache_path,
+        wanted,
+        ctx,
+        render,
+        render_ai,
+        Some(full_renders),
+    )
+}
+fn spawn_edited_inner(
+    cache_path: PathBuf,
+    wanted: Wanted,
+    ctx: egui::Context,
+    render: RenderEdited,
+    render_ai: RenderWithAi,
+    full_renders_override: Option<usize>,
+) -> Worker<EditQueue, EditResult> {
     let shared = Arc::<Shared>::default();
     let (tx, result_rx) = mpsc::channel();
     let results = Results {
@@ -351,7 +421,8 @@ pub(super) fn spawn_edited_with_ai(
     };
     let thread = crate::raw::spawn_background(move || {
         let full_threads = full_threads();
-        let full_renders = full_renders(crate::platform::memory::total(), full_threads);
+        let full_renders = full_renders_override
+            .unwrap_or_else(|| full_renders(crate::platform::memory::total(), full_threads));
         let renders = Renders {
             background: crate::raw::background_pool(2, "edited-preview").ok(),
             full: crate::raw::background_pool(full_threads, "edited-preview-full").ok(),
@@ -768,10 +839,19 @@ fn next_step(shared: &Shared, wanted: &Wanted, full_renders: usize) -> Step {
                 };
             }
         }
+        #[cfg(test)]
+        {
+            state.parked = true;
+            shared.waited.notify_all();
+        }
         state = shared
             .changed
             .wait(state)
             .unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        {
+            state.parked = false;
+        }
     }
 }
 

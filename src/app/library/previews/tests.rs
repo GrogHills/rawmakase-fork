@@ -790,12 +790,13 @@ fn ai_denoise_renders_limit_concurrency_without_deadlocking_rayon_pool() -> anyh
         wanted.lock().unwrap().insert(PhotoId(i));
         paths.push((PhotoId(i), path));
     }
-    let (tx, rx, _) = spawn_edited_with_ai(
+    let (tx, rx, _) = spawn_edited_with_ai_slots(
         directory.path().join("previews.sqlite3"),
         wanted,
         egui::Context::default(),
         plain,
         concurrent_ai,
+        4,
     );
     tx.set_ai_cache(ai);
     tx.set_pace(Pace::Full);
@@ -898,12 +899,13 @@ fn deferred_offscreen_ai_cached_preview_serves_immediately_when_scrolled_into_vi
 
     let wanted = Wanted::default();
     wanted.lock().unwrap().extend([PhotoId(1), PhotoId(2)]);
-    let (tx, rx, _) = spawn_edited_with_ai(
+    let (tx, rx, _) = spawn_edited_with_ai_slots(
         db_path,
         wanted.clone(),
         egui::Context::default(),
         plain,
         blocking_ai,
+        3,
     );
     tx.set_ai_cache(ai);
     tx.set_pace(Pace::Full);
@@ -917,7 +919,8 @@ fn deferred_offscreen_ai_cached_preview_serves_immediately_when_scrolled_into_vi
         })?;
     }
 
-    // Hold both AI slots busy inside `blocking_ai`.
+    // Hold both AI slots busy inside `blocking_ai`, then wait until the offscreen AI job has
+    // been classified, deferred, and the scheduler has parked on `shared.changed`.
     {
         let (lock, cv) = gate();
         let mut state = lock.lock().unwrap();
@@ -934,7 +937,7 @@ fn deferred_offscreen_ai_cached_preview_serves_immediately_when_scrolled_into_vi
             );
         }
     }
-    std::thread::sleep(Duration::from_millis(25));
+    tx.wait_until_deferred_ai_parked(PhotoId(3));
     assert!(rx.try_recv().is_err());
 
     // Scroll photo 3 into view while both AI slots remain occupied: cached preview returns immediately.

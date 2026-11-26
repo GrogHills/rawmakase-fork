@@ -476,24 +476,17 @@ fn set_shown_wakes_waiting_scheduler_for_deferred_offscreen_ai_job() {
     assert_eq!(shared.lock().jobs[0].renders_ai, Some(true));
     assert!(!shared.lock().jobs[0].missed);
 
+    let queue = EditQueue(shared.clone());
     let (step_tx, step_rx) = mpsc::channel();
-    let started = Arc::new(AtomicBool::new(false));
     let shared_worker = shared.clone();
     let wanted_worker = wanted.clone();
-    let started_worker = started.clone();
     let handle = std::thread::spawn(move || {
-        started_worker.store(true, Ordering::SeqCst);
         let step = next_step(&shared_worker, &wanted_worker, 4);
         let _ = step_tx.send(matches!(step, Step::Look(0, false)));
     });
-    while !started.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    // Give the worker thread a moment to enter `shared.changed.wait(state)`.
-    std::thread::sleep(std::time::Duration::from_millis(15));
+    queue.wait_until_parked();
     assert!(step_rx.try_recv().is_err());
 
-    let queue = EditQueue(shared.clone());
     queue.set_shown(&wanted, std::collections::HashSet::from([PhotoId(1)]));
     assert_eq!(
         step_rx.recv_timeout(std::time::Duration::from_secs(5)),
