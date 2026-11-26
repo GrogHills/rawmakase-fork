@@ -899,7 +899,7 @@ fn deferred_offscreen_ai_cached_preview_serves_immediately_when_scrolled_into_vi
 
     let wanted = Wanted::default();
     wanted.lock().unwrap().extend([PhotoId(1), PhotoId(2)]);
-    let (tx, rx, _) = spawn_edited_with_ai_slots(
+    let (tx, rx, _) = spawn_edited_with_ai_slots_unpooled(
         db_path,
         wanted.clone(),
         egui::Context::default(),

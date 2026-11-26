@@ -386,11 +386,33 @@ pub(super) fn spawn_edited_with_ai(
 ) -> Worker<EditQueue, EditResult> {
     spawn_edited_inner(cache_path, wanted, ctx, render, render_ai, None, true)
 }
-/// Runs the edited-preview worker with a fixed `full_renders` cap and without
-/// Rayon worker pools so tests that block renders on a gate cannot deadlock via
-/// Rayon work-stealing during nested `AiCache::load` parallel reads.
+/// Runs the edited-preview worker with a fixed `full_renders` cap while keeping
+/// the production Rayon worker pools active.
 #[cfg(test)]
 pub(super) fn spawn_edited_with_ai_slots(
+    cache_path: PathBuf,
+    wanted: Wanted,
+    ctx: egui::Context,
+    render: RenderEdited,
+    render_ai: RenderWithAi,
+    full_renders: usize,
+) -> Worker<EditQueue, EditResult> {
+    spawn_edited_inner(
+        cache_path,
+        wanted,
+        ctx,
+        render,
+        render_ai,
+        Some(full_renders),
+        true,
+    )
+}
+/// Runs the edited-preview worker with a fixed `full_renders` cap and without
+/// Rayon worker pools for tests whose render callback blocks on a cross-task
+/// barrier, where Rayon work-stealing during nested parallel cache reads can
+/// pin another render task on the same worker stack.
+#[cfg(test)]
+pub(super) fn spawn_edited_with_ai_slots_unpooled(
     cache_path: PathBuf,
     wanted: Wanted,
     ctx: egui::Context,
