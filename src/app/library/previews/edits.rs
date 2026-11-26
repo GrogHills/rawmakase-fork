@@ -206,6 +206,26 @@ impl EditQueue {
         }
         self.0.changed.notify_all();
     }
+    /// Updates `wanted` to `shown` and wakes the worker if visibility changed.
+    /// Acquires `State` before `Wanted`, matching `next_step` and `Renders::start`.
+    pub(in crate::app::library) fn set_shown(
+        &self,
+        wanted: &Wanted,
+        shown: std::collections::HashSet<PhotoId>,
+    ) {
+        let state = self.0.lock();
+        let mut guard = wanted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *guard != shown {
+            *guard = shown;
+            drop(guard);
+            if !state.jobs.is_empty() {
+                self.0.changed.notify_all();
+            }
+        }
+        drop(state);
+    }
     /// Cancels the renders under way and ends the worker once they stop;
     /// jobs not started are dropped.
     pub(in crate::app::library) fn close(&self) {

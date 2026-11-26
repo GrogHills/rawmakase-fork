@@ -343,7 +343,7 @@ fn ai_renders_are_bounded_by_scheduler_even_with_four_slots() {
 }
 
 #[test]
-fn offscreen_ai_request_is_classified_and_deferred_without_file_io_when_ai_slots_full() {
+fn offscreen_ai_request_is_classified_before_lookup_when_ai_slots_full() {
     fn unexpected_render(
         _: &Path,
         _: &EditSource,
@@ -418,4 +418,88 @@ fn offscreen_ai_request_is_classified_and_deferred_without_file_io_when_ai_slots
         next_step(&shared, &wanted, 4),
         Step::Look(0, true)
     ));
+}
+
+#[test]
+fn set_shown_wakes_waiting_scheduler_for_deferred_offscreen_ai_job() {
+    fn unexpected_render(
+        _: &Path,
+        _: &EditSource,
+        _: Cancel<'_>,
+    ) -> anyhow::Result<image::RgbImage> {
+        panic!("unexpected render")
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let shared = Arc::<Shared>::default();
+    let wanted = Wanted::default();
+    let mut ai_recipe = crate::model::recipe::Recipe::default();
+    ai_recipe.ai_denoise.enabled = true;
+    ai_recipe.ai_denoise.amount = 0.5;
+    let ai_job = EditJob::Render {
+        id: PhotoId(1),
+        ticket: 1,
+        path: directory.path().join("ahead-ai.ARW"),
+        source: EditSource::Recipe(serde_json::to_string(&ai_recipe).unwrap()),
+        ahead: true,
+    };
+    {
+        let mut state = shared.lock();
+        state.pace = Pace::Full;
+        state.ai = Some(AiCache::new(directory.path().join("ai"), u64::MAX));
+        for slot in 0..MAX_CONCURRENT_AI_RENDERS {
+            state.running.push(Running {
+                slot: slot as u64,
+                full: true,
+                ai: true,
+                cancel: Arc::default(),
+                path: directory.path().join(format!("busy-{slot}.ARW")),
+            });
+        }
+        state.jobs = vec![Queued::new(ai_job)];
+    }
+    let (tx, _rx) = mpsc::channel();
+    let renders = Renders {
+        background: None,
+        full: None,
+        cache: Arc::new(Mutex::new(None)),
+        cache_path: PathBuf::new(),
+        wanted: wanted.clone(),
+        results: Results {
+            tx,
+            shared: shared.clone(),
+            ctx: egui::Context::default(),
+        },
+        render: unexpected_render,
+        render_ai: render_edited_with_ai,
+    };
+    renders.classify(0);
+    assert_eq!(shared.lock().jobs[0].renders_ai, Some(true));
+    assert!(!shared.lock().jobs[0].missed);
+
+    let (step_tx, step_rx) = mpsc::channel();
+    let started = Arc::new(AtomicBool::new(false));
+    let shared_worker = shared.clone();
+    let wanted_worker = wanted.clone();
+    let started_worker = started.clone();
+    let handle = std::thread::spawn(move || {
+        started_worker.store(true, Ordering::SeqCst);
+        let step = next_step(&shared_worker, &wanted_worker, 4);
+        let _ = step_tx.send(matches!(step, Step::Look(0, false)));
+    });
+    while !started.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Give the worker thread a moment to enter `shared.changed.wait(state)`.
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    assert!(step_rx.try_recv().is_err());
+
+    let queue = EditQueue(shared.clone());
+    queue.set_shown(&wanted, std::collections::HashSet::from([PhotoId(1)]));
+    assert_eq!(
+        step_rx.recv_timeout(std::time::Duration::from_secs(5)),
+        Ok(true)
+    );
+    handle.join().unwrap();
+    shared.lock().running.clear();
+    drop(queue);
 }
