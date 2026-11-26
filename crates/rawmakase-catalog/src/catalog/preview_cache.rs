@@ -361,7 +361,7 @@ impl PreviewCache {
     }
     /// Stores a JPEG-encoded thumbnail built from the file as it was at
     /// `stamp`, returning [`StoreOutcome::Stale`] without writing if the file
-    /// changed or disappeared since.
+    /// changed or is missing, and propagating other metadata or database errors.
     pub fn store_tagged_jpeg(
         &mut self,
         path: &Path,
@@ -377,8 +377,17 @@ impl PreviewCache {
             encoded.width > 0 && encoded.height > 0 && !encoded.jpeg.is_empty(),
             "Preview has no pixels"
         );
-        if Stamp::read(path).ok().as_ref() != Some(stamp) {
-            return Ok(StoreOutcome::Stale);
+        match Stamp::read(path) {
+            Ok(current) if current == *stamp => {}
+            Ok(_) => return Ok(StoreOutcome::Stale),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(StoreOutcome::Stale);
+            }
+            Err(error) => return Err(error),
         }
         // prefix_hash, which needed the file's first 64 KB, is no longer checked.
         self.db
@@ -1607,6 +1616,41 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.usage()?, PreviewUsage::default());
+
+        std::fs::remove_file(&raw)?;
+        assert_eq!(
+            cache.store_tagged_jpeg(&raw, "missing", &stamp, &thumb)?,
+            StoreOutcome::Stale
+        );
+        assert!(
+            cache
+                .store_tagged(&raw, "missing", &stamp, &image::RgbImage::new(16, 16))
+                .is_err()
+        );
+        assert!(cache.load_tagged_jpeg(&raw, "missing")?.is_none());
+
+        #[cfg(unix)]
+        {
+            let blocker = d.path().join("not-a-dir");
+            std::fs::write(&blocker, b"file")?;
+            let blocked_path = blocker.join("photo.ARW");
+            let err = cache
+                .store_tagged_jpeg(&blocked_path, "blocked", &stamp, &thumb)
+                .unwrap_err();
+            assert!(err.downcast_ref::<std::io::Error>().is_some(), "{err:#}");
+            let wrapper_err = cache
+                .store_tagged(
+                    &blocked_path,
+                    "blocked",
+                    &stamp,
+                    &image::RgbImage::new(16, 16),
+                )
+                .unwrap_err();
+            assert!(
+                wrapper_err.downcast_ref::<std::io::Error>().is_some(),
+                "{wrapper_err:#}"
+            );
+        }
         Ok(())
     }
     #[test]
