@@ -169,6 +169,56 @@ mod tests {
         assert!(h.symbol(&mut bits).is_err());
     }
     #[test]
+    fn decodes_codes_longer_than_fast_table() {
+        // Code lengths 11..=16 exercise the canonical slow path beyond FAST_BITS=10.
+        let mut counts = [0u8; 16];
+        counts[0] = 1; // 1-bit: 0 -> sym 10
+        counts[9] = 1; // 10-bit: 1000000000 -> sym 11
+        counts[10] = 2; // 11-bit -> syms 12, 13
+        counts[11] = 2; // 12-bit -> syms 14, 15
+        counts[13] = 2; // 14-bit -> syms 16, 17
+        counts[15] = 2; // 16-bit -> syms 18, 19
+        let syms = [10u8, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+        let h = Huffman::new(&counts, &syms).unwrap();
+
+        let mut expected = Vec::new();
+        let mut code = 0u32;
+        let mut k = 0usize;
+        for (i, &n) in counts.iter().enumerate() {
+            let len = i as u32 + 1;
+            for _ in 0..n {
+                expected.push((len, syms[k], code << (16 - len)));
+                code += 1;
+                k += 1;
+            }
+            code <<= 1;
+        }
+        for (len, sym, left16) in &expected {
+            assert_eq!(h.lookup(*left16).unwrap(), (*len, *sym));
+            if *len < 16 {
+                let tail = (1u32 << (16 - *len)) - 1;
+                assert_eq!(h.lookup(*left16 | tail).unwrap(), (*len, *sym));
+            }
+        }
+        assert!(h.lookup(0xffff).is_err());
+        assert!(h.lookup(1 << 16).is_err());
+
+        // Stream symbols of lengths 11, 16, 1, 14 in one bit buffer.
+        let mut stream = 0u64;
+        let mut used = 0u32;
+        let seq = [expected[2], expected[9], expected[0], expected[6]];
+        for (len, _, left16) in seq {
+            let raw = u64::from(left16 >> (16 - len));
+            used += len;
+            stream |= raw << (64 - used);
+        }
+        let bytes = stream.to_be_bytes();
+        let mut bits = Msb::new(&bytes);
+        for (_, sym, _) in seq {
+            assert_eq!(h.symbol(&mut bits).unwrap(), sym);
+        }
+    }
+    #[test]
     fn extends_differences() {
         assert_eq!(extend(0, 1), -1);
         assert_eq!(extend(1, 1), 1);

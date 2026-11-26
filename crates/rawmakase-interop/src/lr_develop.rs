@@ -234,9 +234,16 @@ pub fn convert_develop(
     // Spots and masks convert on their own and report what they skip.
     let local_settings = std::mem::take(&mut preset.local);
     let base = Recipe::with_profiles(m, profiles);
-    let (mut recipe, substitute) = match preset.apply(&base, m, profiles, image) {
-        Ok(recipe) => (recipe, preset.profile_substitute(m, profiles)),
-        Err(_) => {
+    let fast_path = !preset
+        .settings
+        .get("HasCrop")
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"));
+    let (mut recipe, substitute) = match fast_path
+        .then(|| preset.apply(&base, m, profiles, image))
+        .and_then(Result::ok)
+    {
+        Some(recipe) => (recipe, preset.profile_substitute(m, profiles)),
+        None => {
             // Build a compatible patch before application. Related fields are validated together.
             let mut accepted = preset.clone();
             accepted.settings.clear();

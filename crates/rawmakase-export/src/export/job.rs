@@ -74,7 +74,9 @@ pub fn run(
     }
     let prepared = prepare(&photo, settings, cancel, &progress)?;
     // Drop the full-resolution decoded input image and services before encoding.
-    let Photo { source, .. } = photo;
+    let mut photo = photo;
+    let source = std::mem::take(&mut photo.source);
+    drop(photo);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -711,6 +713,33 @@ mod tests {
             &full.metadata.lateral_ca,
             &full.recovered.get().unwrap().metadata.lateral_ca
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn run_drops_source_image_before_final_progress() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("photo.png");
+        let p = photo(&source, &dir.path().join("cache"));
+        let weak = Arc::downgrade(&p.image);
+        let saw_dropped = std::cell::Cell::new(false);
+        let target = dir.path().join("out.jpg");
+        run(
+            p,
+            &ExportSettings::default(),
+            &target,
+            super::super::Replace::NoClobber,
+            Cancel::NEVER,
+            |progress| {
+                if (progress - 1.0).abs() < f32::EPSILON {
+                    saw_dropped.set(weak.strong_count() == 0);
+                }
+            },
+        )?;
+        assert!(
+            saw_dropped.get(),
+            "Photo.image stayed alive until end of run"
+        );
         Ok(())
     }
 }

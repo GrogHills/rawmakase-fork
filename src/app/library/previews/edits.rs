@@ -111,10 +111,14 @@ struct Queued {
     /// unless its photo is shown.
     dropped: bool,
 }
+const MAX_CONCURRENT_AI_RENDERS: usize = 2;
+
 struct Running {
     slot: u64,
     /// On the full pace's threads, so given up when the pace drops.
     full: bool,
+    /// Decodes full-size source data for AI Denoise, bounded across concurrent jobs.
+    ai: bool,
     cancel: Arc<AtomicBool>,
     /// The file rendered: another render of it waits for this one.
     path: PathBuf,
@@ -497,12 +501,14 @@ impl Renders {
         }
         let full = state.pace == Pace::Full;
         let ai = state.ai.clone();
+        let ai_render = source.renders_ai() && ai.is_some();
         let slot = state.next_slot;
         state.next_slot += 1;
         let cancel = Arc::<AtomicBool>::default();
         state.running.push(Running {
             slot,
             full,
+            ai: ai_render,
             cancel: cancel.clone(),
             path: path.clone(),
         });
@@ -654,17 +660,37 @@ fn next_step(shared: &Shared, wanted: &Wanted, full_renders: usize) -> Step {
             EditJob::Render { path, .. } => state.running.iter().any(|r| &r.path == path),
             EditJob::Store { .. } => false,
         };
+        // Full-size AI decodes stay bounded in the scheduler so pool threads never
+        // wait on a gate while nested Rayon work may be running inside the pool.
+        let ai_running = state.running.iter().filter(|r| r.ai).count();
+        let ai_allowed = |q: &Queued| match &q.job {
+            EditJob::Render { source, .. } => {
+                !(source.renders_ai() && state.ai.is_some())
+                    || ai_running < MAX_CONCURRENT_AI_RENDERS
+            }
+            EditJob::Store { .. } => true,
+        };
         // Photos shown, the latest first: from the cache whether or not a
         // render could start, rendered when one can.
         if let Some(index) = state.jobs.iter().rposition(|q| visible(q) && !q.missed) {
-            return Step::Look(index, free && !rendering(&state.jobs[index]));
+            let can_render =
+                free && !rendering(&state.jobs[index]) && ai_allowed(&state.jobs[index]);
+            return Step::Look(index, can_render);
         }
         if free {
-            if let Some(index) = state.jobs.iter().rposition(|q| visible(q) && !rendering(q)) {
+            if let Some(index) = state
+                .jobs
+                .iter()
+                .rposition(|q| visible(q) && !rendering(q) && ai_allowed(q))
+            {
                 return Step::Render(index);
             }
             // Then the ones asked ahead, in the order asked.
-            if let Some(index) = state.jobs.iter().position(|q| !visible(q) && !rendering(q)) {
+            if let Some(index) = state
+                .jobs
+                .iter()
+                .position(|q| !visible(q) && !rendering(q) && ai_allowed(q))
+            {
                 return if state.jobs[index].missed {
                     Step::Render(index)
                 } else {

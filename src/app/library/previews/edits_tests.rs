@@ -161,6 +161,7 @@ fn a_file_is_rendered_once_at_a_time() {
         state.running.push(Running {
             slot: 0,
             full: true,
+            ai: false,
             cancel: Arc::default(),
             path: one.into(),
         });
@@ -251,6 +252,7 @@ fn photos_shown_go_before_the_ones_asked_ahead() {
     state.running.push(Running {
         slot: 0,
         full: false,
+        ai: false,
         cancel: Arc::default(),
         path: PathBuf::from("/elsewhere.png"),
     });

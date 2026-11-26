@@ -273,48 +273,28 @@ pub fn scan(
     }
     unknown.sort();
     // Each unknown file matched with the checksums on record.
-    // Present photos without a current checksum are read now, so a copy
-    // of one is known as a copy. Only files whose size matches an unknown
-    // file can ever match it.
-    let mut extra_checksums: HashMap<PhotoId, FileChecksum> = HashMap::new();
-    let mut extra_by_quick: HashMap<(u64, String), Vec<PhotoId>> = HashMap::new();
+    // Present photos without a current checksum are mapped by file size and
+    // hashed on demand only if an unknown file actually shares that size.
+    let mut unhashed_present_by_size: HashMap<u64, Vec<PhotoId>> = HashMap::new();
     if !unknown.is_empty() {
-        let unknown_sizes: HashSet<u64> = unknown
-            .iter()
-            .filter_map(|(path, _)| crate::storage::Stamp::read(path).ok().map(|s| s.size))
-            .collect();
-        if !unknown_sizes.is_empty() {
-            for (id, state) in &states {
-                if *state != FileState::Present {
-                    continue;
-                }
-                let Some(path) = inputs.path_of(*id) else {
-                    continue;
-                };
-                let Ok(now) = crate::storage::Stamp::read(&path) else {
-                    continue;
-                };
-                if !unknown_sizes.contains(&now.size) {
-                    continue;
-                }
-                let current = inputs.checksums.get(id).is_some_and(|c| {
-                    now.size == c.identity.size && now.modified_ns == c.identity.modified_ns
-                });
-                if current {
-                    continue;
-                }
-                if cancelled() {
-                    bail!("Synchronization stopped");
-                }
-                if let Ok(ChecksumRead::Done(quick)) =
-                    FileChecksum::read_quick(&path, |_| !cancelled())
-                {
-                    extra_by_quick
-                        .entry((quick.size, quick.quick.clone()))
-                        .or_default()
-                        .push(*id);
-                    extra_checksums.insert(*id, quick);
-                }
+        for (id, state) in &states {
+            if *state != FileState::Present {
+                continue;
+            }
+            let Some(path) = inputs.path_of(*id) else {
+                continue;
+            };
+            let Ok(now) = crate::storage::Stamp::read(&path) else {
+                continue;
+            };
+            let current = inputs.checksums.get(id).is_some_and(|c| {
+                now.size == c.identity.size && now.modified_ns == c.identity.modified_ns
+            });
+            if !current {
+                unhashed_present_by_size
+                    .entry(now.size)
+                    .or_default()
+                    .push(*id);
             }
         }
     }
@@ -324,8 +304,9 @@ pub fn scan(
         cancel,
         states,
         dir_cache,
-        extra_checksums,
-        extra_by_quick,
+        unhashed_present_by_size,
+        extra_checksums: HashMap::new(),
+        extra_by_quick: HashMap::new(),
     };
     let mut found: Vec<(PathBuf, (RootId, String), Identity, Found)> = Vec::new();
     for (n, (file, place)) in unknown.into_iter().enumerate() {
@@ -498,12 +479,39 @@ struct Matching<'a> {
     cancel: Cancel<'a>,
     states: HashMap<PhotoId, FileState>,
     dir_cache: DirCheckCache,
+    /// Present photos without a current checksum, grouped by stamped size for lazy hashing.
+    unhashed_present_by_size: HashMap<u64, Vec<PhotoId>>,
     /// Checksums of present photos read during this scan.
     extra_checksums: HashMap<PhotoId, FileChecksum>,
     extra_by_quick: HashMap<(u64, String), Vec<PhotoId>>,
 }
 
 impl Matching<'_> {
+    fn hash_present_of_size(&mut self, size: u64) -> Result<()> {
+        let Some(ids) = self.unhashed_present_by_size.remove(&size) else {
+            return Ok(());
+        };
+        for id in ids {
+            if !self.go_on() {
+                bail!("Synchronization stopped");
+            }
+            let Some(path) = self.inputs.path_of(id) else {
+                continue;
+            };
+            match FileChecksum::read_quick(&path, |_| self.go_on())? {
+                ChecksumRead::Done(quick) => {
+                    self.extra_by_quick
+                        .entry((quick.size, quick.quick.clone()))
+                        .or_default()
+                        .push(id);
+                    self.extra_checksums.insert(id, quick);
+                }
+                ChecksumRead::Changed => {}
+                ChecksumRead::Cancelled => bail!("Synchronization stopped"),
+            }
+        }
+        Ok(())
+    }
     /// Where master `id`'s file stands; one outside the scope is checked
     /// on its own, by the same rules.
     fn state(&mut self, id: PhotoId) -> FileState {
@@ -545,6 +553,7 @@ impl Matching<'_> {
             ChecksumRead::Cancelled => bail!("Synchronization stopped"),
         };
         let identity = quick.identity.clone();
+        self.hash_present_of_size(quick.size)?;
         let quick_key = (quick.size, quick.quick.clone());
         let mut hits: BTreeSet<PhotoId> = BTreeSet::new();
         if let Some(ids) = self.inputs.by_quick.get(&quick_key) {

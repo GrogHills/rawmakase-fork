@@ -201,10 +201,10 @@ impl Filters {
 fn matches_query(p: &Photo, query: &str, scratch: &mut String) -> bool {
     scratch.clear();
     let push_lower = |out: &mut String, field: &str| {
-        for c in field.chars() {
-            for lc in c.to_lowercase() {
-                out.push(lc);
-            }
+        if field.is_ascii() {
+            out.extend(field.bytes().map(|b| b.to_ascii_lowercase() as char));
+        } else {
+            out.push_str(&field.to_lowercase());
         }
     };
     push_lower(scratch, &p.filename);
@@ -260,5 +260,34 @@ fn stacked(photos: &[Photo], visible: Vec<usize>) -> Vec<usize> {
 pub(super) fn toggle<T: Ord>(set: &mut BTreeSet<T>, item: T) {
     if !set.remove(&item) {
         set.insert(item);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{FolderId, Photo, PhotoId};
+
+    #[test]
+    fn matches_query_preserves_unicode_final_sigma_folding() {
+        let photo = Photo {
+            id: PhotoId(1),
+            folder: FolderId(1),
+            path: "ΟΔΟΣ.dng".into(),
+            filename: "ΟΔΟΣ.dng".into(),
+            captured: String::new(),
+            rating: 0,
+            flag: 0,
+            label: String::new(),
+            format: "DNG".into(),
+            copy_name: String::new(),
+            master: None,
+            stack: None,
+            keywords: "ΟΔΟΣ".into(),
+            has_lightroom_edits: false,
+        };
+        let mut scratch = String::new();
+        assert!(matches_query(&photo, &"ΟΔΟΣ".to_lowercase(), &mut scratch));
+        assert!(matches_query(&photo, "οδος", &mut scratch));
     }
 }

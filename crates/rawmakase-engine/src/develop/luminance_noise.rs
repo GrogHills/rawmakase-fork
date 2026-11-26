@@ -32,19 +32,26 @@ impl LuminanceDenoise {
     pub(crate) fn apply(&self, im: &CameraImage, cancel: Cancel<'_>) -> Result<CameraImage> {
         check(cancel)?;
         let (plane, filtered) = self.filtered_luma(im, cancel)?;
-        let pixels = im
-            .pixels
-            .par_iter()
-            .zip(plane.data.par_iter().zip(filtered.data.par_iter()))
-            .map(|(p, (&orig, &filt))| {
-                let delta = filt - orig;
-                if delta != 0. {
-                    p.map(|v| (v.max(0.).sqrt() + delta).max(0.).powi(2))
-                } else {
-                    *p
+        let mut pixels = vec![[0f32; 3]; im.pixels.len()];
+        pixels
+            .par_chunks_mut(1024)
+            .enumerate()
+            .for_each(|(chunk, dst)| {
+                if cancel.is_cancelled() {
+                    return;
                 }
-            })
-            .collect();
+                let start = chunk * 1024;
+                for (j, out) in dst.iter_mut().enumerate() {
+                    let i = start + j;
+                    let p = im.pixels[i];
+                    let delta = filtered.data[i] - plane.data[i];
+                    *out = if delta != 0. {
+                        p.map(|v| (v.max(0.).sqrt() + delta).max(0.).powi(2))
+                    } else {
+                        p
+                    };
+                }
+            });
         check(cancel)?;
         Ok(CameraImage {
             width: im.width,
@@ -370,6 +377,9 @@ mod tests {
         let d = LuminanceDenoise::new(0.5, 0.5, 0.).unwrap();
         assert!(d.apply(&im, Cancel::new(&cancel)).is_err());
         cancel.store(false, Ordering::Relaxed);
-        assert!(d.apply(&im, Cancel::new(&cancel)).is_ok());
+        let applied = d.apply(&im, Cancel::new(&cancel)).unwrap();
+        let mut in_place = im;
+        d.apply_in_place(&mut in_place, Cancel::NEVER).unwrap();
+        assert_eq!(applied.pixels, in_place.pixels);
     }
 }

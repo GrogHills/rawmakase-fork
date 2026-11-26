@@ -283,15 +283,16 @@ pub(super) fn color_stage(
     if lut.output == PixelOutput::ColorInput {
         return lab;
     }
-    lab[0] = lab[0].clamp(0., 1.);
     if lut.color_adjustments {
         // HSL, Saturation and Vibrance render in the measured color mixer; Defringe
         // and the black & white mix work here, on the color's Oklab hue.
-        if r.effects.defringe != [0.; 2] {
-            let hue =
-                lab[2].atan2(lab[1]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
-            lab = r.effects.defringe_color(lab, hue);
-        }
+        let chroma = lab[1].hypot(lab[2]);
+        let hue = lab[2].atan2(lab[1]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+        let angle = hue * std::f32::consts::TAU;
+        lab[0] = lab[0].clamp(0., 1.);
+        lab[1] = angle.cos() * chroma;
+        lab[2] = angle.sin() * chroma;
+        lab = r.effects.defringe_color(lab, hue);
         // `gray_grid` is there for black & white renders.
         if let Some(grid) = &lut.gray_grid {
             // The gray's Oklab lightness is the cube root of its luminance.
@@ -301,6 +302,9 @@ pub(super) fn color_stage(
             lab[1] = 0.;
             lab[2] = 0.;
         }
+    } else {
+        // Identity color controls need no hue angle or trigonometry.
+        lab[0] = lab[0].clamp(0., 1.);
     }
     let out = finish_color_in(lab, lut.space);
     // Visualize Range grays what the swatch leaves out after every color control, so

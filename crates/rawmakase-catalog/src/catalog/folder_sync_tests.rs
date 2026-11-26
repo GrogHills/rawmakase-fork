@@ -875,4 +875,66 @@ mod scenarios {
         assert!(f.cat.previous_import()?.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn apply_rechecks_anchor_listing_for_every_missing_removal() -> Result<()> {
+        let mut f = fixture()?;
+        let a = f.id("IMG_1001.dng");
+        let b = f.id("IMG_1002.dng");
+        std::fs::remove_file(f.root.join("Lisbon/IMG_1001.dng"))?;
+        std::fs::remove_file(f.root.join("Lisbon/IMG_1002.dng"))?;
+        let plan = f.plan(SyncScope::All)?;
+        assert_eq!(plan.missing.len(), 2);
+        let accepted = Accepted {
+            removals: vec![a, b],
+            ..Default::default()
+        };
+        let moved_root = f._dir.path().join("renamed-root");
+        let calls = std::cell::Cell::new(0usize);
+        let root_for_hook = f.root.clone();
+        let online = |_: &Path| {
+            let n = calls.get();
+            calls.set(n + 1);
+            // Rename the root anchor after the first removal's listing check passes.
+            if n == 0 {
+                std::fs::rename(&root_for_hook, &moved_root).unwrap();
+            }
+            true
+        };
+        let applied =
+            f.cat
+                .apply_folder_sync(&plan, &accepted, &online, None, &Default::default())?;
+        assert_eq!(applied.removed, vec![a]);
+        assert_eq!(applied.skipped.len(), 1);
+        assert_eq!(
+            applied.skipped[0].path,
+            root_for_hook.join("Lisbon/IMG_1002.dng")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_written_over_unknown_file_during_scan_progress_is_still_recognized_as_copy()
+    -> Result<()> {
+        let f = fixture()?;
+        f.cat
+            .db_for_tests()
+            .execute_batch("DELETE FROM photo_checksums")?;
+        let id = f.id("IMG_1001.dng");
+        let present = f.root.join("Lisbon/IMG_1001.dng");
+        let unknown = f.root.join("Lisbon/IMG_9999.dng");
+        std::fs::write(&unknown, b"short unrelated unknown")?;
+        let inputs = f.cat.sync_inputs(SyncScope::All)?;
+        let swapped = std::cell::Cell::new(false);
+        let plan = scan(&inputs, &|_| true, Cancel::NEVER, &|_| {
+            if !swapped.replace(true) {
+                std::fs::copy(&present, &unknown).unwrap();
+            }
+        })?;
+        assert_eq!(plan.additions.len(), 1);
+        assert_eq!(plan.additions[0].file, unknown);
+        assert_eq!(plan.additions[0].copy_of, [id]);
+        assert!(plan.default_accepted().additions.is_empty());
+        Ok(())
+    }
 }

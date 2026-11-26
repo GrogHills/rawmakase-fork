@@ -830,4 +830,85 @@ mod tests {
         assert_eq!(pixels[0], [0., (1. + 6.) / 2., 7.]);
         assert_eq!(pixels[4], [14., (15. + 20.) / 2., 21.]);
     }
+    #[test]
+    fn bayer_interior_fast_path_matches_general_path() {
+        let patterns: [[u8; 4]; 4] = [[0, 1, 1, 2], [1, 0, 2, 1], [1, 2, 0, 1], [2, 1, 1, 0]];
+        let (w, h) = (17usize, 13usize);
+        for phase in patterns {
+            let pattern: [u8; PATTERN * PATTERN] =
+                std::array::from_fn(|i| phase[(((i / PATTERN) & 1) << 1) | (i & 1)]);
+            let data: Vec<f32> = (0..w * h)
+                .map(|i| (((i * 2654435761usize) % 1009) as f32 / 1009.) * 0.9 + 0.05)
+                .collect();
+            let cfa = Cfa {
+                data: &data,
+                width: w,
+                height: h,
+                pattern: &pattern,
+                white: [1.; 3],
+            };
+            let fast = demosaic(&cfa);
+            // Compute the general green + colour-difference path at every pixel.
+            let mut green = vec![0f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let (xi, yi) = (x as isize, y as isize);
+                    let c = cfa.at(xi, yi);
+                    if cfa.color(x, y) == 1 {
+                        green[y * w + x] = c;
+                        continue;
+                    }
+                    let (l, r) = (cfa.at(xi - 1, yi), cfa.at(xi + 1, yi));
+                    let (u, d) = (cfa.at(xi, yi - 1), cfa.at(xi, yi + 1));
+                    let lap_h = 2. * c - cfa.at(xi - 2, yi) - cfa.at(xi + 2, yi);
+                    let lap_v = 2. * c - cfa.at(xi, yi - 2) - cfa.at(xi, yi + 2);
+                    let gh = (l + r) * 0.5 + lap_h * 0.25;
+                    let gv = (u + d) * 0.5 + lap_v * 0.25;
+                    let dh = (l - r).abs() + lap_h.abs();
+                    let dv = (u - d).abs() + lap_v.abs();
+                    let (wh, wv) = (1. / (dh + 1e-5), 1. / (dv + 1e-5));
+                    let est = (gh * wh + gv * wv) / (wh + wv);
+                    green[y * w + x] = est.clamp(l.min(r).min(u).min(d), l.max(r).max(u).max(d));
+                }
+            }
+            let g_at = |x: isize, y: isize| green[Cfa::reflect(y, h) * w + Cfa::reflect(x, w)];
+            for y in 0..h {
+                for x in 0..w {
+                    let (xi, yi) = (x as isize, y as isize);
+                    let gc = g_at(xi, yi);
+                    let own = cfa.color(x, y);
+                    let mut px = [0f32; 3];
+                    px[1] = gc.max(0.);
+                    for c in [0u8, 2] {
+                        if own == c {
+                            px[c as usize] = cfa.at(xi, yi).max(0.);
+                            continue;
+                        }
+                        let mut sum = 0.;
+                        let mut total = 0.;
+                        for radius in 1..=2isize {
+                            for dy in -radius..=radius {
+                                for dx in -radius..=radius {
+                                    if dx.abs().max(dy.abs()) != radius
+                                        || cfa.color_at(xi + dx, yi + dy) != c
+                                    {
+                                        continue;
+                                    }
+                                    let wgt = 1. / ((dx * dx + dy * dy) as f32).sqrt();
+                                    sum +=
+                                        (cfa.at(xi + dx, yi + dy) - g_at(xi + dx, yi + dy)) * wgt;
+                                    total += wgt;
+                                }
+                            }
+                            if total > 0. {
+                                break;
+                            }
+                        }
+                        px[c as usize] = (gc + if total > 0. { sum / total } else { 0. }).max(0.);
+                    }
+                    assert_eq!(fast[y * w + x], px, "phase={phase:?} at ({x}, {y})");
+                }
+            }
+        }
+    }
 }

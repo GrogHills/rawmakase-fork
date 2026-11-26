@@ -754,3 +754,75 @@ fn closing_cancels_the_edited_preview_under_way() -> anyhow::Result<()> {
     assert!(rx.try_recv().is_err());
     Ok(())
 }
+
+#[test]
+fn ai_denoise_renders_limit_concurrency_without_deadlocking_rayon_pool() -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicUsize;
+
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+    fn concurrent_ai(
+        _: &Path,
+        _: &crate::storage::Identity,
+        _: &EditSource,
+        _: &rawmakase_decode::ai::cache::AiEntry,
+        _: Cancel<'_>,
+    ) -> anyhow::Result<image::RgbImage> {
+        let now = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(25));
+        let (a, b) = rayon::join(|| 1u8, || 2u8);
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        Ok(image::RgbImage::from_pixel(4, 4, image::Rgb([a, b, 3])))
+    }
+
+    ACTIVE.store(0, Ordering::SeqCst);
+    PEAK.store(0, Ordering::SeqCst);
+    let directory = tempfile::tempdir()?;
+    let ai = AiCache::new(directory.path().join("ai"), u64::MAX);
+    let source = with_ai_denoise()?;
+    let wanted = Wanted::default();
+    let mut paths = Vec::new();
+    for i in 1..=4 {
+        let path = directory.path().join(format!("p{i}.png"));
+        image::RgbImage::from_pixel(8, 8, image::Rgb([i as u8; 3])).save(&path)?;
+        finish_ai(&ai, &path)?;
+        wanted.lock().unwrap().insert(PhotoId(i));
+        paths.push((PhotoId(i), path));
+    }
+    let (tx, rx, _) = spawn_edited_with_ai(
+        directory.path().join("previews.sqlite3"),
+        wanted,
+        egui::Context::default(),
+        plain,
+        concurrent_ai,
+    );
+    tx.set_ai_cache(ai);
+    tx.set_pace(Pace::Full);
+    for (id, path) in paths {
+        tx.send(EditJob::Render {
+            id,
+            ticket: 0,
+            path,
+            source: source.clone(),
+            ahead: false,
+        })?;
+    }
+    let mut completed = 0;
+    for _ in 0..4 {
+        match rx.recv_timeout(Duration::from_secs(20))? {
+            EditResult::Ready(..) => completed += 1,
+            other => panic!(
+                "unexpected result: {:?}",
+                matches!(other, EditResult::Failed(..))
+            ),
+        }
+    }
+    assert_eq!(completed, 4);
+    assert!(
+        PEAK.load(Ordering::SeqCst) <= 2,
+        "peak={}",
+        PEAK.load(Ordering::SeqCst)
+    );
+    Ok(())
+}

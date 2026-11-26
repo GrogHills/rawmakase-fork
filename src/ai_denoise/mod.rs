@@ -531,9 +531,13 @@ impl Service {
                         return;
                     }
                     if queue.unload {
-                        models.clear();
+                        let dropped = std::mem::take(&mut models);
+                        drop(queue);
+                        drop(dropped);
+                        queue = self.queue();
                         queue.unload = false;
                         self.shared.changed.notify_all();
+                        continue;
                     }
                     // A Develop job nobody wants any more, and no export waits for, goes.
                     queue.pending.retain_mut(|job| {
@@ -560,8 +564,11 @@ impl Service {
                             .wait_timeout(queue, Duration::from_secs(60))
                             .unwrap_or_else(|e| e.into_inner());
                         queue = guard;
-                        if timeout.timed_out() && queue.pending.is_empty() {
-                            models.clear();
+                        if timeout.timed_out() && queue.pending.is_empty() && !queue.stopped {
+                            let dropped = std::mem::take(&mut models);
+                            drop(queue);
+                            drop(dropped);
+                            queue = self.queue();
                         }
                     }
                 }

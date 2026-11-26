@@ -5,10 +5,7 @@
 //! disk and in the catalog, and one that no longer holds is skipped and
 //! reported, never forced.
 use super::digest;
-use super::{
-    DirCheckCache, FileState, Move, NotChecked, PlanKind, SyncPlan, Target, current_master,
-    state_of_cached,
-};
+use super::{FileState, Move, NotChecked, PlanKind, SyncPlan, Target, current_master, state_of};
 use crate::catalog::copies::delete_photo;
 use crate::catalog::db::{Reads, sql};
 use crate::catalog::edit_rows::{Refresh, refresh_identity};
@@ -106,14 +103,13 @@ impl Catalog {
         // On disk, just before the transaction: the file found is as it
         // was scanned, and the old file still missing by the scan's rules.
         let folders = self.db.snapshot(|s| self.locate_folders(s))?;
-        let mut dir_cache = DirCheckCache::default();
-        let state_for = |id: PhotoId, path: &Path, cache: &mut DirCheckCache| {
+        let state_for = |id: PhotoId, path: &Path| {
             let anchor = plan
                 .scanned
                 .get(&id)
                 .and_then(|(m, _)| folders.get(&m.folder))
                 .and_then(|f| f.anchor.as_deref());
-            state_of_cached(Some(path), anchor, online, cache)
+            state_of(Some(path), anchor, online)
         };
         let matcher = crate::catalog::ingest::Matcher::new(self)?;
         let mut ready: Vec<&Move> = Vec::new();
@@ -121,10 +117,10 @@ impl Catalog {
             // A move from an offline location, verified: its old file must still
             // not be there, offline or missing.
             let still_absent = if !m.offline {
-                state_for(m.photo, &m.from, &mut dir_cache) == FileState::Missing
+                state_for(m.photo, &m.from) == FileState::Missing
             } else {
                 matches!(
-                    state_for(m.photo, &m.from, &mut dir_cache),
+                    state_for(m.photo, &m.from),
                     FileState::Missing | FileState::Unavailable
                 )
             };
@@ -149,7 +145,7 @@ impl Catalog {
             };
             if open == Some(*id) {
                 skip(&mut applied, &missing.path, "open in Develop");
-            } else if state_for(*id, &missing.path, &mut dir_cache) != FileState::Missing {
+            } else if state_for(*id, &missing.path) != FileState::Missing {
                 skip(&mut applied, &missing.path, "no longer missing");
             } else {
                 removals.push((*id, missing.path.clone()));
@@ -169,9 +165,7 @@ impl Catalog {
                     let anchor = f.anchor.as_deref();
                     absent
                         && anchor.is_some_and(|a| {
-                            Some(a) != f.path.as_deref()
-                                && dir_cache.list_all(a).is_ok()
-                                && online(a)
+                            Some(a) != f.path.as_deref() && super::list_all(a).is_ok() && online(a)
                         })
                 })
             })

@@ -409,10 +409,10 @@ pub fn correct_dark(rgb: &mut [f32], reference: &GainReference<'_>) {
                     let row1 = &plane_rgb[(2 * y + 1) * w..(2 * y + 2) * w];
                     for x in x0..x1 {
                         let px = 2 * x;
-                        sum += f64::from(row0[px]) / 4.
-                            + f64::from(row0[px + 1]) / 4.
-                            + f64::from(row1[px]) / 4.
-                            + f64::from(row1[px + 1]) / 4.;
+                        sum += f64::from(row0[px]) / 4.;
+                        sum += f64::from(row0[px + 1]) / 4.;
+                        sum += f64::from(row1[px]) / 4.;
+                        sum += f64::from(row1[px + 1]) / 4.;
                     }
                 }
                 o[c] = sum;
@@ -942,5 +942,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.data, expected);
+    }
+
+    #[test]
+    fn dark_correction_preserves_sequential_sum_order_on_signed_inputs() {
+        let (pw, ph) = (2, 1);
+        let rgb_ref = vec![[0f32; 3]; pw * ph];
+        let clipped = vec![false; pw * ph];
+        let reference = GainReference {
+            width: pw,
+            height: ph,
+            rgb: &rgb_ref,
+            clipped: &clipped,
+        };
+        let (w, h) = (2 * pw, 2 * ph);
+        let plane = w * h;
+        let mut rgb = vec![0f32; 3 * plane];
+        // Pixel (0, 0): [-1, 0, 0, 0] across rows; pixel (1, 0): [1, 2^-60, 0, 0].
+        rgb[0] = -1.0;
+        rgb[2] = 1.0;
+        rgb[3] = 2f32.powi(-60);
+        correct_dark(&mut rgb, &reference);
+        assert_eq!(rgb[2], 0.0);
+        assert_eq!(rgb[3], 0.0);
     }
 }

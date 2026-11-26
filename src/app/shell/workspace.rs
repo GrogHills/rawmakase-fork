@@ -1742,19 +1742,34 @@ impl Editor {
             if keys.escape && !self.view.masking.is_renaming() {
                 self.view.tool = Tool::None;
             }
-            // Tool key handlers only mutate edit/view state without calling back into
-            // `ctx`, so they can borrow `InputState` directly without cloning it.
-            match self.view.tool {
-                Tool::Crop => ctx.input(|i| self.crop_keys(i)),
-                Tool::Remove => ctx.input(|i| self.retouch_keys(i)),
-                Tool::RedEye => ctx.input(|i| self.red_eye_keys(i)),
-                Tool::Mask => ctx.input(|i| self.mask_keys(i)),
-                Tool::Guided => ctx.input(|i| self.guided_keys(i)),
-                Tool::None
-                | Tool::WhiteBalance
-                | Tool::Defringe
-                | Tool::PointColor
-                | Tool::Targeted(_) => {}
+            // Tool key handlers may save session state to disk (`atomic_json`), so
+            // release `ctx`'s input lock before invoking them.
+            let tool_input = matches!(
+                self.view.tool,
+                Tool::Crop | Tool::Remove | Tool::RedEye | Tool::Mask | Tool::Guided
+            )
+            .then(|| {
+                ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+                        .then(|| i.clone())
+                })
+            })
+            .flatten();
+            if let Some(input) = &tool_input {
+                match self.view.tool {
+                    Tool::Crop => self.crop_keys(input),
+                    Tool::Remove => self.retouch_keys(input),
+                    Tool::RedEye => self.red_eye_keys(input),
+                    Tool::Mask => self.mask_keys(input),
+                    Tool::Guided => self.guided_keys(input),
+                    Tool::None
+                    | Tool::WhiteBalance
+                    | Tool::Defringe
+                    | Tool::PointColor
+                    | Tool::Targeted(_) => {}
+                }
             }
             if let Some(kind) = keys.new_mask {
                 self.create_mask(kind, None);

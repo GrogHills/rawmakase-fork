@@ -172,33 +172,37 @@ impl Catalog {
             return Ok(HashMap::new());
         }
         self.db.snapshot(|s| {
-            let steps: HashMap<i64, KeywordStep> = s
-                .read::<KeywordStep>(
-                    sql!(
-                        "SELECT k.id, k.name, k.parent, COALESCE(e.include, 1), COALESCE(e.parents, 1)
-                         FROM keywords k LEFT JOIN keyword_export e ON e.keyword = k.id"
-                    ),
-                    &[],
-                )?
-                .into_iter()
-                .map(|step| (step.id, step))
-                .collect();
-            let mut resolved: HashMap<i64, Keyword> = HashMap::new();
-            let mut by_photo: HashMap<PhotoId, Vec<Keyword>> = HashMap::with_capacity(ids.len());
+            let mut memberships: Vec<(PhotoId, Vec<i64>)> = Vec::with_capacity(ids.len());
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            let mut any_keyword = false;
             for &photo_id in ids {
-                if by_photo.contains_key(&photo_id) {
+                if !seen.insert(photo_id) {
                     continue;
                 }
                 let kw_ids: Vec<i64> = s.read(
                     sql!("SELECT keyword FROM photo_keywords WHERE photo=?"),
                     &[&photo_id],
                 )?;
+                any_keyword |= !kw_ids.is_empty();
+                memberships.push((photo_id, kw_ids));
+            }
+            if !any_keyword {
+                return Ok(memberships
+                    .into_iter()
+                    .map(|(photo_id, _)| (photo_id, Vec::new()))
+                    .collect());
+            }
+            let mut steps: HashMap<i64, KeywordStep> = HashMap::new();
+            let mut resolved: HashMap<i64, Keyword> = HashMap::new();
+            let mut by_photo: HashMap<PhotoId, Vec<Keyword>> =
+                HashMap::with_capacity(memberships.len());
+            for (photo_id, kw_ids) in memberships {
                 let mut photo_keywords = Vec::with_capacity(kw_ids.len());
                 for kw_id in kw_ids {
                     let kw = if let Some(cached) = resolved.get(&kw_id) {
                         cached.clone()
                     } else {
-                        let built = assemble_keyword(&steps, kw_id)?;
+                        let built = resolve_keyword(s, &mut steps, kw_id)?;
                         resolved.insert(kw_id, built.clone());
                         built
                     };
@@ -332,8 +336,8 @@ pub(super) fn keyword_at(w: &mut Write<'_>, path: &[String]) -> Result<i64> {
 }
 
 row! {
+    #[derive(Clone)]
     struct KeywordStep {
-        id: i64,
         name: String,
         parent: Option<i64>,
         included: bool,
@@ -358,7 +362,11 @@ fn build_keyword(id: i64, mut path: Vec<String>, include: Vec<bool>, parents: bo
     }
 }
 
-fn assemble_keyword(steps: &HashMap<i64, KeywordStep>, id: i64) -> Result<Keyword> {
+fn resolve_keyword(
+    db: &impl Reads,
+    steps: &mut HashMap<i64, KeywordStep>,
+    id: i64,
+) -> Result<Keyword> {
     let mut path = Vec::new();
     // Include on Export of each, from the keyword up.
     let mut include = Vec::new();
@@ -367,14 +375,28 @@ fn assemble_keyword(steps: &HashMap<i64, KeywordStep>, id: i64) -> Result<Keywor
     while let Some(k) = next {
         // A cycle in a damaged catalog would never end.
         ensure!(path.len() < 256, "Keyword hierarchy too deep");
-        let step = steps.get(&k).context("Unknown keyword")?;
+        let step = if let Some(cached) = steps.get(&k) {
+            cached.clone()
+        } else {
+            let fetched: KeywordStep = db
+                .read_optional(
+                    sql!(
+                        "SELECT k.name, k.parent, COALESCE(e.include, 1), COALESCE(e.parents, 1)
+                         FROM keywords k LEFT JOIN keyword_export e ON e.keyword = k.id WHERE k.id=?"
+                    ),
+                    &[&k],
+                )?
+                .context("Unknown keyword")?;
+            steps.insert(k, fetched.clone());
+            fetched
+        };
         if step.name.is_empty() && step.parent.is_none() {
             break;
         }
         if path.is_empty() {
             parents = step.with_parents;
         }
-        path.push(step.name.clone());
+        path.push(step.name);
         include.push(step.included);
         next = step.parent;
     }

@@ -116,29 +116,9 @@ impl CurveSet {
             // The black response follows the median positive-Shadows gain. Masks
             // select this response locally; an unmasked pixel keeps the global key.
             let levels = base.lum();
-            let unit_median = if levels.is_empty() {
-                None
-            } else {
-                levels
-                    .par_iter()
-                    .enumerate()
-                    .map(|(i, y)| {
-                        let x = (i % small.width as usize) as f32 / map.scale[0];
-                        let yy = (i / small.width as usize) as f32 / map.scale[1];
-                        map.shadow_unit_gain(x, yy, *y)
-                    })
-                    .collect::<Option<Vec<f32>>>()
-                    .map(|mut gains| {
-                        let k = (gains.len() - 1) / 2;
-                        *gains.select_nth_unstable_by(k, f32::total_cmp).1
-                    })
-            };
             let shift = |shadows: f32| {
                 if shadows <= 0. {
                     return 0.;
-                }
-                if let Some(median) = unit_median {
-                    return median * shadows.min(1.);
                 }
                 let mut gains: Vec<f32> = levels
                     .par_iter()
@@ -239,7 +219,11 @@ impl CurveSet {
                 .profile
                 .as_ref()
                 .and_then(|p| p.enhanced.as_ref()?.rgb().cloned()),
-            color_adjustments: r.effects.defringe != [0.; 2] || r.effects.monochrome,
+            color_adjustments: r.vibrance != 0.
+                || r.saturation != 0.
+                || r.hsl != [[0.; 3]; 8]
+                || r.effects.defringe != [0.; 2]
+                || r.effects.monochrome,
             calibration: crate::develop::calibration::Calibration::new(
                 r.effects.calibration,
                 r.effects.shadow_tint,

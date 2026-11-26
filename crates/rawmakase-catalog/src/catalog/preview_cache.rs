@@ -7,7 +7,7 @@
 //! rows are keyed by file and shared by virtual copies and catalogs.
 use super::{CatalogLocation, PhotoId};
 use anyhow::{Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -555,45 +555,68 @@ impl PreviewCache {
     }
     /// Evicts the least recently used rows of `kind` alone.
     fn prune_sized(&mut self, kind: PreviewKind, budget: i64) -> Result<()> {
+        let total: i64 = self
+            .db
+            .prepare_cached(
+                "SELECT COALESCE(sum(length(jpeg)),0) FROM sized_previews WHERE kind=?1",
+            )?
+            .query_row([kind.code()], |r| r.get(0))?;
+        if total <= budget {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows: Vec<(i64, i64)> = {
-            let mut stmt = self.db.prepare_cached(
+            let mut stmt = tx.prepare_cached(
                 "SELECT rowid, length(jpeg) FROM sized_previews WHERE kind=?1 ORDER BY last_used ASC, source_path ASC",
             )?;
             stmt.query_map([kind.code()], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?
         };
         let to_delete = evict_prefix(rows, budget);
-        if !to_delete.is_empty() {
-            let tx = self.db.transaction()?;
-            {
-                let mut del = tx.prepare_cached("DELETE FROM sized_previews WHERE rowid=?")?;
-                for rowid in to_delete {
-                    del.execute([rowid])?;
-                }
+        let deleted = !to_delete.is_empty();
+        if deleted {
+            let mut del =
+                tx.prepare_cached("DELETE FROM sized_previews WHERE rowid=?1 AND kind=?2")?;
+            for rowid in to_delete {
+                del.execute(params![rowid, kind.code()])?;
             }
-            tx.commit()?;
+        }
+        tx.commit()?;
+        if deleted {
             self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
         }
         Ok(())
     }
     fn prune(&mut self, budget: i64) -> Result<()> {
+        let total: i64 = self
+            .db
+            .prepare_cached("SELECT COALESCE(sum(length(jpeg)),0) FROM previews")?
+            .query_row([], |r| r.get(0))?;
+        if total <= budget {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows: Vec<(i64, i64)> = {
-            let mut stmt = self.db.prepare_cached(
+            let mut stmt = tx.prepare_cached(
                 "SELECT rowid, length(jpeg) FROM previews ORDER BY last_used ASC, source_path ASC",
             )?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?
         };
         let to_delete = evict_prefix(rows, budget);
-        if !to_delete.is_empty() {
-            let tx = self.db.transaction()?;
-            {
-                let mut del = tx.prepare_cached("DELETE FROM previews WHERE rowid=?")?;
-                for rowid in to_delete {
-                    del.execute([rowid])?;
-                }
+        let deleted = !to_delete.is_empty();
+        if deleted {
+            let mut del = tx.prepare_cached("DELETE FROM previews WHERE rowid=?")?;
+            for rowid in to_delete {
+                del.execute([rowid])?;
             }
-            tx.commit()?;
+        }
+        tx.commit()?;
+        if deleted {
             self.db.execute_batch("PRAGMA incremental_vacuum(256);")?;
         }
         Ok(())
@@ -1121,6 +1144,55 @@ mod tests {
             .execute("UPDATE sized_previews SET last_used=?", [long_ago])?;
         cache.touch_sized(&raw, "new", PreviewKind::OneToOne)?;
         assert_eq!(cache.expire(PreviewKind::OneToOne, month)?, 0);
+        Ok(())
+    }
+    #[test]
+    fn under_budget_pruning_and_multi_connection_sized_eviction_are_safe() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let raw = d.path().join("photo.ARW");
+        std::fs::write(&raw, b"original raw")?;
+        let db_path = d.path().join("previews.sqlite3");
+        let mut cache_a = PreviewCache::open(&db_path)?;
+        let cache_b = PreviewCache::open(&db_path)?;
+        let stamp = Stamp::read(&raw)?;
+        let im = image::RgbImage::from_pixel(32, 16, image::Rgb([100, 120, 140]));
+        cache_a.store(&raw, &stamp, &im)?;
+        cache_a.store_sized(&raw, "s1", PreviewKind::Standard, &stamp, 2048, &im)?;
+        cache_a.store_sized(&raw, "o1", PreviewKind::OneToOne, &stamp, 0, &im)?;
+        let before = cache_a.usage()?;
+        // Under-budget prunes keep every row untouched.
+        cache_a.prune(LIMIT)?;
+        cache_a.prune_sized(PreviewKind::Standard, PreviewKind::Standard.budget())?;
+        cache_a.prune_sized(PreviewKind::OneToOne, PreviewKind::OneToOne.budget())?;
+        assert_eq!(cache_a.usage()?, before);
+
+        // Even if another connection replaces the first rowid with a OneToOne entry,
+        // pruning Standard never deletes a OneToOne preview.
+        let std_rowid: i64 = cache_a.db.query_row(
+            "SELECT rowid FROM sized_previews WHERE kind=?",
+            [PreviewKind::Standard.code()],
+            |r| r.get(0),
+        )?;
+        cache_b
+            .db
+            .execute("DELETE FROM sized_previews WHERE rowid=?", [std_rowid])?;
+        cache_b.db.execute(
+            "INSERT INTO sized_previews(rowid,source_path,identity,kind,source_size,modified_ns,generation,requested_edge,width,height,jpeg,last_used)
+             VALUES(?1,?2,'o2',?3,1,'1',?4,0,32,16,X'FFD8FFD9',1)",
+            params![
+                std_rowid,
+                key(&raw),
+                PreviewKind::OneToOne.code(),
+                SIZED_GENERATION,
+            ],
+        )?;
+        cache_a.prune_sized(PreviewKind::Standard, 0)?;
+        let remaining_one_to_one: i64 = cache_a.db.query_row(
+            "SELECT count(*) FROM sized_previews WHERE kind=?",
+            [PreviewKind::OneToOne.code()],
+            |r| r.get(0),
+        )?;
+        assert_eq!(remaining_one_to_one, 2);
         Ok(())
     }
 }

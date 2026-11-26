@@ -220,16 +220,18 @@ impl CatalogSession {
         }
     }
     fn photo_position(&self, id: PhotoId) -> Option<usize> {
-        if let Some(&i) = self.photo_index.get(&id)
-            && self.photos.get(i).is_some_and(|p| p.id == id)
-        {
-            return Some(i);
-        }
-        #[cfg(test)]
-        if self.photo_index.len() != self.photos.len() || self.photo_index.contains_key(&id) {
-            return self.photos.iter().position(|p| p.id == id);
-        }
-        None
+        debug_assert!(
+            self.photo_index.len() == self.photos.len()
+                && self
+                    .photo_index
+                    .get(&id)
+                    .is_none_or(|&i| self.photos.get(i).is_some_and(|p| p.id == id)),
+            "CatalogSession::photo_index out of sync with photos"
+        );
+        self.photo_index
+            .get(&id)
+            .copied()
+            .filter(|&i| self.photos.get(i).is_some_and(|p| p.id == id))
     }
     /// The listed photo `id`, if it is in the session.
     pub(crate) fn photo(&self, id: PhotoId) -> Option<&Photo> {

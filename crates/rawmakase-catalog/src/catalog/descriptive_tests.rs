@@ -440,3 +440,17 @@ fn keywords_for_photos_rejects_cycles() -> Result<()> {
     assert!(cat.keywords_for_photos(&ids).is_err());
     Ok(())
 }
+
+#[test]
+fn keywords_for_photos_skips_unrelated_hierarchy_rows_when_untagged() -> Result<()> {
+    let (_dir, cat, ids) = catalog(2)?;
+    // Poison an unrelated keyword row with a non-integer/broken parent or cycle that only fails if read.
+    cat.db_for_tests().execute_batch(
+        "INSERT INTO keywords(id, name, parent) VALUES (10, 'Cyclic', 10);
+         INSERT INTO keywords(id, name, parent) VALUES (11, 'Extra', NULL);",
+    )?;
+    let empty = cat.keywords_for_photos(&[ids[0]])?;
+    assert_eq!(empty.len(), 1);
+    assert!(empty[&ids[0]].is_empty());
+    Ok(())
+}
