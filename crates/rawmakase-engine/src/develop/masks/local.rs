@@ -142,17 +142,7 @@ pub(crate) fn tone(
     p: [f32; 3],
     photo: &crate::develop::basic_tone::PhotoTone,
 ) -> [f32; 3] {
-    let curve =
-        |x| crate::develop::basic_tone::contrast_at(d[slot::CONTRAST], photo.contrast_pivot, x);
-    let p = p.map(|v| v.clamp(0., 1.));
-    let lo = p.into_iter().fold(f32::INFINITY, f32::min);
-    let hi = p.into_iter().fold(0f32, f32::max);
-    let (a, b) = (curve(lo), curve(hi));
-    if hi - lo > 1e-8 {
-        p.map(|v| a + (b - a) * (v - lo) / (hi - lo))
-    } else {
-        [a; 3]
-    }
+    crate::develop::basic_tone::contrast_at_rgb(d[slot::CONTRAST], photo.contrast_pivot, p)
 }
 /// Local Hue (degrees) and Saturation on Oklab.
 pub(crate) fn hue_saturation(d: &LocalDelta, mut lab: [f32; 3]) -> [f32; 3] {

@@ -181,8 +181,12 @@ impl PreviewTextures {
     /// Hands the worker the photos shown last frame. Call once per frame.
     pub(super) fn publish_shown(&mut self) {
         self.shown_files = std::mem::take(&mut self.thumb_seen);
-        self.shown_photos = std::mem::take(&mut self.edit_seen);
-        *self.edit_wanted.lock().unwrap() = self.shown_photos.clone();
+        let next_shown = std::mem::take(&mut self.edit_seen);
+        if next_shown != self.shown_photos {
+            self.shown_photos = next_shown;
+            self.edit_tx
+                .set_shown(&self.edit_wanted, self.shown_photos.clone());
+        }
     }
     /// How many textures of each kind are kept: [`KEPT`], or as many as are
     /// shown at once.

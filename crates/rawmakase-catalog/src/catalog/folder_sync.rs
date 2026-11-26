@@ -452,6 +452,24 @@ pub(super) fn current_master(db: &impl Reads, id: PhotoId) -> Result<Option<Mast
     }))
 }
 
+/// Memoizes `list_all(dir)` results per directory within one scan.
+#[derive(Default)]
+pub(super) struct DirCheckCache(HashMap<PathBuf, Result<(), std::sync::Arc<std::io::Error>>>);
+
+impl DirCheckCache {
+    pub(super) fn list_all(
+        &mut self,
+        directory: &Path,
+    ) -> Result<(), std::sync::Arc<std::io::Error>> {
+        if let Some(cached) = self.0.get(directory) {
+            return cached.clone();
+        }
+        let result = list_all(directory).map_err(std::sync::Arc::new);
+        self.0.insert(directory.to_path_buf(), result.clone());
+        result
+    }
+}
+
 /// Lists `directory` to the end, so a listing that fails part way is no
 /// evidence of anything.
 pub(super) fn list_all(directory: &Path) -> std::io::Result<()> {
@@ -494,6 +512,27 @@ pub(super) fn state_of(
     anchor: Option<&Path>,
     online: &dyn Fn(&Path) -> bool,
 ) -> FileState {
+    state_of_with(path, anchor, online, &mut |dir| {
+        list_all(dir).map_err(std::sync::Arc::new)
+    })
+}
+
+/// [`state_of`] reusing `list_all` results cached in `cache`.
+pub(super) fn state_of_cached(
+    path: Option<&Path>,
+    anchor: Option<&Path>,
+    online: &dyn Fn(&Path) -> bool,
+    cache: &mut DirCheckCache,
+) -> FileState {
+    state_of_with(path, anchor, online, &mut |dir| cache.list_all(dir))
+}
+
+fn state_of_with(
+    path: Option<&Path>,
+    anchor: Option<&Path>,
+    online: &dyn Fn(&Path) -> bool,
+    listed: &mut impl FnMut(&Path) -> Result<(), std::sync::Arc<std::io::Error>>,
+) -> FileState {
     let (Some(path), Some(anchor)) = (path, anchor) else {
         return FileState::Unavailable;
     };
@@ -505,7 +544,6 @@ pub(super) fn state_of(
         }
         Err(_) => {}
     }
-    let listed = |dir: &Path| list_all(dir);
     let parent = path.parent().unwrap_or(anchor);
     let evidence = match listed(parent) {
         Ok(()) => listed(anchor),

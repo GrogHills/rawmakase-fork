@@ -228,7 +228,7 @@ fn find_on_disk_is_offered_for_one_offline_photo() -> Result<()> {
         library.menu_single(a, true)
     ));
     // One of several selected: the menu acts on them all, so not offered.
-    library.selection.selected.extend([a, b]);
+    library.selection.mutate(|s| s.selected.extend([a, b]));
     assert!(!library.menu_single(a, true));
     assert!(!cell::find_on_disk_enabled(
         false,
@@ -986,8 +986,9 @@ fn batched_availability_distinguishes_files_directories_and_missing_paths() -> R
     directory.path = photos.join("directory.ARW");
     std::fs::create_dir(&directory.path)?;
     rows.push(directory);
+    let paths: Vec<PathBuf> = rows.into_iter().map(|p| p.path).collect();
     assert_eq!(
-        thumbnails::available_paths(&rows),
+        thumbnails::available_paths(&paths),
         HashSet::from([photos.join("present.ARW").canonicalize()?])
     );
     Ok(())
@@ -3211,8 +3212,10 @@ fn a_mixed_field_left_alone_changes_nothing_and_typing_replaces_it_on_all() -> R
         .session
         .catalog_mut_for_tests()
         .set_text(&ids[..1], TextField::Title, "Only a")?;
-    library.selection.selected = ids.iter().copied().collect();
-    library.selection.active = Some(ids[0]);
+    library.selection.mutate(|s| {
+        s.selected = ids.iter().copied().collect();
+        s.active = Some(ids[0]);
+    });
     library.sync_fields();
     assert_eq!(library.fields.drafts.title, "");
     // Leaving the field without typing.
@@ -3221,8 +3224,10 @@ fn a_mixed_field_left_alone_changes_nothing_and_typing_replaces_it_on_all() -> R
     assert_eq!(library.session.catalog().descriptive(ids[1])?.title, None);
     // Typing then moving the selection saves it for the photos it was typed for.
     library.fields.drafts.title = "Both".into();
-    library.selection.selected = [ids[1]].into();
-    library.selection.active = Some(ids[1]);
+    library.selection.mutate(|s| {
+        s.selected = [ids[1]].into();
+        s.active = Some(ids[1]);
+    });
     library.sync_fields();
     for id in &ids {
         assert_eq!(
@@ -3297,14 +3302,18 @@ fn a_descriptive_edit_is_one_command_that_restores_each_photo() -> Result<()> {
 fn a_draft_that_fails_to_save_stays_with_its_photos() -> Result<()> {
     let (_dir, mut library) = library_of(&["a.ARW", "b.ARW"])?;
     let ids: Vec<PhotoId> = library.session.photos().iter().map(|p| p.id).collect();
-    library.selection.selected = [ids[0]].into();
-    library.selection.active = Some(ids[0]);
+    library.selection.mutate(|s| {
+        s.selected = [ids[0]].into();
+        s.active = Some(ids[0]);
+    });
     library.sync_fields();
     library.fields.drafts.title = "For a".into();
     // A write that fails, as on a full disk.
     library.session.catalog().fail_metadata_writes()?;
-    library.selection.selected = [ids[1]].into();
-    library.selection.active = Some(ids[1]);
+    library.selection.mutate(|s| {
+        s.selected = [ids[1]].into();
+        s.active = Some(ids[1]);
+    });
     library.sync_fields();
     assert_eq!(library.fields.targets, vec![ids[0]]);
     assert_eq!(library.fields.drafts.title, "For a");
@@ -3314,12 +3323,16 @@ fn a_draft_that_fails_to_save_stays_with_its_photos() -> Result<()> {
 fn a_keyword_being_typed_is_dropped_when_the_selection_moves() -> Result<()> {
     let (_dir, mut library) = library_of(&["a.ARW", "b.ARW"])?;
     let ids: Vec<PhotoId> = library.session.photos().iter().map(|p| p.id).collect();
-    library.selection.selected = [ids[0]].into();
-    library.selection.active = Some(ids[0]);
+    library.selection.mutate(|s| {
+        s.selected = [ids[0]].into();
+        s.active = Some(ids[0]);
+    });
     library.sync_fields();
     library.fields.keyword_entry = "Typed for a".into();
-    library.selection.selected = [ids[1]].into();
-    library.selection.active = Some(ids[1]);
+    library.selection.mutate(|s| {
+        s.selected = [ids[1]].into();
+        s.active = Some(ids[1]);
+    });
     library.sync_fields();
     assert!(library.fields.keyword_entry.is_empty());
     Ok(())
@@ -3388,8 +3401,10 @@ fn emptying_a_mixed_field_after_typing_clears_it_on_every_photo() -> Result<()> 
         .session
         .catalog_mut_for_tests()
         .set_text(&ids[..1], TextField::Title, "Only a")?;
-    library.selection.selected = ids.iter().copied().collect();
-    library.selection.active = Some(ids[0]);
+    library.selection.mutate(|s| {
+        s.selected = ids.iter().copied().collect();
+        s.active = Some(ids[0]);
+    });
     library.sync_fields();
     // Typed, then deleted again.
     library.fields.drafts.title = String::new();
@@ -3407,8 +3422,10 @@ fn emptying_a_mixed_field_after_typing_clears_it_on_every_photo() -> Result<()> 
 fn the_same_photos_in_another_order_keep_what_is_typed() -> Result<()> {
     let (_dir, mut library) = library_of(&["a.ARW", "b.ARW"])?;
     let ids: Vec<PhotoId> = library.session.photos().iter().map(|p| p.id).collect();
-    library.selection.selected = ids.iter().copied().collect();
-    library.selection.active = Some(ids[0]);
+    library.selection.mutate(|s| {
+        s.selected = ids.iter().copied().collect();
+        s.active = Some(ids[0]);
+    });
     library.sync_fields();
     library.fields.keyword_entry = "Typed".into();
     library.visible.reverse();
@@ -3421,8 +3438,10 @@ fn a_draft_in_a_hidden_section_is_saved_when_the_values_are_read_again() -> Resu
     use crate::metadata::{LangAlt, Value};
     let (_dir, mut library) = library_of(&["a.ARW"])?;
     let id = library.session.photos()[0].id;
-    library.selection.selected = [id].into();
-    library.selection.active = Some(id);
+    library.selection.mutate(|s| {
+        s.selected = [id].into();
+        s.active = Some(id);
+    });
     library.sync_fields();
     library.fields.drafts.title = "Typed".into();
     // A keyword added meanwhile reads the values again.
@@ -3448,8 +3467,10 @@ fn a_draft_in_a_hidden_section_is_saved_when_the_values_are_read_again() -> Resu
 fn a_saved_draft_is_not_saved_again_after_undo() -> Result<()> {
     let (_dir, mut library) = library_of(&["a.ARW"])?;
     let id = library.session.photos()[0].id;
-    library.selection.selected = [id].into();
-    library.selection.active = Some(id);
+    library.selection.mutate(|s| {
+        s.selected = [id].into();
+        s.active = Some(id);
+    });
     library.sync_fields();
     library.fields.drafts.title = "Typed".into();
     library.commit_fields()?;
@@ -4543,7 +4564,7 @@ fn a_stack_shows_where_its_top_sorts_and_the_filters_show_every_match() -> Resul
     let (_d, mut library, ids) = stack_library(&["a.RAF", "b.RAF", "c.RAF", "d.RAF", "e.RAF"])?;
     let [a, b, c, d, e] = ids[..] else { panic!() };
     library.select(Some(d));
-    library.selection.selected = [b, d].into();
+    library.selection.mutate(|s| s.selected = [b, d].into());
     library.stack_action(StackAction::Group, vec![b, d]);
     // The active photo is the top; collapsed, it shows alone where it sorts.
     assert_eq!(library.session.catalog().stack_of(b)?, [d, b]);
@@ -4810,7 +4831,7 @@ fn grouping_puts_the_active_photo_on_top_even_for_a_stack_whose_top_is_filtered_
     // a is filtered out: b shows for the collapsed stack.
     assert_eq!(library.shown(), [b, c]);
     library.select(Some(b));
-    library.selection.selected = [b, c].into();
+    library.selection.mutate(|s| s.selected = [b, c].into());
     library.stack_action(StackAction::Group, vec![b, c]);
     assert_eq!(library.session.catalog().stack_of(a)?, [b, a, c]);
     assert_eq!(library.shown(), [b]);

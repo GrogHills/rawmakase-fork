@@ -17,8 +17,14 @@ pub struct AiSource(Arc<CameraImage>);
 impl AiSource {
     /// Recovers the highlights of `image`, the assembled AI source
     /// (`rawmakase_decode::ai::denoise::assemble`); its unrecovered pixels are let go.
-    pub fn recover(image: CameraImage, cancel: Cancel<'_>) -> Result<Self> {
-        Ok(Self(super::quality::recovered(&image, cancel)?))
+    pub fn recover(mut image: CameraImage, cancel: Cancel<'_>) -> Result<Self> {
+        if let Some(recovered) = std::mem::take(&mut image.recovered).into_inner() {
+            return Ok(Self(recovered));
+        }
+        if !image.metadata.is_rendered() {
+            super::quality::recover_highlights_in_place(&mut image, cancel)?;
+        }
+        Ok(Self(Arc::new(image)))
     }
     /// The recovered image.
     pub fn image(&self) -> &Arc<CameraImage> {

@@ -239,13 +239,10 @@ impl Library {
         changed
     }
     fn has_copies(&self) -> bool {
-        self.session.photos().iter().any(|p| p.master.is_some())
+        self.has_copies
     }
     fn has_other_labels(&self) -> bool {
-        self.session
-            .photos()
-            .iter()
-            .any(|p| !p.label.is_empty() && !LABELS.contains(&p.label.as_str()))
+        self.has_other_labels
     }
 }
 

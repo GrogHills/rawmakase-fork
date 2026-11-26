@@ -72,12 +72,6 @@ impl CatalogSession {
         let Ok(mut stored) = self.catalog.sequences() else {
             return;
         };
-        let photos: HashMap<PhotoId, &crate::catalog::Photo> = self
-            .photos
-            .iter()
-            .filter(|p| p.master.is_none())
-            .map(|p| (p.id, p))
-            .collect();
         let mut batches = Vec::new();
         let mut todo: Vec<(PhotoId, PathBuf)> = Vec::new();
         // By the file each was asked for: what was kept of a photo is only
@@ -87,7 +81,7 @@ impl CatalogSession {
             let members: Vec<&crate::catalog::Photo> = batch
                 .photos
                 .iter()
-                .filter_map(|id| photos.get(id).copied())
+                .filter_map(|id| self.photo(*id).filter(|p| p.master.is_none()))
                 .collect();
             if members.iter().any(|p| !available(&p.path)) {
                 continue;

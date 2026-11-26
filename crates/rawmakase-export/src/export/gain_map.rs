@@ -58,22 +58,33 @@ impl Metadata {
     }
 }
 
-/// The gain map of `hdr` over `sdr`, both linear sRGB-primaries RGB of the same size
-/// (1 = graphics white), as 8-bit samples, with its metadata; `peak` is the master's
-/// brightest value.
-pub fn compute(sdr: &[[f32; 3]], hdr: &[[f32; 3]], peak: f32) -> Result<(Vec<u8>, Metadata)> {
+/// Rec. 709 luminance of `p` with negative channels clamped at 0.
+pub(super) fn luminance(p: [f32; 3]) -> f32 {
+    LUMINANCE[0] * p[0].max(0.) + LUMINANCE[1] * p[1].max(0.) + LUMINANCE[2] * p[2].max(0.)
+}
+
+/// The gain map of `hdr_lum` over `sdr_lum` (both Rec. 709 linear luminance,
+/// 1 = graphics white), as 8-bit samples, with its metadata; `peak` is the
+/// master's brightest value.
+pub(super) fn compute_from_luminances(
+    sdr_lum: impl ExactSizeIterator<Item = f32>,
+    hdr_lum: impl ExactSizeIterator<Item = f32>,
+    peak: f32,
+) -> Result<(Vec<u8>, Metadata)> {
     ensure!(
-        sdr.len() == hdr.len() && !sdr.is_empty(),
+        sdr_lum.len() == hdr_lum.len() && sdr_lum.len() > 0,
         "Gain map renditions differ in size"
     );
-    let lum = |p: &[f32; 3]| (0..3).map(|c| LUMINANCE[c] * p[c].max(0.)).sum::<f32>();
-    let gains: Vec<f32> = sdr
-        .iter()
-        .zip(hdr)
-        .map(|(s, h)| ((lum(h) + OFFSET) / (lum(s) + OFFSET)).log2())
-        .collect();
-    let min = gains.iter().copied().fold(f32::INFINITY, f32::min).min(0.);
-    let mut max = gains.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut gains = Vec::with_capacity(sdr_lum.len());
+    for (s, h) in sdr_lum.zip(hdr_lum) {
+        let g = ((h + OFFSET) / (s + OFFSET)).log2();
+        min = min.min(g);
+        max = max.max(g);
+        gains.push(g);
+    }
+    min = min.min(0.);
     if max - min < 1. / 256. {
         max = min + 1. / 256.;
     }
@@ -90,6 +101,17 @@ pub fn compute(sdr: &[[f32; 3]], hdr: &[[f32; 3]], peak: f32) -> Result<(Vec<u8>
             alternate_headroom: peak.max(1.).log2(),
         },
     ))
+}
+
+/// The gain map of `hdr` over `sdr`, both linear sRGB-primaries RGB of the same size
+/// (1 = graphics white), as 8-bit samples, with its metadata; `peak` is the master's
+/// brightest value.
+pub fn compute(sdr: &[[f32; 3]], hdr: &[[f32; 3]], peak: f32) -> Result<(Vec<u8>, Metadata)> {
+    compute_from_luminances(
+        sdr.iter().map(|p| luminance(*p)),
+        hdr.iter().map(|p| luminance(*p)),
+        peak,
+    )
 }
 
 /// The APP2 payload naming ISO 21496-1, before its metadata.

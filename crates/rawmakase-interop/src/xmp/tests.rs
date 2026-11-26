@@ -2108,6 +2108,28 @@ fn a_preset_says_whether_it_measures_the_photo() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn has_crop_false_still_validates_and_drops_invalid_crop_fields() -> Result<()> {
+    let m = Metadata::default();
+    for source in [
+        "s = { HasCrop = false, CropLeft = 2 }",
+        "s = { HasCrop = 0, CropLeft = 2 }",
+    ] {
+        let (r, warnings) = crate::lr_develop::convert_develop(source, &m, &[], None)?;
+        assert_eq!(r.crop, [0., 0., 1., 1.], "{source}");
+        assert!(
+            warnings.iter().any(|w| w.contains("CropLeft")),
+            "expected CropLeft validation warning for {source}, got {warnings:?}"
+        );
+        assert!(
+            !r.preset_settings.contains_key("CropLeft"),
+            "out-of-range CropLeft must not be retained for {source}: {:?}",
+            r.preset_settings
+        );
+    }
+    Ok(())
+}
 /// A fitted camera look travels whole in sidecars and presets and comes back
 /// exactly, at its Amount, without any profile of its name installed; one that is
 /// missing, damaged or for another camera is refused, never refitted or replaced.

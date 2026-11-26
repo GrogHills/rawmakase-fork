@@ -255,6 +255,9 @@ impl Library {
                         .clicked()
                     {
                         self.filters.only_editable_previews = !self.filters.only_editable_previews;
+                        if self.filters.only_editable_previews {
+                            self.editable_previews_dirty = true;
+                        }
                         self.filter()
                     }
                 });

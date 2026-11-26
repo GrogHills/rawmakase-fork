@@ -118,10 +118,22 @@ pub(super) fn scene_color(
 /// tone stage's, as Camera Raw's does not follow the camera's baseline exposure.
 pub(super) fn exposure_stage(color: [f32; 3], lut: &CurveSet, local: Option<Local>) -> [f32; 3] {
     let exposure = local.map_or(0., |l| l.delta[slot::EXPOSURE]);
-    let mut rgb = mul(TO_2020, color).map(|v| v * lut.exposure_gain * exposure.exp2());
-    if let Some(l) = local {
+    let local_gain = if exposure == 0. { 1. } else { exposure.exp2() };
+    let mut rgb = mul(TO_2020, color).map(|v| {
+        if exposure == 0. {
+            v * lut.exposure_gain
+        } else {
+            v * lut.exposure_gain * local_gain
+        }
+    });
+    if let Some(l) = local
+        && l.delta[slot::COLOR..slot::COLOR + 3] != [0.; 3]
+    {
         for (c, v) in rgb.iter_mut().enumerate() {
-            *v *= l.delta[slot::COLOR + c].exp2();
+            let d = l.delta[slot::COLOR + c];
+            if d != 0. {
+                *v *= d.exp2();
+            }
         }
     }
     mul(crate::camera_profiles::RGB_TO_PRO, mul(FROM_2020, rgb))
@@ -263,8 +275,9 @@ pub(super) fn color_stage(
     // Raw 18.7 applies it (also after the user's tone curves and Saturation).
     let rgb = lut.rgb_table.as_ref().map_or(rgb, |t| t.apply(rgb));
     let rgb = lut.grade.as_ref().map_or(rgb, |g| g.apply(rgb));
+    let local_hs = local.is_some_and(|d| d[slot::HUE] != 0. || d[slot::SATURATION] != 0.);
     let mut lab = srgb_to_lab(rgb);
-    if let Some(d) = local {
+    if local_hs && let Some(d) = local {
         lab = local::hue_saturation(d, lab);
     }
     if lut.output == PixelOutput::ColorInput {

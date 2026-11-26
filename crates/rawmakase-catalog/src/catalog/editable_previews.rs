@@ -414,18 +414,26 @@ impl Catalog {
     /// file may be missing (deleted outside RAWmakase, or the catalog moved
     /// without its store folder): the caller checks when it opens it.
     pub fn editable_preview(&self, photo: PhotoId) -> Result<Option<EditablePreview>> {
-        let stored: Option<Stored> = self.db.read_optional(
-            sql!(
-                "SELECT s.photo, s.file, s.identity, s.original_width, s.original_height,
-                    s.width, s.height, s.bytes, s.version, s.built_at
-                 FROM editable_previews s JOIN photos p ON p.id = s.photo
-                 WHERE COALESCE(p.master_id, p.id) =
-                     (SELECT COALESCE(q.master_id, q.id) FROM photos q WHERE q.id = ?)
-                 ORDER BY CASE WHEN p.master_id IS NULL THEN 0 ELSE 1 END, s.built_at DESC
-                 LIMIT 1"
-            ),
-            &[&photo],
-        )?;
+        let stored: Option<Stored> = self.db.snapshot(|s| {
+            let Some(master): Option<i64> = s.read_optional(
+                sql!("SELECT COALESCE(master_id, id) FROM photos WHERE id = ?"),
+                &[&photo],
+            )?
+            else {
+                return Ok(None);
+            };
+            s.read_optional(
+                sql!(
+                    "SELECT s.photo, s.file, s.identity, s.original_width, s.original_height,
+                        s.width, s.height, s.bytes, s.version, s.built_at
+                     FROM editable_previews s JOIN photos p ON p.id = s.photo
+                     WHERE p.id = ?1 OR p.master_id = ?1
+                     ORDER BY CASE WHEN p.master_id IS NULL THEN 0 ELSE 1 END, s.built_at DESC
+                     LIMIT 1"
+                ),
+                &[&master],
+            )
+        })?;
         stored
             .map(|s| s.read(&self.editable_preview_folder()))
             .transpose()

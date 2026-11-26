@@ -20,6 +20,13 @@ pub(crate) struct Behaviour {
     pub(crate) gate: Mutex<()>,
     /// Panic when a loaded model is dropped, outside any job.
     panic_on_drop: bool,
+    /// Hold or notify while a loaded model is being dropped, outside any lock.
+    drop_gate: Option<DropGate>,
+}
+
+struct DropGate {
+    started: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<mpsc::Receiver<()>>,
 }
 
 /// Nearest-neighbour stand-in for the network, at the model's own scale (×10⁶).
@@ -30,6 +37,12 @@ struct Fake {
 
 impl Drop for Fake {
     fn drop(&mut self) {
+        if let Some(gate) = &self.behaviour.drop_gate {
+            if let Some(tx) = gate.started.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let _ = gate.release.lock().unwrap().recv();
+        }
         if self.behaviour.panic_on_drop && !std::thread::panicking() {
             panic!("fake model panicked when dropped");
         }
@@ -891,6 +904,44 @@ fn a_request_while_the_dying_worker_reports_its_failures_starts_a_new_worker() {
     release.send(()).unwrap();
     let states = until_final(&c);
     assert!(matches!(states.last(), Some(State::Ready(_))), "{states:?}");
+}
+
+#[test]
+fn stop_does_not_block_while_unload_drops_model() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let f = fixture(
+        Provider::Cpu,
+        Behaviour {
+            drop_gate: Some(DropGate {
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(release_rx),
+            }),
+            ..Default::default()
+        },
+    );
+    let plain = f.plain();
+    let (rx, _w) = f.request(&f.photo("a.raw"), &plain, None);
+    assert!(matches!(until_final(&rx).last(), Some(State::Ready(_))));
+    let service = f.service.clone();
+    let unloader = std::thread::spawn(move || service.unload());
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("model drop started");
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let stop_service = f.service;
+    let stop_thread = std::thread::spawn(move || {
+        let handle = stop_service.stop();
+        let _ = stop_tx.send(());
+        handle
+    });
+    let stopped_in_time = stop_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    let _ = release_tx.send(());
+    unloader.join().unwrap();
+    if let Some(handle) = stop_thread.join().unwrap() {
+        handle.join().unwrap();
+    }
+    assert!(stopped_in_time, "stop() blocked while model was dropping");
 }
 
 /// A result is filed under the file's identity, the model and its assembly version,

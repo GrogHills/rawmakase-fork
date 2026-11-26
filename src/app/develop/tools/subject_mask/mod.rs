@@ -657,15 +657,12 @@ impl Editor {
         }
         // The rasters this would add, with every other the edit and its History refer to.
         let edit = &self.document.edit;
-        let history = edit.history().saved(edit.recipe());
-        let held = history.mask_asset_ids();
-        let ids: Vec<&str> = edit
-            .recipe()
-            .mask_asset_ids()
-            .chain(held.iter().copied())
-            .chain([generated.id.as_str()])
-            .collect();
-        let bytes = crate::storage::mask_assets::decoded_bytes(ids);
+        let held = edit.history().mask_asset_ids(edit.recipe());
+        let bytes = crate::storage::mask_assets::decoded_bytes(
+            held.iter()
+                .map(String::as_str)
+                .chain([generated.id.as_str()]),
+        );
         if bytes > crate::storage::mask_assets::EDIT_BYTES {
             self.messages
                 .warn("This photo's masks use too much memory for another selection");
@@ -750,11 +747,7 @@ impl Editor {
         }
         let edit = &self.document.edit;
         let named = edit.recipe().mask_asset_ids().any(|i| i == id)
-            || edit
-                .history()
-                .saved(edit.recipe())
-                .mask_asset_ids()
-                .contains(id)
+            || edit.history().mask_asset_ids(edit.recipe()).contains(id)
             || self
                 .document
                 .before

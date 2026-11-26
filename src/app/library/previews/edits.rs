@@ -89,6 +89,8 @@ pub(in crate::app::library) struct EditQueue(Arc<Shared>);
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    #[cfg(test)]
+    waited: Condvar,
 }
 #[derive(Default)]
 struct State {
@@ -102,19 +104,42 @@ struct State {
     /// Where AI Denoise's results are, which an edit with it renders from once
     /// finished; none until the app sets it.
     ai: Option<AiCache>,
+    #[cfg(test)]
+    parked: bool,
 }
 struct Queued {
     job: EditJob,
+    /// Whether this job's edit enables AI Denoise, filled once on the worker thread
+    /// outside `State`'s mutex during cache lookup (or start).
+    renders_ai: Option<bool>,
     /// The cache had no preview for it when asked; it waits for a render.
     missed: bool,
     /// Asked ahead for a list no longer shown: answered without a render
     /// unless its photo is shown.
     dropped: bool,
 }
+impl Queued {
+    fn new(job: EditJob) -> Self {
+        let renders_ai = match &job {
+            EditJob::Render { .. } => None,
+            EditJob::Store { .. } => Some(false),
+        };
+        Self {
+            job,
+            renders_ai,
+            missed: false,
+            dropped: false,
+        }
+    }
+}
+const MAX_CONCURRENT_AI_RENDERS: usize = 2;
+
 struct Running {
     slot: u64,
     /// On the full pace's threads, so given up when the pace drops.
     full: bool,
+    /// Decodes full-size source data for AI Denoise, bounded across concurrent jobs.
+    ai: bool,
     cancel: Arc<AtomicBool>,
     /// The file rendered: another render of it waits for this one.
     path: PathBuf,
@@ -144,15 +169,12 @@ impl std::fmt::Display for Closed {
 impl std::error::Error for Closed {}
 impl EditQueue {
     pub(in crate::app::library) fn send(&self, job: EditJob) -> Result<(), Closed> {
+        let queued = Queued::new(job);
         let mut state = self.0.lock();
         if state.closed {
             return Err(Closed);
         }
-        state.jobs.push(Queued {
-            job,
-            missed: false,
-            dropped: false,
-        });
+        state.jobs.push(queued);
         self.0.changed.notify_all();
         Ok(())
     }
@@ -187,6 +209,64 @@ impl EditQueue {
             }
         }
         self.0.changed.notify_all();
+    }
+    /// Updates `wanted` to `shown` and wakes the worker if visibility changed.
+    /// Acquires `State` before `Wanted`, matching `next_step` and `Renders::start`.
+    pub(in crate::app::library) fn set_shown(
+        &self,
+        wanted: &Wanted,
+        shown: std::collections::HashSet<PhotoId>,
+    ) {
+        let state = self.0.lock();
+        let mut guard = wanted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *guard != shown {
+            *guard = shown;
+            drop(guard);
+            if !state.jobs.is_empty() {
+                self.0.changed.notify_all();
+            }
+        }
+        drop(state);
+    }
+    #[cfg(test)]
+    fn wait_until(&self, ready: impl Fn(&State) -> bool) {
+        let mut state = self.0.lock();
+        let started = std::time::Instant::now();
+        while !ready(&state) {
+            let remaining = std::time::Duration::from_secs(20)
+                .checked_sub(started.elapsed())
+                .expect("timed out waiting for edited preview scheduler");
+            let (next, timed_out) = self
+                .0
+                .waited
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            if ready(&state) {
+                return;
+            }
+            assert!(
+                !timed_out.timed_out(),
+                "timed out waiting for edited preview scheduler"
+            );
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn wait_until_parked(&self) {
+        self.wait_until(|state| state.parked);
+    }
+    #[cfg(test)]
+    pub(super) fn wait_until_deferred_ai_parked(&self, target: PhotoId) {
+        self.wait_until(|state| {
+            state.parked
+                && state.jobs.iter().any(|q| {
+                    matches!(q.job, EditJob::Render { id, .. } if id == target)
+                        && q.renders_ai == Some(true)
+                        && !q.missed
+                })
+        });
     }
     /// Cancels the renders under way and ends the worker once they stop;
     /// jobs not started are dropped.
@@ -266,6 +346,8 @@ enum Step {
     /// Answer without rendering: the photo is out of view, or was asked for
     /// ahead and the pace dropped.
     Skip(PhotoId, u64),
+    /// Classify whether an offscreen job enables AI Denoise before any file I/O.
+    Classify(usize),
     /// Ask the cache, then render on a miss when `render` (a free slot).
     Look(usize, bool),
     Render(usize),
@@ -302,6 +384,61 @@ pub(super) fn spawn_edited_with_ai(
     render: RenderEdited,
     render_ai: RenderWithAi,
 ) -> Worker<EditQueue, EditResult> {
+    spawn_edited_inner(cache_path, wanted, ctx, render, render_ai, None, true)
+}
+/// Runs the edited-preview worker with a fixed `full_renders` cap while keeping
+/// the production Rayon worker pools active.
+#[cfg(test)]
+pub(super) fn spawn_edited_with_ai_slots(
+    cache_path: PathBuf,
+    wanted: Wanted,
+    ctx: egui::Context,
+    render: RenderEdited,
+    render_ai: RenderWithAi,
+    full_renders: usize,
+) -> Worker<EditQueue, EditResult> {
+    spawn_edited_inner(
+        cache_path,
+        wanted,
+        ctx,
+        render,
+        render_ai,
+        Some(full_renders),
+        true,
+    )
+}
+/// Runs the edited-preview worker with a fixed `full_renders` cap and without
+/// Rayon worker pools for tests whose render callback blocks on a cross-task
+/// barrier, where Rayon work-stealing during nested parallel cache reads can
+/// pin another render task on the same worker stack.
+#[cfg(test)]
+pub(super) fn spawn_edited_with_ai_slots_unpooled(
+    cache_path: PathBuf,
+    wanted: Wanted,
+    ctx: egui::Context,
+    render: RenderEdited,
+    render_ai: RenderWithAi,
+    full_renders: usize,
+) -> Worker<EditQueue, EditResult> {
+    spawn_edited_inner(
+        cache_path,
+        wanted,
+        ctx,
+        render,
+        render_ai,
+        Some(full_renders),
+        false,
+    )
+}
+fn spawn_edited_inner(
+    cache_path: PathBuf,
+    wanted: Wanted,
+    ctx: egui::Context,
+    render: RenderEdited,
+    render_ai: RenderWithAi,
+    full_renders_override: Option<usize>,
+    use_pools: bool,
+) -> Worker<EditQueue, EditResult> {
     let shared = Arc::<Shared>::default();
     let (tx, result_rx) = mpsc::channel();
     let results = Results {
@@ -311,10 +448,15 @@ pub(super) fn spawn_edited_with_ai(
     };
     let thread = crate::raw::spawn_background(move || {
         let full_threads = full_threads();
-        let full_renders = full_renders(crate::platform::memory::total(), full_threads);
+        let full_renders = full_renders_override
+            .unwrap_or_else(|| full_renders(crate::platform::memory::total(), full_threads));
         let renders = Renders {
-            background: crate::raw::background_pool(2, "edited-preview").ok(),
-            full: crate::raw::background_pool(full_threads, "edited-preview-full").ok(),
+            background: use_pools
+                .then(|| crate::raw::background_pool(2, "edited-preview").ok())
+                .flatten(),
+            full: use_pools
+                .then(|| crate::raw::background_pool(full_threads, "edited-preview-full").ok())
+                .flatten(),
             cache: Arc::new(Mutex::new(PreviewCache::open(&cache_path).ok())),
             cache_path,
             wanted,
@@ -327,6 +469,7 @@ pub(super) fn spawn_edited_with_ai(
                 Step::Exit => break,
                 Step::Skip(id, ticket) => renders.results.send(EditResult::Skipped(id, ticket)),
                 Step::Store(path, tag, stamp, image) => renders.store(&path, &tag, &stamp, &image),
+                Step::Classify(index) => renders.classify(index),
                 Step::Look(index, render) => renders.look(index, render),
                 Step::Render(index) => renders.start(index),
             }
@@ -376,13 +519,16 @@ impl Renders {
     /// as its preview under `tag`; a file changed since gets none of it, and
     /// that is not a cache failure.
     fn store(&self, path: &Path, tag: &str, stamp: &Stamp, image: &image::RgbImage) {
+        if Stamp::read(path).ok().as_ref() != Some(stamp) {
+            return;
+        }
         let stored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match &mut *cache(&self.cache) {
-                Some(cache) if Stamp::read(path).ok().as_ref() == Some(stamp) => cache
+                Some(cache) => cache
                     .store_tagged(path, tag, stamp, image)
                     .err()
                     .map(|error| error.to_string()),
-                _ => None,
+                None => None,
             }
         }));
         match stored {
@@ -391,12 +537,30 @@ impl Renders {
             Err(_) => reopen(&self.cache, &self.cache_path),
         }
     }
+    /// Classifies whether the queued render at `index` enables AI Denoise,
+    /// outside `State`'s mutex and without reading the photo from disk.
+    fn classify(&self, index: usize) {
+        let source = {
+            let state = self.results.shared.lock();
+            if state.closed {
+                return;
+            }
+            match &state.jobs[index].job {
+                EditJob::Render { source, .. } => source.clone(),
+                EditJob::Store { .. } => unreachable!("stores are already classified"),
+            }
+        };
+        let renders_ai = source.renders_ai();
+        let mut state = self.results.shared.lock();
+        state.jobs[index].renders_ai = Some(renders_ai);
+    }
     /// Answers the job at `index` from the cache, else renders it when
     /// `render`, else marks it to wait for a render.
     fn look(&self, index: usize, render: bool) {
-        let (id, ticket, path, source, ahead, ai) = {
+        let (id, ticket, path, source, ahead, renders_ai, ai) = {
             let state = self.results.shared.lock();
-            match &state.jobs[index].job {
+            let job = &state.jobs[index];
+            match &job.job {
                 EditJob::Render {
                     id,
                     ticket,
@@ -409,12 +573,13 @@ impl Renders {
                     path.clone(),
                     source.clone(),
                     *ahead,
+                    job.renders_ai,
                     state.ai.clone(),
                 ),
                 EditJob::Store { .. } => unreachable!("stores are not looked up"),
             }
         };
-        let tags = preview_tags(&path, &source, ai.as_ref());
+        let (renders_ai, tags) = preview_tags(&path, &source, renders_ai, ai.as_ref());
         let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let cache = cache(&self.cache);
             let cache = cache.as_ref()?;
@@ -432,11 +597,18 @@ impl Renders {
                 drop(state);
                 self.results.send(self.answer(id, ticket, ahead, image));
             }
-            None if render => {
-                drop(state);
-                self.start(index);
+            None => {
+                state.jobs[index].renders_ai = Some(renders_ai);
+                let allow_ai = !renders_ai
+                    || state.ai.is_none()
+                    || state.running.iter().filter(|r| r.ai).count() < MAX_CONCURRENT_AI_RENDERS;
+                if render && allow_ai {
+                    drop(state);
+                    self.start(index);
+                } else {
+                    state.jobs[index].missed = true;
+                }
             }
-            None => state.jobs[index].missed = true,
         }
     }
     /// A preview for photo `id`: shown, unless it was asked ahead and the
@@ -450,13 +622,29 @@ impl Renders {
     /// to keep it in (rendered when shown).
     fn start(&self, index: usize) {
         let shared = &self.results.shared;
-        let no_cache = cache(&self.cache).is_none();
+        let (check_cache, unclassified) = {
+            let state = shared.lock();
+            if state.closed {
+                return;
+            }
+            let check_cache = matches!(&state.jobs[index].job, EditJob::Render { ahead: true, .. });
+            let unclassified = match &state.jobs[index].job {
+                EditJob::Render { source, .. } if state.jobs[index].renders_ai.is_none() => {
+                    Some(source.clone())
+                }
+                _ => None,
+            };
+            (check_cache, unclassified)
+        };
+        let computed_ai = unclassified.map(|source| source.renders_ai());
+        let no_cache = check_cache && cache(&self.cache).is_none();
         let mut state = shared.lock();
         // Closed since it was looked up: nothing is rendered, nor answered.
         if state.closed {
             return;
         }
         let queued = state.jobs.remove(index);
+        let renders_ai = queued.renders_ai.or(computed_ai).unwrap_or(false);
         let EditJob::Render {
             id,
             ticket,
@@ -481,12 +669,14 @@ impl Renders {
         }
         let full = state.pace == Pace::Full;
         let ai = state.ai.clone();
+        let ai_render = renders_ai && ai.is_some();
         let slot = state.next_slot;
         state.next_slot += 1;
         let cancel = Arc::<AtomicBool>::default();
         state.running.push(Running {
             slot,
             full,
+            ai: ai_render,
             cancel: cancel.clone(),
             path: path.clone(),
         });
@@ -638,28 +828,55 @@ fn next_step(shared: &Shared, wanted: &Wanted, full_renders: usize) -> Step {
             EditJob::Render { path, .. } => state.running.iter().any(|r| &r.path == path),
             EditJob::Store { .. } => false,
         };
+        // Full-size AI decodes stay bounded in the scheduler so pool threads never
+        // wait on a gate while nested Rayon work may be running inside the pool.
+        let ai_running = state.running.iter().filter(|r| r.ai).count();
+        let ai_limited = state.ai.is_some() && ai_running >= MAX_CONCURRENT_AI_RENDERS;
+        let ai_allowed = |q: &Queued| !ai_limited || q.renders_ai != Some(true);
         // Photos shown, the latest first: from the cache whether or not a
         // render could start, rendered when one can.
         if let Some(index) = state.jobs.iter().rposition(|q| visible(q) && !q.missed) {
-            return Step::Look(index, free && !rendering(&state.jobs[index]));
+            let can_render =
+                free && !rendering(&state.jobs[index]) && ai_allowed(&state.jobs[index]);
+            return Step::Look(index, can_render);
         }
         if free {
-            if let Some(index) = state.jobs.iter().rposition(|q| visible(q) && !rendering(q)) {
+            if let Some(index) = state
+                .jobs
+                .iter()
+                .rposition(|q| visible(q) && !rendering(q) && ai_allowed(q))
+            {
                 return Step::Render(index);
             }
             // Then the ones asked ahead, in the order asked.
-            if let Some(index) = state.jobs.iter().position(|q| !visible(q) && !rendering(q)) {
-                return if state.jobs[index].missed {
+            if let Some(index) = state
+                .jobs
+                .iter()
+                .position(|q| !visible(q) && !rendering(q) && ai_allowed(q))
+            {
+                let job = &state.jobs[index];
+                return if ai_limited && job.renders_ai.is_none() {
+                    Step::Classify(index)
+                } else if job.missed {
                     Step::Render(index)
                 } else {
                     Step::Look(index, true)
                 };
             }
         }
+        #[cfg(test)]
+        {
+            state.parked = true;
+            shared.waited.notify_all();
+        }
         state = shared
             .changed
             .wait(state)
             .unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        {
+            state.parked = false;
+        }
     }
 }
 

@@ -158,11 +158,15 @@ impl AiCache {
         let half: Vec<u16> = entry
             .rgb
             .par_iter()
-            .map(|v| f16::from_f32(*v).to_bits())
-            .collect();
-        if !half.par_iter().all(|b| f16::from_bits(*b).is_finite()) {
-            return Err(BeyondHalfPrecision.into());
-        }
+            .map(|&v| {
+                let h = f16::from_f32(v);
+                if h.is_finite() {
+                    Ok(h.to_bits())
+                } else {
+                    Err(BeyondHalfPrecision)
+                }
+            })
+            .collect::<Result<Vec<u16>, BeyondHalfPrecision>>()?;
         let header = serde_json::to_vec(&Header {
             format: FORMAT,
             key: key.into(),
@@ -179,8 +183,15 @@ impl AiCache {
             out.write_all(MAGIC)?;
             out.write_all(&(header.len() as u32).to_le_bytes())?;
             out.write_all(&header)?;
-            for b in &half {
-                out.write_all(&b.to_le_bytes())?;
+            #[cfg(target_endian = "little")]
+            out.write_all(bytemuck::cast_slice(&half))?;
+            #[cfg(not(target_endian = "little"))]
+            for chunk in half.chunks(4096) {
+                let mut buf = [0u8; 4096 * 2];
+                for (dst, &b) in buf.chunks_exact_mut(2).zip(chunk) {
+                    dst.copy_from_slice(&b.to_le_bytes());
+                }
+                out.write_all(&buf[..chunk.len() * 2])?;
             }
             let flags: Vec<u8> = entry.clipped.iter().map(|c| u8::from(*c)).collect();
             out.write_all(&flags)?;
@@ -236,12 +247,13 @@ fn read(path: &Path, key: &str) -> Result<AiEntry> {
     read_at(&file, start, &mut bytes)?;
     let rgb: Vec<f32> = bytes
         .par_chunks_exact(2)
-        .map(|b| f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
-        .collect();
-    ensure!(
-        rgb.par_iter().all(|v| v.is_finite()),
-        "AI Denoise cache entry has a value that is not finite"
-    );
+        .map(|b| {
+            let v = f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+            if v.is_finite() { Ok(v) } else { Err(()) }
+        })
+        .collect::<std::result::Result<Vec<f32>, ()>>()
+        .map_err(|()| anyhow::anyhow!("AI Denoise cache entry has a value that is not finite"))?;
+    drop(bytes);
     let mut flags = vec![0u8; packed as usize];
     read_at(&file, start + 3 * pixels * 2, &mut flags)?;
     ensure!(

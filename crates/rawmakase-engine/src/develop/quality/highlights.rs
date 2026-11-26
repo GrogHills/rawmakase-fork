@@ -40,27 +40,33 @@ fn reconstruct(p: [f32; 3], sensor: [f32; 3]) -> [f32; 3] {
     x
 }
 
+/// Highlight reconstruction in camera space, before colour conversion, mutating `im`
+/// in place. Stops with an error once `cancel` is set, and only then.
+pub fn recover_highlights_in_place(im: &mut CameraImage, cancel: Cancel<'_>) -> Result<()> {
+    check_cancel(cancel)?;
+    let wb = im.metadata.wb.map(|v| v.max(0.001));
+    let stride = im.width.max(1) as usize;
+    im.pixels.par_chunks_mut(stride).for_each(|row| {
+        if cancel.is_cancelled() {
+            return;
+        }
+        for p in row {
+            let sensor = std::array::from_fn(|c| p[c] / wb[c]);
+            if sensor.iter().all(|s| *s <= PULL_FLOOR) {
+                continue;
+            }
+            *p = reconstruct(*p, sensor);
+        }
+    });
+    check_cancel(cancel)
+}
+
 /// Highlight reconstruction in camera space, before colour conversion. Stops with an
 /// error once `cancel` is set, and only then.
 pub fn recover_highlights(im: &CameraImage, cancel: Cancel<'_>) -> Result<CameraImage> {
     check_cancel(cancel)?;
     let mut out = im.clone();
-    let wb = im.metadata.wb.map(|v| v.max(0.001));
-    out.pixels
-        .par_chunks_mut(im.width.max(1) as usize)
-        .for_each(|row| {
-            if cancel.is_cancelled() {
-                return;
-            }
-            for p in row {
-                let sensor = std::array::from_fn(|c| p[c] / wb[c]);
-                if sensor.iter().all(|s| *s <= PULL_FLOOR) {
-                    continue;
-                }
-                *p = reconstruct(*p, sensor);
-            }
-        });
-    check_cancel(cancel)?;
+    recover_highlights_in_place(&mut out, cancel)?;
     Ok(out)
 }
 

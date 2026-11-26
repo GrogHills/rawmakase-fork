@@ -165,7 +165,9 @@ impl Library {
     }
     /// Sets rating, flag and label in the catalog, then as shown.
     fn write_ratings(&mut self, values: &[Metadata]) -> Result<()> {
-        self.session.set_ratings(values)
+        self.session.set_ratings(values)?;
+        self.refresh_summary();
+        Ok(())
     }
 }
 /// Rating, flag and label of each photo given.

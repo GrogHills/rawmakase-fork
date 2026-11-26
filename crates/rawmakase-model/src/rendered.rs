@@ -1,5 +1,7 @@
 //! Developed pixels as values: an output image, its histogram and clipping, as
 //! the renderer, export and watermarks pass them; nothing here renders.
+use rayon::prelude::*;
+
 /// A value from 0 to 1 as a byte, rounded; out-of-range values are clamped.
 pub fn unit_to_u8(v: f32) -> u8 {
     (v.clamp(0., 1.) * 255. + 0.5) as u8
@@ -101,29 +103,50 @@ pub struct Rendered {
 }
 impl Rendered {
     pub fn rgb8(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.pixels.len());
         self.pixels
-            .iter()
-            .flatten()
-            .map(|v| unit_to_u8(*v))
-            .collect()
+            .par_iter()
+            .map(|p| p.map(unit_to_u8))
+            .collect_into_vec(&mut out);
+        out.into_flattened()
     }
     pub fn rgb16(&self) -> Vec<u16> {
+        let mut out = Vec::with_capacity(self.pixels.len());
         self.pixels
-            .iter()
-            .flatten()
-            .map(|v| unit_to_u16(*v))
-            .collect()
+            .par_iter()
+            .map(|p| p.map(unit_to_u16))
+            .collect_into_vec(&mut out);
+        out.into_flattened()
     }
     pub fn histogram(&self) -> Histogram {
-        let mut h = Histogram::EMPTY;
-        for p in &self.pixels {
-            for (c, &v) in p.iter().enumerate() {
-                h.bins[c][(v.clamp(0., 1.) * 255.) as usize] += 1;
-                h.clipped.highlights[c] += (v >= HIGHLIGHT_CLIP) as u32;
-                h.clipped.shadows[c] += (v <= SHADOW_CLIP) as u32;
-            }
-        }
-        h
+        self.pixels
+            .par_chunks(4096)
+            .fold(
+                || Histogram::EMPTY,
+                |mut h, chunk| {
+                    for p in chunk {
+                        for (c, &v) in p.iter().enumerate() {
+                            h.bins[c][(v.clamp(0., 1.) * 255.) as usize] += 1;
+                            h.clipped.highlights[c] += (v >= HIGHLIGHT_CLIP) as u32;
+                            h.clipped.shadows[c] += (v <= SHADOW_CLIP) as u32;
+                        }
+                    }
+                    h
+                },
+            )
+            .reduce(
+                || Histogram::EMPTY,
+                |mut a, b| {
+                    for c in 0..3 {
+                        for i in 0..256 {
+                            a.bins[c][i] += b.bins[c][i];
+                        }
+                        a.clipped.highlights[c] += b.clipped.highlights[c];
+                        a.clipped.shadows[c] += b.clipped.shadows[c];
+                    }
+                    a
+                },
+            )
     }
 }
 

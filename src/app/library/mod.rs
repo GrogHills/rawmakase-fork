@@ -169,7 +169,11 @@ pub(crate) struct Library {
     /// The open catalog and the photos, folders and collections read from it.
     pub session: CatalogSession,
     /// The active photo and the photos selected with it.
-    selection: selection::Selection,
+    selection: selection::TrackedSelection,
+    /// Cached [`Self::selected_count`] keyed by `(shown_version, selection_version)`.
+    selected_count: std::cell::Cell<Option<(u64, u64, usize)>>,
+    /// Cached [`Self::selected_contains`] keyed by `(shown_version, selection_version, id)`.
+    selected_contains: std::cell::Cell<Option<(u64, u64, PhotoId, bool)>>,
     /// Grid columns last frame, for Up and Down.
     grid_columns: usize,
     /// Whole grid rows the view showed last frame, for Page Up and Page Down.
@@ -284,6 +288,14 @@ pub(crate) struct Library {
     /// as the catalog recorded them when the Library last filtered or was told
     /// of a build or discard.
     editable_previews: std::collections::BTreeSet<PhotoId>,
+    /// Whether `editable_previews` needs to be queried again on the next filter.
+    editable_previews_dirty: bool,
+    /// Cached summary over `session.photos()`: known color labels plus sorted
+    /// custom labels, whether any photo is a virtual copy, and whether any
+    /// photo has a non-standard label.
+    labels: Vec<String>,
+    has_copies: bool,
+    has_other_labels: bool,
     /// The photo last asked whether Develop would open it from its editable
     /// preview ([`Self::develops_from_preview`]), and the answer, so the Loupe
     /// asks once each time it comes to a photo rather than every frame.
@@ -315,6 +327,8 @@ impl Library {
         let mut s = Self {
             session,
             selection: Default::default(),
+            selected_count: Default::default(),
+            selected_contains: Default::default(),
             grid_columns: 1,
             grid_page_rows: 1,
             scroll_to_active: false,
@@ -370,6 +384,10 @@ impl Library {
             loupe_stored: None,
             refusal_shown: None,
             editable_previews: Default::default(),
+            editable_previews_dirty: true,
+            labels: Vec::new(),
+            has_copies: false,
+            has_other_labels: false,
             preview_usable: Default::default(),
             reread: None,
             reread_finished: false,
@@ -442,6 +460,8 @@ impl Library {
         self.cell_info.clear();
         self.sort_keys = None;
         self.shown_version += 1;
+        self.editable_previews_dirty = true;
+        self.refresh_summary();
         if self.filters.previous_import {
             self.filters.members = self.session.previous_import().clone();
         }
@@ -565,10 +585,14 @@ impl Library {
             .catalog()
             .photos_with_editable_previews()
             .unwrap_or_default();
+        self.editable_previews_dirty = false;
     }
     /// Turns the Editable Previews filter on or off, for tests.
     #[cfg(test)]
     pub(in crate::app) fn show_only_editable_previews(&mut self, on: bool) {
+        if on {
+            self.editable_previews_dirty = true;
+        }
         self.filters.only_editable_previews = on;
         self.filter();
     }
@@ -645,6 +669,7 @@ impl Library {
         // What the right panel and the Loupe say of a photo may have changed.
         self.refusal_shown = None;
         self.preview_usable.replace(None);
+        self.editable_previews_dirty = true;
         if self.filters.only_editable_previews {
             self.filter();
         } else {
@@ -712,7 +737,9 @@ impl Library {
         self.availability.count(self.session.photos())
     }
     fn filter(&mut self) {
-        self.refresh_editable_previews();
+        if self.editable_previews_dirty {
+            self.refresh_editable_previews();
+        }
         // What the order needs from the catalog, read once until it changes.
         let sort = self.filters.sort;
         if self.sort_keys.as_ref().is_none_or(|(of, _)| *of != sort) {
@@ -750,7 +777,7 @@ impl Library {
         }
     }
     pub(crate) fn photo(&self, id: PhotoId) -> Option<&Photo> {
-        self.session.photos().iter().find(|p| p.id == id)
+        self.session.photo(id)
     }
     /// What photo `id` is developed from, as Develop would open it: its original or
     /// editable preview ([`Self::develop_from`]) and its saved edit (checked as
@@ -808,23 +835,24 @@ impl Library {
         let n = (at as i32 + delta).clamp(0, self.visible.len().saturating_sub(1) as i32) as usize;
         self.visible.get(n).map(|i| self.session.photos()[*i].id)
     }
-    fn labels(&self) -> Vec<String> {
-        let mut labels: Vec<String> = crate::app::library::photo_metadata::LABELS
-            .iter()
-            .map(|s| (*s).into())
-            .collect();
-        let mut custom: Vec<_> = self
-            .session
-            .photos()
-            .iter()
-            .map(|p| &p.label)
-            .filter(|s| !s.is_empty() && !labels.contains(s))
-            .cloned()
-            .collect();
-        custom.sort();
-        custom.dedup();
-        labels.extend(custom);
-        labels
+    pub(super) fn refresh_summary(&mut self) {
+        let mut labels: Vec<String> = photo_metadata::LABELS.iter().map(|s| (*s).into()).collect();
+        let mut custom = std::collections::BTreeSet::new();
+        let mut has_copies = false;
+        for p in self.session.photos() {
+            has_copies |= p.master.is_some();
+            if !p.label.is_empty() && !photo_metadata::LABELS.contains(&p.label.as_str()) {
+                custom.insert(p.label.as_str());
+            }
+        }
+        let has_other_labels = !custom.is_empty();
+        labels.extend(custom.into_iter().map(str::to_owned));
+        self.labels = labels;
+        self.has_copies = has_copies;
+        self.has_other_labels = has_other_labels;
+    }
+    fn labels(&self) -> &[String] {
+        &self.labels
     }
     #[cfg(test)]
     pub(in crate::app) fn show_unflagged(&mut self) {
@@ -858,11 +886,62 @@ impl Library {
     pub(in crate::app) fn selected_photos(&self) -> Vec<PhotoId> {
         self.selected_ids()
     }
+    /// Number of selected photos in display order, matching [`Self::selected_photos`]
+    /// without allocating.
+    pub(in crate::app) fn selected_count(&self) -> usize {
+        let key = (self.shown_version, self.selection_version());
+        if let Some((sv, sel_v, count)) = self.selected_count.get()
+            && (sv, sel_v) == key
+        {
+            return count;
+        }
+        let photos = self.session.photos();
+        let shown_selected = if self.selection.selected.is_empty() {
+            0
+        } else {
+            self.visible
+                .iter()
+                .filter(|&&i| self.selection.selected.contains(&photos[i].id))
+                .count()
+        };
+        let count = if shown_selected == 0 {
+            usize::from(self.selection.active.is_some())
+        } else {
+            shown_selected
+        };
+        self.selected_count.set(Some((key.0, key.1, count)));
+        count
+    }
+    /// Whether `id` is included in [`Self::selected_photos`], without allocating.
+    pub(in crate::app) fn selected_contains(&self, id: PhotoId) -> bool {
+        let key = (self.shown_version, self.selection_version());
+        if let Some((sv, sel_v, cached_id, contains)) = self.selected_contains.get()
+            && (sv, sel_v, cached_id) == (key.0, key.1, id)
+        {
+            return contains;
+        }
+        let photos = self.session.photos();
+        let contains = if self.selection.selected.contains(&id)
+            && self.visible.iter().any(|&i| photos[i].id == id)
+        {
+            true
+        } else {
+            self.selection.active == Some(id)
+                && (self.selection.selected.is_empty()
+                    || !self
+                        .visible
+                        .iter()
+                        .any(|&i| self.selection.selected.contains(&photos[i].id)))
+        };
+        self.selected_contains
+            .set(Some((key.0, key.1, id, contains)));
+        contains
+    }
     pub(in crate::app) fn place(&self) -> Place {
         Place {
             filters: self.filters.clone(),
             folders: self.selected_folders.clone(),
-            selection: self.selection.clone(),
+            selection: self.selection.snapshot(),
         }
     }
     /// Returns to `place`, with the photos it had selected that are still
@@ -883,7 +962,10 @@ impl Library {
                 .cloned()
                 .unwrap_or_default();
         }
-        self.selection = place.selection.clone();
+        if self.filters.only_editable_previews {
+            self.editable_previews_dirty = true;
+        }
+        self.selection.replace(place.selection.clone());
         self.filter();
         self.compare.restored = true;
         self.scroll_to_active = true;

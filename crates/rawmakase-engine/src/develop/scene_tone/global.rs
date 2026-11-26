@@ -103,9 +103,23 @@ fn bracket_in(values: &[f32], v: f32) -> (usize, f32) {
 pub(crate) fn evaluate(samples: &[f32], first: f32, step: f32, x: f32) -> f32 {
     evaluate_with(first, step, samples.len(), x, |k| samples[k])
 }
+/// [`evaluate`] with `low = first.exp2()` precomputed.
+fn evaluate_low(samples: &[f32], first: f32, low: f32, step: f32, x: f32) -> f32 {
+    evaluate_with_low(first, low, step, samples.len(), x, |k| samples[k])
+}
 /// [`evaluate`] with the samples read on demand.
 fn evaluate_with(first: f32, step: f32, n: usize, x: f32, at: impl Fn(usize) -> f32) -> f32 {
-    let low = first.exp2();
+    evaluate_with_low(first, first.exp2(), step, n, x, at)
+}
+/// [`evaluate_with`] with `low = first.exp2()` precomputed.
+fn evaluate_with_low(
+    first: f32,
+    low: f32,
+    step: f32,
+    n: usize,
+    x: f32,
+    at: impl Fn(usize) -> f32,
+) -> f32 {
     if x <= low {
         return x * at(0) / low;
     }
@@ -126,6 +140,11 @@ pub(crate) struct GlobalTone {
     /// log2 of the level Whites stretches toward (at the render's Exposure), within the
     /// measured range of sensor whites and maxima.
     top: f32,
+    top_lin: f32,
+    white_low: f32,
+    tail_low: f32,
+    tail_at_top: f32,
+    black_low: f32,
     black_key: f32,
     black_point: bool,
     whites: f32,
@@ -262,8 +281,18 @@ impl GlobalTone {
             let corners = blacks_corners(black_key, blacks);
             Box::new(std::array::from_fn(|k| blacks_sample(&corners, k)))
         });
+        let top_lin = top.exp2();
+        let white_low = (top + U_FIRST).exp2();
+        let tail_low = T_FIRST.exp2();
+        let tail_at_top = evaluate_low(&tail[..], T_FIRST, tail_low, T_STEP, top_lin);
+        let black_low = Y_FIRST.exp2();
         let mut tone = Self {
             top,
+            top_lin,
+            white_low,
+            tail_low,
+            tail_at_top,
+            black_low,
             black_key,
             black_point,
             whites,
@@ -323,15 +352,14 @@ impl GlobalTone {
         self.sdr_white_at(curve, x)
     }
     fn sdr_white_at(&self, curve: &[f32; U_SAMPLES], x: f32) -> f32 {
-        let top = self.top.exp2();
-        let y = if x <= top {
-            evaluate(curve, self.top + U_FIRST, U_STEP, x)
+        let y = if x <= self.top_lin {
+            evaluate_low(curve, self.top + U_FIRST, self.white_low, U_STEP, x)
         } else {
             // Specks brighter than the maximum roll on to white with the default curve;
             // a curve Whites has already stretched past white stays there.
             let at_top = curve[U_SAMPLES - 1];
-            let r = evaluate(&self.tail[..], T_FIRST, T_STEP, x);
-            let rm = evaluate(&self.tail[..], T_FIRST, T_STEP, top);
+            let r = evaluate_low(&self.tail[..], T_FIRST, self.tail_low, T_STEP, x);
+            let rm = self.tail_at_top;
             if rm < 1. && at_top < 1. {
                 at_top + (1. - at_top) * ((r - rm) / (1. - rm)).clamp(0., 1.)
             } else {
@@ -376,15 +404,17 @@ impl GlobalTone {
             let t = f - i as f32;
             p.map(|v| {
                 if v < 1. {
-                    let a = evaluate(
+                    let a = evaluate_low(
                         &rows[i * Y_SAMPLES..(i + 1) * Y_SAMPLES],
                         Y_FIRST,
+                        self.black_low,
                         Y_STEP,
                         v,
                     );
-                    let b = evaluate(
+                    let b = evaluate_low(
                         &rows[(i + 1) * Y_SAMPLES..(i + 2) * Y_SAMPLES],
                         Y_FIRST,
+                        self.black_low,
                         Y_STEP,
                         v,
                     );
@@ -398,7 +428,7 @@ impl GlobalTone {
                 // Above white (positive Whites' overshoot) it leaves the output alone.
                 Some(curve) => p.map(|v| {
                     if v < 1. {
-                        evaluate(&curve[..], Y_FIRST, Y_STEP, v)
+                        evaluate_low(&curve[..], Y_FIRST, self.black_low, Y_STEP, v)
                     } else {
                         v
                     }
@@ -411,12 +441,14 @@ impl GlobalTone {
             // renders of Blacks −100 keep the default's peak.
             Some(blacks) if self.hdr.is_some() => p.map(|v| {
                 if v < 1. {
-                    evaluate(&blacks[..], Y_FIRST, Y_STEP, v)
+                    evaluate_low(&blacks[..], Y_FIRST, self.black_low, Y_STEP, v)
                 } else {
                     v
                 }
             }),
-            Some(blacks) => p.map(|v| evaluate(&blacks[..], Y_FIRST, Y_STEP, v)),
+            Some(blacks) => {
+                p.map(|v| evaluate_low(&blacks[..], Y_FIRST, self.black_low, Y_STEP, v))
+            }
             None => p,
         }
     }
@@ -477,11 +509,13 @@ fn mask_curve(kind: usize, s: f32, y: f32) -> f32 {
         IDENTITY => 0.,
         _ => MASK_VALUES[if slot < IDENTITY { slot } else { slot - 1 }],
     };
+    // `2f32.powi(-16)` (`Y_FIRST == -16.`), constant so mask curves need no `exp2` per pixel.
+    const Y_LOW: f32 = 1. / 65536.;
     let output = |slot: usize| match slot {
         IDENTITY => y,
         _ => {
             let row = if slot < IDENTITY { slot } else { slot - 1 };
-            evaluate_with(Y_FIRST, Y_STEP, Y_SAMPLES, y, |k| {
+            evaluate_with_low(Y_FIRST, Y_LOW, Y_STEP, Y_SAMPLES, y, |k| {
                 value(MASKS, (kind * MASK_VALUES.len() + row) * Y_SAMPLES + k)
             })
         }

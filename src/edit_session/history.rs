@@ -129,6 +129,26 @@ impl History {
             applied: done.len(),
         }
     }
+    /// The distinct content IDs of the mask rasters `current` and any state in
+    /// History refer to.
+    pub(crate) fn mask_asset_ids(&self, current: &Recipe) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        for recipe in self
+            .undo
+            .iter()
+            .chain(&self.redo)
+            .map(|(r, _)| r)
+            .chain(&self.gesture)
+            .chain(std::iter::once(current))
+        {
+            for id in recipe.mask_asset_ids() {
+                if !ids.contains(id) {
+                    ids.insert(id.to_owned());
+                }
+            }
+        }
+        ids
+    }
     /// History restored from `saved` for an edit now at `current`. When the edit was
     /// changed since (Undo after moving to another photo, or a sidecar import), that change
     /// becomes the latest step, as Lightroom adds one.
@@ -839,5 +859,46 @@ mod tests {
         assert_eq!(recipe.exposure, 0.5);
         assert_eq!(recipe.temperature, original.temperature);
         assert_eq!(history.steps().0.len(), 2);
+    }
+    #[test]
+    fn mask_asset_ids_collects_undo_redo_gesture_and_current() {
+        use crate::model::masks::{
+            BITMAP_SAMPLING, BitmapMask, MaskComponent, MaskGroup, MaskShape,
+        };
+        let with_masks = |ids: &[&str]| {
+            let mut recipe = Recipe::default();
+            for id in ids {
+                recipe.masks.push(MaskGroup {
+                    components: vec![MaskComponent::new(MaskShape::Bitmap(BitmapMask {
+                        id: (*id).into(),
+                        width: 4,
+                        height: 3,
+                        sampling: BITMAP_SAMPLING,
+                        source: None,
+                    }))],
+                    ..Default::default()
+                });
+            }
+            recipe
+        };
+        let mut history = History::default();
+        let mut current = with_masks(&["shared", "a"]);
+        let before = current.clone();
+        current = with_masks(&["shared", "b"]);
+        history.record(before, &current);
+        let before = current.clone();
+        current = with_masks(&["c"]);
+        history.record(before, &current);
+        assert!(history.undo(&mut current));
+        history.begin_frame();
+        let gesture_after = with_masks(&["d"]);
+        history.observe(current.clone(), &gesture_after, true);
+        current = gesture_after;
+        let ids = history.mask_asset_ids(&current);
+        let expected: std::collections::HashSet<String> = ["shared", "a", "b", "c", "d"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(ids, expected);
     }
 }

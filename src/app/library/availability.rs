@@ -24,10 +24,10 @@ impl Availability {
     /// answer is in, every photo counts as online.
     pub(super) fn start(&mut self, photos: &[Photo], ctx: &egui::Context) {
         let (tx, rx) = channel();
-        let photos = photos.to_vec();
+        let paths: Vec<PathBuf> = photos.iter().map(|p| p.path.clone()).collect();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            if tx.send(super::thumbnails::available_paths(&photos)).is_ok() {
+            if tx.send(super::thumbnails::available_paths(&paths)).is_ok() {
                 ctx.request_repaint();
             }
         });

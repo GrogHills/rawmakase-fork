@@ -155,16 +155,25 @@ impl ChromaDenoise {
         };
         let chroma = Plane { w, h, data };
         let chroma = self.filter(chroma, measurable, 0., 0., 0, offset, cancel)?;
-        let mut out = im.clone();
-        out.recovered = Default::default();
-        out.pixels
-            .par_iter_mut()
-            .zip(luma.par_iter().zip(chroma.data.par_iter()))
-            .for_each(|(p, (y, [a, b]))| {
+        let pixels = luma
+            .par_iter()
+            .zip(chroma.data.par_iter())
+            .map(|(y, [a, b])| {
                 let g = y - (a + b) * 0.25;
-                *p = [g + a, g, g + b].map(|v| v.max(0.).powi(2));
-            });
-        Ok(out)
+                [g + a, g, g + b].map(|v| v.max(0.).powi(2))
+            })
+            .collect();
+        Ok(CameraImage {
+            width: im.width,
+            height: im.height,
+            recovered: Default::default(),
+            pixels,
+            metadata: im.metadata.clone(),
+            fast: im.fast,
+            scale_factor: im.scale_factor,
+            scale_clipped: im.scale_clipped,
+            hdr: Default::default(),
+        })
     }
     /// Filters `plane` as pyramid level `level`, recursing to the coarser ones;
     /// `measurable` is where its noise can be measured, `finer_noise` and
@@ -173,7 +182,7 @@ impl ChromaDenoise {
     #[allow(clippy::too_many_arguments)]
     fn filter(
         &self,
-        plane: Plane,
+        mut plane: Plane,
         measurable: Mask,
         finer_noise: f32,
         finest_noise: f32,
@@ -202,9 +211,20 @@ impl ChromaDenoise {
             None => finer_noise * COARSER_NOISE,
         };
         let finest_noise = if level == 0 { noise } else { finest_noise };
+        let coarse_mask = measurable.down();
+        drop(measurable);
+        plane
+            .data
+            .par_iter_mut()
+            .zip(up.data.par_iter())
+            .for_each(|(v, u)| {
+                v[0] -= u[0];
+                v[1] -= u[1];
+            });
+        drop(up);
         let coarse = self.filter(
             coarse,
-            measurable.down(),
+            coarse_mask,
             noise,
             finest_noise,
             level + 1,
@@ -212,7 +232,8 @@ impl ChromaDenoise {
             cancel,
         )?;
         ensure!(!cancel.is_cancelled(), "Render superseded");
-        let coarse_up = coarse.up(plane.w, plane.h);
+        let mut coarse_up = coarse.up(plane.w, plane.h);
+        drop(coarse);
         // Between two of the photo's levels, the thresholds' ratio is shared out
         // geometrically and the exponents' difference linearly.
         let geometric = |a: f32, b: f32, f: f32| a * (b / a).powf(f);
@@ -220,29 +241,25 @@ impl ChromaDenoise {
         let threshold = at_level(&self.thresholds, photo_level, geometric)
             * noise
             * (finest_noise / REFERENCE_NOISE).powf(at_level(&NOISE_EXPONENT, photo_level, linear));
-        let data = plane
+        let threshold_sq = threshold * threshold;
+        coarse_up
             .data
-            .par_iter()
-            .zip(up.data.par_iter().zip(coarse_up.data.par_iter()))
-            .map(|(v, (u, c))| {
-                let d = [v[0] - u[0], v[1] - u[1]];
+            .par_iter_mut()
+            .zip(plane.data.par_iter())
+            .for_each(|(c, &d)| {
                 let size = d[0] * d[0] + d[1] * d[1];
                 let gain = if threshold <= 0. {
                     1.
                 } else {
                     // As x / (1 + x) with x = (size / threshold²)^steepness, without
                     // overflowing where the threshold is tiny next to the detail.
-                    1. / (1. + (threshold * threshold / size).powi(ADAPTIVE_STEEPNESS))
+                    1. / (1. + (threshold_sq / size).powi(ADAPTIVE_STEEPNESS))
                 };
                 let gain = super::laplacian::partial_gain(gain, share);
-                [c[0] + d[0] * gain, c[1] + d[1] * gain]
-            })
-            .collect();
-        Ok(Plane {
-            w: plane.w,
-            h: plane.h,
-            data,
-        })
+                c[0] += d[0] * gain;
+                c[1] += d[1] * gain;
+            });
+        Ok(coarse_up)
     }
 }
 

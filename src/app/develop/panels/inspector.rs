@@ -96,9 +96,8 @@ impl Editor {
             _ => Color32::from_rgb(170, 70, 170),
         };
         for i in 0..256 {
-            let mut v: Vec<(f32, usize)> = (0..3)
-                .map(|c| ((smooth(c, i) / max).sqrt().min(1.) * plot.height(), c))
-                .collect();
+            let mut v: [(f32, usize); 3] =
+                std::array::from_fn(|c| ((smooth(c, i) / max).sqrt().min(1.) * plot.height(), c));
             v.sort_by(|a, b| a.0.total_cmp(&b.0));
             let x = plot.left() + i as f32 * bar;
             let segment = |from: f32, to: f32, color: Color32| {

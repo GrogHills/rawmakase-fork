@@ -36,28 +36,50 @@ pub(crate) fn smooth(v: f32) -> f32 {
 
 /// Mean over the `(2r+1)²` window around every pixel, clamped at the edges.
 pub(crate) fn mean(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
-    // Horizontal running sums, then vertical.
+    // Horizontal running sums, then row-major vertical sliding window.
     let mut tmp = vec![0f32; w * h];
+    let mut prefix = vec![0f64; w + 1];
     for y in 0..h {
         let row = &src[y * w..(y + 1) * w];
-        let mut prefix = vec![0f64; w + 1];
+        let dst = &mut tmp[y * w..(y + 1) * w];
+        prefix[0] = 0.;
         for x in 0..w {
             prefix[x + 1] = prefix[x] + row[x] as f64;
         }
-        for x in 0..w {
+        for (x, d) in dst.iter_mut().enumerate() {
             let (a, b) = (x.saturating_sub(r), (x + r + 1).min(w));
-            tmp[y * w + x] = ((prefix[b] - prefix[a]) / (b - a) as f64) as f32;
+            *d = ((prefix[b] - prefix[a]) / (b - a) as f64) as f32;
         }
     }
     let mut out = vec![0f32; w * h];
-    for x in 0..w {
-        let mut prefix = vec![0f64; h + 1];
-        for y in 0..h {
-            prefix[y + 1] = prefix[y] + tmp[y * w + x] as f64;
+    let mut col_sum = vec![0f64; w];
+    let init_end = (r + 1).min(h);
+    for row_y in 0..init_end {
+        let row = &tmp[row_y * w..(row_y + 1) * w];
+        for (sum, &v) in col_sum.iter_mut().zip(row) {
+            *sum += v as f64;
         }
-        for y in 0..h {
-            let (a, b) = (y.saturating_sub(r), (y + r + 1).min(h));
-            out[y * w + x] = ((prefix[b] - prefix[a]) / (b - a) as f64) as f32;
+    }
+    for y in 0..h {
+        if y > 0 {
+            if y > r {
+                let old_row = &tmp[(y - r - 1) * w..(y - r) * w];
+                for (sum, &v) in col_sum.iter_mut().zip(old_row) {
+                    *sum -= v as f64;
+                }
+            }
+            if y + r < h {
+                let new_row = &tmp[(y + r) * w..(y + r + 1) * w];
+                for (sum, &v) in col_sum.iter_mut().zip(new_row) {
+                    *sum += v as f64;
+                }
+            }
+        }
+        let (a, b) = (y.saturating_sub(r), (y + r + 1).min(h));
+        let count = (b - a) as f64;
+        let dst = &mut out[y * w..(y + 1) * w];
+        for (d, &sum) in dst.iter_mut().zip(&col_sum) {
+            *d = (sum / count) as f32;
         }
     }
     out

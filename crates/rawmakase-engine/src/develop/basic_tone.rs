@@ -91,9 +91,8 @@ pub(crate) fn contrast_curve(contrast: f32, photo: &PhotoTone) -> Option<ToneLut
     if contrast == 0. {
         return None;
     }
-    Some(ToneLut::rising(|x| {
-        contrast_at(contrast, photo.contrast_pivot, x)
-    }))
+    let (k, inv_k) = contrast_k(photo.contrast_pivot);
+    Some(ToneLut::rising(|x| contrast_at_k(contrast, k, inv_k, x)))
 }
 
 /// The measured tables in the order `develop.wgsl`'s local Contrast reads them: the
@@ -111,12 +110,15 @@ fn slider(table: &[[f32; 64]; 6], s: f32, x: f32) -> f32 {
     }
     let s = s.clamp(-1., 1.);
     // Bracketing measured positions, with the identity at 0.
-    let mut points: Vec<(f32, Option<&[f32; 64]>)> = SLIDER_VALUES
-        .iter()
-        .zip(table)
-        .map(|(v, t)| (*v, Some(t)))
-        .collect();
-    points.insert(3, (0., None));
+    let points: [(f32, Option<&[f32; 64]>); 7] = [
+        (SLIDER_VALUES[0], Some(&table[0])),
+        (SLIDER_VALUES[1], Some(&table[1])),
+        (SLIDER_VALUES[2], Some(&table[2])),
+        (0., None),
+        (SLIDER_VALUES[3], Some(&table[3])),
+        (SLIDER_VALUES[4], Some(&table[4])),
+        (SLIDER_VALUES[5], Some(&table[5])),
+    ];
     let j = points
         .windows(2)
         .position(|w| s <= w[1].0)
@@ -129,20 +131,63 @@ fn slider(table: &[[f32; 64]; 6], s: f32, x: f32) -> f32 {
     y0 + (y1 - y0) * w
 }
 
+fn to_gamma22(v: f32) -> f32 {
+    srgb_decode(v.clamp(0., 1.)).powf(1. / 2.2)
+}
+
+fn from_gamma22(w: f32) -> f32 {
+    srgb_encode(w.clamp(0., 1.).powf(2.2))
+}
+
+fn chart_pivot_ln() -> f32 {
+    static LN: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *LN.get_or_init(|| to_gamma22(CONTRAST_PIVOT).ln())
+}
+
+fn contrast_k(pivot: f32) -> (f32, f32) {
+    let k = chart_pivot_ln() / to_gamma22(pivot).ln();
+    (k, 1. / k)
+}
+
+fn contrast_at_k(s: f32, k: f32, inv_k: f32, x: f32) -> f32 {
+    if s == 0. {
+        return x;
+    }
+    let y = slider(&CONTRAST_CHART, s, from_gamma22(to_gamma22(x).powf(k)));
+    from_gamma22(to_gamma22(y).powf(inv_k))
+}
+
 /// The chart's Contrast at slider `s`, moved so it pivots at `pivot` instead of
 /// [`CONTRAST_PIVOT`]: a power warp of gamma-2.2 encoded values takes one pivot to the
 /// other, which fits each photo's Camera Raw Contrast to 0.002–0.01 at every amount.
 /// The local adjustments evaluate it per pixel, without [`contrast_curve`]'s table and
 /// monotone clean-up.
+#[cfg(test)]
 pub(crate) fn contrast_at(s: f32, pivot: f32, x: f32) -> f32 {
     if s == 0. {
         return x;
     }
-    let to = |v: f32| srgb_decode(v.clamp(0., 1.)).powf(1. / 2.2);
-    let from = |w: f32| srgb_encode(w.clamp(0., 1.).powf(2.2));
-    let k = to(CONTRAST_PIVOT).ln() / to(pivot).ln();
-    let y = slider(&CONTRAST_CHART, s, from(to(x).powf(k)));
-    from(to(y).powf(1. / k))
+    let (k, inv_k) = contrast_k(pivot);
+    contrast_at_k(s, k, inv_k, x)
+}
+
+/// Pivot-warped Contrast across an RGB triple in DNG RGBTone fashion, computing the
+/// pivot warp exponent once per pixel.
+pub(crate) fn contrast_at_rgb(s: f32, pivot: f32, p: [f32; 3]) -> [f32; 3] {
+    let p = p.map(|v| v.clamp(0., 1.));
+    if s == 0. {
+        return p;
+    }
+    let lo = p.into_iter().fold(f32::INFINITY, f32::min);
+    let hi = p.into_iter().fold(0f32, f32::max);
+    let (k, inv_k) = contrast_k(pivot);
+    let a = contrast_at_k(s, k, inv_k, lo);
+    if hi - lo > 1e-8 {
+        let b = contrast_at_k(s, k, inv_k, hi);
+        p.map(|v| a + (b - a) * (v - lo) / (hi - lo))
+    } else {
+        [a; 3]
+    }
 }
 
 /// Linear interpolation between bin centres; linear extrapolation to 0 and 1.
@@ -234,5 +279,22 @@ mod tests {
         assert!((rendered_pivot(0.5) - 0.535).abs() < 1e-6);
         assert_eq!(rendered_pivot(0.74), 0.75);
         assert!((rendered_pivot(0.3) - 0.335).abs() < 1e-6);
+    }
+
+    #[test]
+    fn contrast_at_rgb_matches_scalar_contrast_at() {
+        for pivot in [0.35, TYPICAL_PIVOT, 0.7] {
+            for s in [-0.7, 0., 0.65] {
+                let p = [0.15, 0.42, 0.85];
+                let got = contrast_at_rgb(s, pivot, p);
+                let (a, b) = (contrast_at(s, pivot, p[0]), contrast_at(s, pivot, p[2]));
+                let expected = p.map(|v| a + (b - a) * (v - p[0]) / (p[2] - p[0]));
+                assert_eq!(got, expected);
+                assert_eq!(
+                    contrast_at_rgb(s, pivot, [0.4; 3]),
+                    [contrast_at(s, pivot, 0.4); 3]
+                );
+            }
+        }
     }
 }

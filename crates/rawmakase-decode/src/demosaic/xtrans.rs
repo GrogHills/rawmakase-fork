@@ -70,6 +70,9 @@ const CURVATURE: f32 = 0.2;
 pub(crate) fn demosaic(cfa: &Cfa) -> Vec<[f32; 3]> {
     let w = cfa.width;
     let mut out = vec![[0f32; 3]; w * cfa.height];
+    if out.is_empty() {
+        return out;
+    }
     let shared = OnceLock::new();
     let clip = cfa.white.map(|w| w * CLIPPED);
     out.par_chunks_mut(w * BAND)
@@ -97,7 +100,7 @@ impl Band {
             let gy = Cfa::reflect(y0 as isize + py as isize - MARGIN as isize, cfa.height);
             for px in 0..width {
                 let gx = Cfa::reflect(px as isize - MARGIN as isize, cfa.width);
-                raw.push(cfa.data[gy * cfa.width + gx]);
+                raw.push(cfa.data[gy * cfa.width + gx].max(0.));
                 colour.push(cfa.color(gx, gy));
             }
         }

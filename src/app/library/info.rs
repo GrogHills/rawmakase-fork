@@ -153,7 +153,7 @@ impl Library {
     ) -> bool {
         if let Some(photo) = self.photo(id).cloned()
             && let Some(edit) =
-                crate::app::library::photo_metadata::controls(ui, &photo, &self.labels())
+                crate::app::library::photo_metadata::controls(ui, &photo, self.labels())
         {
             let ids = if whole_selection && self.selection.selected.contains(&id) {
                 self.selected_ids()

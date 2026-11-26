@@ -754,3 +754,213 @@ fn closing_cancels_the_edited_preview_under_way() -> anyhow::Result<()> {
     assert!(rx.try_recv().is_err());
     Ok(())
 }
+
+#[test]
+fn ai_denoise_renders_limit_concurrency_without_deadlocking_rayon_pool() -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicUsize;
+
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+    fn concurrent_ai(
+        _: &Path,
+        _: &crate::storage::Identity,
+        _: &EditSource,
+        _: &rawmakase_decode::ai::cache::AiEntry,
+        _: Cancel<'_>,
+    ) -> anyhow::Result<image::RgbImage> {
+        let now = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(25));
+        let (a, b) = rayon::join(|| 1u8, || 2u8);
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        Ok(image::RgbImage::from_pixel(4, 4, image::Rgb([a, b, 3])))
+    }
+
+    ACTIVE.store(0, Ordering::SeqCst);
+    PEAK.store(0, Ordering::SeqCst);
+    let directory = tempfile::tempdir()?;
+    let ai = AiCache::new(directory.path().join("ai"), u64::MAX);
+    let source = with_ai_denoise()?;
+    let wanted = Wanted::default();
+    let mut paths = Vec::new();
+    for i in 1..=4 {
+        let path = directory.path().join(format!("p{i}.png"));
+        image::RgbImage::from_pixel(8, 8, image::Rgb([i as u8; 3])).save(&path)?;
+        finish_ai(&ai, &path)?;
+        wanted.lock().unwrap().insert(PhotoId(i));
+        paths.push((PhotoId(i), path));
+    }
+    let (tx, rx, _) = spawn_edited_with_ai_slots(
+        directory.path().join("previews.sqlite3"),
+        wanted,
+        egui::Context::default(),
+        plain,
+        concurrent_ai,
+        4,
+    );
+    tx.set_ai_cache(ai);
+    tx.set_pace(Pace::Full);
+    for (id, path) in paths {
+        tx.send(EditJob::Render {
+            id,
+            ticket: 0,
+            path,
+            source: source.clone(),
+            ahead: false,
+        })?;
+    }
+    let mut completed = 0;
+    for _ in 0..4 {
+        match rx.recv_timeout(Duration::from_secs(20))? {
+            EditResult::Ready(..) => completed += 1,
+            other => fail_unexpected(other, "unexpected result"),
+        }
+    }
+    assert_eq!(completed, 4);
+    assert!(
+        PEAK.load(Ordering::SeqCst) <= 2,
+        "peak={}",
+        PEAK.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
+
+fn fail_unexpected(other: EditResult, context: &str) -> ! {
+    let kind = match other {
+        EditResult::Ready(..) => "Ready",
+        EditResult::Kept(..) => "Kept",
+        EditResult::Skipped(..) => "Skipped",
+        EditResult::Failed(..) => "Failed",
+        EditResult::CacheError(error) => panic!("{context}: unexpected CacheError: {error}"),
+    };
+    panic!("{context}: {kind}");
+}
+
+#[test]
+fn deferred_offscreen_ai_cached_preview_serves_immediately_when_scrolled_into_view()
+-> anyhow::Result<()> {
+    fn gate() -> &'static (Mutex<(usize, bool)>, std::sync::Condvar) {
+        static GATE: std::sync::OnceLock<(Mutex<(usize, bool)>, std::sync::Condvar)> =
+            std::sync::OnceLock::new();
+        GATE.get_or_init(|| (Mutex::new((0, false)), std::sync::Condvar::new()))
+    }
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let (lock, cv) = gate();
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            state.1 = true;
+            cv.notify_all();
+        }
+    }
+    fn blocking_ai(
+        _: &Path,
+        _: &crate::storage::Identity,
+        _: &EditSource,
+        _: &rawmakase_decode::ai::cache::AiEntry,
+        _: Cancel<'_>,
+    ) -> anyhow::Result<image::RgbImage> {
+        let (lock, cv) = gate();
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 += 1;
+        cv.notify_all();
+        while !state.1 {
+            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        Ok(image::RgbImage::from_pixel(4, 4, image::Rgb([200; 3])))
+    }
+
+    {
+        let (lock, _) = gate();
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = (0, false);
+    }
+    let _release = Release;
+    let directory = tempfile::tempdir()?;
+    let ai = AiCache::new(directory.path().join("ai"), u64::MAX);
+    let source = with_ai_denoise()?;
+    let mut paths = Vec::new();
+    for i in 1..=3 {
+        let path = directory.path().join(format!("p{i}.png"));
+        image::RgbImage::from_pixel(8, 8, image::Rgb([i as u8; 3])).save(&path)?;
+        finish_ai(&ai, &path)?;
+        paths.push((PhotoId(i), path));
+    }
+    let db_path = directory.path().join("previews.sqlite3");
+    let cached_p3 = image::RgbImage::from_pixel(8, 8, image::Rgb([77; 3]));
+    {
+        let mut cache = PreviewCache::open(&db_path)?;
+        cache.store_tagged(
+            &paths[2].1,
+            &source.preview_tag(PreviewAi::Finished),
+            &Stamp::read(&paths[2].1)?,
+            &cached_p3,
+        )?;
+    }
+
+    let wanted = Wanted::default();
+    wanted.lock().unwrap().extend([PhotoId(1), PhotoId(2)]);
+    let (tx, rx, _) = spawn_edited_with_ai_slots_unpooled(
+        db_path,
+        wanted.clone(),
+        egui::Context::default(),
+        plain,
+        blocking_ai,
+        3,
+    );
+    tx.set_ai_cache(ai);
+    tx.set_pace(Pace::Full);
+    for (i, (id, path)) in paths.into_iter().enumerate() {
+        tx.send(EditJob::Render {
+            id,
+            ticket: id.0 as u64,
+            path,
+            source: source.clone(),
+            ahead: i == 2,
+        })?;
+    }
+
+    // Hold both AI slots busy inside `blocking_ai`, then wait until the offscreen AI job has
+    // been classified, deferred, and the scheduler has parked on `shared.changed`.
+    {
+        let (lock, cv) = gate();
+        let mut state = lock.lock().unwrap();
+        let started = std::time::Instant::now();
+        while state.0 < 2 {
+            let remaining = Duration::from_secs(20)
+                .checked_sub(started.elapsed())
+                .expect("timed out waiting for two AI renders");
+            let (next, timed_out) = cv.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(
+                !timed_out.timed_out(),
+                "timed out waiting for two AI renders"
+            );
+        }
+    }
+    tx.wait_until_deferred_ai_parked(PhotoId(3));
+    assert!(rx.try_recv().is_err());
+
+    // Scroll photo 3 into view while both AI slots remain occupied: cached preview returns immediately.
+    tx.set_shown(
+        &wanted,
+        std::collections::HashSet::from([PhotoId(1), PhotoId(2), PhotoId(3)]),
+    );
+    match rx.recv_timeout(Duration::from_secs(5))? {
+        EditResult::Ready(id, ticket, _) => {
+            assert_eq!(id, PhotoId(3));
+            assert_eq!(ticket, 3);
+        }
+        other => fail_unexpected(other, "expected cached Ready for photo 3"),
+    }
+
+    drop(_release);
+    let mut completed = 0;
+    for _ in 0..2 {
+        match rx.recv_timeout(Duration::from_secs(20))? {
+            EditResult::Ready(..) => completed += 1,
+            other => fail_unexpected(other, "unexpected result draining blocked AI jobs"),
+        }
+    }
+    assert_eq!(completed, 2);
+    Ok(())
+}

@@ -146,6 +146,9 @@ pub struct ModelOutput<'a> {
 /// For each packed pixel, the share of the plain image near clipped samples: 1 within
 /// [`CLIPPED_RADIUS`] sensor pixels of one, fading to 0 over as many again.
 fn plain_share(layout: &Layout, clipped: &[bool]) -> Vec<f32> {
+    if !clipped.iter().any(|&c| c) {
+        return Vec::new();
+    }
     let (w, h) = (layout.packed_width, layout.packed_height);
     // Chessboard distance to the nearest clipped packed pixel, two passes.
     let far = u32::MAX / 2;
@@ -219,7 +222,9 @@ pub fn assemble(
         "The AI Denoise result has the wrong size"
     );
     let mut share = plain_share(&layout, output.clipped);
-    if let Some(done) = output.done {
+    if !share.is_empty()
+        && let Some(done) = output.done
+    {
         for (s, d) in share.iter_mut().zip(done) {
             if !d {
                 *s = 1.;
@@ -236,9 +241,27 @@ pub fn assemble(
         .enumerate()
         .for_each(|(y, (row, plain_row))| {
             let oy = y + ay;
+            if share.is_empty() && output.done.is_none() {
+                for (x, p) in row.iter_mut().enumerate() {
+                    let i = oy * ow + x + ax;
+                    *p = [
+                        (output.rgb[i] * wb[0]).max(0.),
+                        (output.rgb[plane + i] * wb[1]).max(0.),
+                        (output.rgb[2 * plane + i] * wb[2]).max(0.),
+                    ];
+                }
+                return;
+            }
             for (x, (p, q)) in row.iter_mut().zip(plain_row).enumerate() {
                 let ox = x + ax;
-                let s = share[(oy / 2) * pw + ox / 2];
+                let packed_idx = (oy / 2) * pw + ox / 2;
+                let s = if !share.is_empty() {
+                    share[packed_idx]
+                } else if output.done.is_some_and(|done| !done[packed_idx]) {
+                    1.
+                } else {
+                    0.
+                };
                 let i = oy * ow + ox;
                 if s == 1. {
                     *p = *q;

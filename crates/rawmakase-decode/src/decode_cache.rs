@@ -19,7 +19,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::SystemTime,
@@ -53,20 +53,27 @@ pub fn cache_dir() -> PathBuf {
         .unwrap_or_else(|| home.join(".cache/rawmakase"))
 }
 
+fn build_identity_str() -> &'static str {
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(fs::metadata)
+            .map(|m| {
+                let modified = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}-{modified}", m.len())
+            })
+            .unwrap_or_default()
+    })
+}
+
 /// The running executable's size and modification time: what a cache entry made
 /// by this build is keyed by, so another build never reads it.
 pub fn build_identity() -> String {
-    std::env::current_exe()
-        .and_then(fs::metadata)
-        .map(|m| {
-            let modified = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_nanos());
-            format!("{}-{modified}", m.len())
-        })
-        .unwrap_or_default()
+    build_identity_str().to_string()
 }
 
 /// The key of a result this build made from file version `id`: the file's identity
@@ -76,7 +83,7 @@ pub fn build_identity() -> String {
 /// Each cache keeps its own part and reads the file's identity once, when its job
 /// is captured; Library previews keep their cheap stamps instead.
 pub fn source_key(id: &crate::storage::Identity, own: impl std::fmt::Display) -> String {
-    format!("{}-{own}-{}", id.key(), build_identity())
+    format!("{}-{own}-{}", id.key(), build_identity_str())
 }
 
 #[derive(Clone, Debug)]
@@ -327,17 +334,30 @@ impl DecodeCache {
             recovered.pixels.len() == image.pixels.len(),
             "Recovered size mismatch"
         );
-        let changes: Vec<Change> = image
+        const CHUNK: usize = 65_536;
+        let chunks: Vec<Vec<Change>> = image
             .pixels
-            .iter()
-            .zip(&recovered.pixels)
+            .par_chunks(CHUNK)
+            .zip(recovered.pixels.par_chunks(CHUNK))
             .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(i, (_, b))| Change {
-                index: i as u32,
-                value: *b,
+            .map(|(chunk_idx, (a, b))| {
+                let base = chunk_idx * CHUNK;
+                let mut local = Vec::new();
+                for (offset, (pa, pb)) in a.iter().zip(b).enumerate() {
+                    if pa != pb {
+                        local.push(Change {
+                            index: (base + offset) as u32,
+                            value: *pb,
+                        });
+                    }
+                }
+                local
             })
             .collect();
+        let mut changes = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+        for c in chunks {
+            changes.extend(c);
+        }
         let header = serde_json::to_vec(&Header {
             key: key.into(),
             width: image.width,

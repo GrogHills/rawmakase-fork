@@ -16,13 +16,13 @@ rawmakase-cancel = { path = "../rawmakase-cancel", version = "0.1.0" }
 rawmakase-model = { path = "../rawmakase-model", version = "0.1.0" }
 anyhow.workspace = true
 bytemuck.workspace = true
-image.workspace = true
 pollster = "1"
 rayon.workspace = true
 serde_json.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+image.workspace = true
 rawmakase-interop = { path = "../rawmakase-interop", version = "0.1.0", features = ["test-support"] }
 rawmakase-model = { path = "../rawmakase-model", version = "0.1.0", features = ["test-support"] }
 

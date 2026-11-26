@@ -41,9 +41,8 @@ impl Catalog {
     }
     /// The overrides of several photos, by photo.
     pub fn descriptive_of(&self, ids: &[PhotoId]) -> Result<HashMap<PhotoId, Descriptive>> {
-        ids.iter()
-            .map(|id| Ok((*id, read(&self.db, *id)?)))
-            .collect()
+        self.db
+            .snapshot(|s| ids.iter().map(|id| Ok((*id, read(s, *id)?))).collect())
     }
     /// Replaces the default language of a field on every photo given, keeping
     /// its other languages; empty text clears the field, every language.
@@ -167,6 +166,56 @@ impl Catalog {
     pub fn keywords(&self, id: PhotoId) -> Result<Vec<Keyword>> {
         keywords(&self.db, id)
     }
+    /// Every photo's keywords, each with its path from the top, by path.
+    pub fn keywords_for_photos(&self, ids: &[PhotoId]) -> Result<HashMap<PhotoId, Vec<Keyword>>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.db.snapshot(|s| {
+            let mut memberships: Vec<(PhotoId, Vec<i64>)> = Vec::with_capacity(ids.len());
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            let mut any_keyword = false;
+            for &photo_id in ids {
+                if !seen.insert(photo_id) {
+                    continue;
+                }
+                let kw_ids: Vec<i64> = s.read(
+                    sql!("SELECT keyword FROM photo_keywords WHERE photo=?"),
+                    &[&photo_id],
+                )?;
+                any_keyword |= !kw_ids.is_empty();
+                memberships.push((photo_id, kw_ids));
+            }
+            if !any_keyword {
+                return Ok(memberships
+                    .into_iter()
+                    .map(|(photo_id, _)| (photo_id, Vec::new()))
+                    .collect());
+            }
+            let mut steps: HashMap<i64, KeywordStep> = HashMap::new();
+            let mut resolved: HashMap<i64, Keyword> = HashMap::new();
+            let mut by_photo: HashMap<PhotoId, Vec<Keyword>> =
+                HashMap::with_capacity(memberships.len());
+            for (photo_id, kw_ids) in memberships {
+                let mut photo_keywords = Vec::with_capacity(kw_ids.len());
+                for kw_id in kw_ids {
+                    let kw = if let Some(cached) = resolved.get(&kw_id) {
+                        cached.clone()
+                    } else {
+                        let built = resolve_keyword(s, &mut steps, kw_id)?;
+                        resolved.insert(kw_id, built.clone());
+                        built
+                    };
+                    if !kw.path.is_empty() {
+                        photo_keywords.push(kw);
+                    }
+                }
+                photo_keywords.sort_by(|a, b| a.path.cmp(&b.path).then(a.id.cmp(&b.id)));
+                by_photo.insert(photo_id, photo_keywords);
+            }
+            Ok(by_photo)
+        })
+    }
     /// The keyword at `path` (top first), made where it or its parents are
     /// missing. Names are compared in NFC, case kept.
     #[cfg(any(test, feature = "test-support"))]
@@ -286,6 +335,74 @@ pub(super) fn keyword_at(w: &mut Write<'_>, path: &[String]) -> Result<i64> {
     Ok(parent.unwrap())
 }
 
+row! {
+    #[derive(Clone)]
+    struct KeywordStep {
+        name: String,
+        parent: Option<i64>,
+        included: bool,
+        with_parents: bool,
+    }
+}
+
+fn build_keyword(id: i64, mut path: Vec<String>, include: Vec<bool>, parents: bool) -> Keyword {
+    let own = include.first().copied().unwrap_or(true);
+    let mut exported: Vec<bool> = include
+        .iter()
+        .enumerate()
+        .map(|(i, included)| own && *included && (i == 0 || parents))
+        .collect();
+    path.reverse();
+    exported.reverse();
+    Keyword {
+        id,
+        name: path.last().cloned().unwrap_or_default(),
+        path,
+        exported,
+    }
+}
+
+fn resolve_keyword(
+    db: &impl Reads,
+    steps: &mut HashMap<i64, KeywordStep>,
+    id: i64,
+) -> Result<Keyword> {
+    let mut path = Vec::new();
+    // Include on Export of each, from the keyword up.
+    let mut include = Vec::new();
+    let mut parents = true;
+    let mut next = Some(id);
+    while let Some(k) = next {
+        // A cycle in a damaged catalog would never end.
+        ensure!(path.len() < 256, "Keyword hierarchy too deep");
+        let step = if let Some(cached) = steps.get(&k) {
+            cached.clone()
+        } else {
+            let fetched: KeywordStep = db
+                .read_optional(
+                    sql!(
+                        "SELECT k.name, k.parent, COALESCE(e.include, 1), COALESCE(e.parents, 1)
+                         FROM keywords k LEFT JOIN keyword_export e ON e.keyword = k.id WHERE k.id=?"
+                    ),
+                    &[&k],
+                )?
+                .context("Unknown keyword")?;
+            steps.insert(k, fetched.clone());
+            fetched
+        };
+        if step.name.is_empty() && step.parent.is_none() {
+            break;
+        }
+        if path.is_empty() {
+            parents = step.with_parents;
+        }
+        path.push(step.name);
+        include.push(step.included);
+        next = step.parent;
+    }
+    Ok(build_keyword(id, path, include, parents))
+}
+
 /// A keyword with its path from the top. Lightroom's hidden root, a
 /// nameless keyword with no parent that its top-level keywords are under,
 /// is no part of a path; the root itself has an empty one.
@@ -325,20 +442,7 @@ fn keyword(db: &impl Reads, id: i64) -> Result<Keyword> {
         include.push(step.included);
         next = step.parent;
     }
-    let own = include.first().copied().unwrap_or(true);
-    let mut exported: Vec<bool> = include
-        .iter()
-        .enumerate()
-        .map(|(i, included)| own && *included && (i == 0 || parents))
-        .collect();
-    path.reverse();
-    exported.reverse();
-    Ok(Keyword {
-        id,
-        name: path.last().cloned().unwrap_or_default(),
-        path,
-        exported,
-    })
+    Ok(build_keyword(id, path, include, parents))
 }
 
 pub(super) fn read(db: &impl Reads, id: PhotoId) -> Result<Descriptive> {
