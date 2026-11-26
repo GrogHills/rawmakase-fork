@@ -345,6 +345,23 @@ pub fn scan(
             }),
         }
     }
+    if !matcher.had_retry_failure.is_empty() {
+        let mut pending_retries: Vec<u64> = matcher.had_retry_failure.iter().copied().collect();
+        pending_retries.sort_unstable();
+        for size in pending_retries {
+            if cancelled() {
+                bail!("Synchronization stopped");
+            }
+            matcher.hash_present_of_size(size)?;
+        }
+        let total = found.len();
+        for size in matcher.retried_sizes.drain() {
+            retried_before
+                .entry(size)
+                .and_modify(|end| *end = (*end).max(total))
+                .or_insert(total);
+        }
+    }
     while !retried_before.is_empty() {
         let pending = std::mem::take(&mut retried_before);
         let total = found.len();

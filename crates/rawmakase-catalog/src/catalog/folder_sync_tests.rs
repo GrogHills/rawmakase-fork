@@ -1244,6 +1244,38 @@ mod scenarios {
         assert_eq!(plan.default_accepted().additions, vec![moved_2]);
         Ok(())
     }
+
+    #[test]
+    fn transiently_unreadable_catalog_photo_is_retried_even_without_another_same_size_file()
+    -> Result<()> {
+        let f = fixture()?;
+        f.cat
+            .db_for_tests()
+            .execute_batch("DELETE FROM photo_checksums")?;
+        let id = f.id("IMG_1001.dng");
+        let original = f.root.join("Lisbon/IMG_1001.dng");
+        let backup = f._dir.path().join("IMG_1001.dng.bak");
+        let copy1 = f.root.join("Lisbon/IMG_9991.dng");
+        let other = f.root.join("Lisbon/IMG_9992.dng");
+        std::fs::copy(&original, &copy1)?;
+        let mut larger = bytes(4);
+        larger.push(0);
+        std::fs::write(&other, larger)?;
+        let inputs = f.cat.sync_inputs(SyncScope::All)?;
+        let plan = scan(&inputs, &|_| true, Cancel::NEVER, &|n| match n {
+            1 => std::fs::rename(&original, &backup).unwrap(),
+            2 => std::fs::rename(&backup, &original).unwrap(),
+            _ => {}
+        })?;
+        assert!(plan.not_checked.is_empty(), "{:?}", plan.not_checked);
+        assert_eq!(plan.additions.len(), 2);
+        assert_eq!(plan.additions[0].file, copy1);
+        assert_eq!(plan.additions[0].copy_of, [id]);
+        assert_eq!(plan.additions[1].file, other);
+        assert!(plan.additions[1].copy_of.is_empty());
+        assert_eq!(plan.default_accepted().additions, vec![other]);
+        Ok(())
+    }
 }
 
 #[test]
