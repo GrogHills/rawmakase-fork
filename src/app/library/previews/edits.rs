@@ -4,7 +4,7 @@ use super::render::{finished_entry, plain_of, preview_tags, render_edited, rende
 use super::source::{EditSource, PreviewAi};
 use super::thumbnails::Worker;
 use crate::catalog::PhotoId;
-use crate::catalog::preview_cache::{PreviewCache, Stamp};
+use crate::catalog::preview_cache::{EncodedPreview, PreviewCache, Stamp, StoreOutcome};
 use eframe::egui;
 use rawmakase_cancel::Cancel;
 use rawmakase_decode::ai::cache::AiCache;
@@ -554,7 +554,7 @@ fn load_first_tagged(
             Ok(None) => {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if let Some(cache) = &*cache(cache_at) {
-                        let _ = cache.delete_tagged(path, &tags[index]);
+                        let _ = cache.delete_corrupt_tagged(path, &tags[index], &jpeg);
                     }
                 }))
                 .is_err()
@@ -569,6 +569,36 @@ fn load_first_tagged(
     }
     None
 }
+/// Writes an off-lock encoded preview to the cache on-lock, suppressing
+/// stale-stamp skips, reopening SQLite after a cache panic, and reporting any
+/// genuine cache failure.
+fn store_encoded_tagged(
+    cache_at: &Mutex<Option<PreviewCache>>,
+    cache_path: &Path,
+    results: &Results,
+    path: &Path,
+    tag: &str,
+    stamp: &Stamp,
+    encoded: &anyhow::Result<EncodedPreview>,
+) {
+    let stored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut guard = cache(cache_at);
+        let cache = guard.as_mut()?;
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => return Some(error.to_string()),
+        };
+        match cache.store_tagged_jpeg(path, tag, stamp, encoded) {
+            Ok(StoreOutcome::Stored | StoreOutcome::Stale) => None,
+            Err(error) => Some(error.to_string()),
+        }
+    }));
+    match stored {
+        Ok(Some(error)) => results.send(EditResult::CacheError(error)),
+        Ok(None) => {}
+        Err(_) => reopen(cache_at, cache_path),
+    }
+}
 impl Renders {
     /// Keeps `image`, rendered from the file at `path` as `stamp` gives it,
     /// as its preview under `tag`; a file changed since gets none of it, and
@@ -582,24 +612,15 @@ impl Renders {
         })) else {
             return;
         };
-        let stored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut guard = cache(&self.cache);
-            let cache = guard.as_mut()?;
-            let encoded = match &encoded {
-                Ok(encoded) => encoded,
-                Err(error) => return Some(error.to_string()),
-            };
-            match cache.store_tagged_jpeg(path, tag, stamp, encoded) {
-                Ok(()) => None,
-                Err(_) if Stamp::read(path).ok().as_ref() != Some(stamp) => None,
-                Err(error) => Some(error.to_string()),
-            }
-        }));
-        match stored {
-            Ok(Some(error)) => self.results.send(EditResult::CacheError(error)),
-            Ok(None) => {}
-            Err(_) => reopen(&self.cache, &self.cache_path),
-        }
+        store_encoded_tagged(
+            &self.cache,
+            &self.cache_path,
+            &self.results,
+            path,
+            tag,
+            stamp,
+            &encoded,
+        );
     }
     /// Classifies whether the queued render at `index` enables AI Denoise,
     /// outside `State`'s mutex and without reading the photo from disk.
@@ -746,7 +767,6 @@ impl Renders {
         );
         let task = move || {
             let _finished = Finished(results.shared.clone(), slot);
-            let mut cache_error = None;
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Given up before it began: not even the file is read.
                 if cancel.load(Ordering::Relaxed) {
@@ -763,23 +783,24 @@ impl Renders {
                         plain_of(&source),
                     ),
                 };
-                let tag = source.preview_tag(shows);
                 let encoded = PreviewCache::encode_thumbnail(&image);
-                if let Some(cache) = &mut *cache(&cache_at)
-                    && let Err(error) = encoded
-                        .and_then(|encoded| cache.store_tagged_jpeg(&path, &tag, &stamp, &encoded))
-                {
-                    cache_error = Some(error.to_string());
-                }
-                Some(image)
+                Some((stamp, image, source.preview_tag(shows), encoded))
             }));
-            let image = rendered.unwrap_or_else(|_| {
-                reopen(&cache_at, &cache_path);
-                None
-            });
-            if let Some(error) = cache_error {
-                results.send(EditResult::CacheError(error));
-            }
+            let image = match rendered {
+                Ok(Some((stamp, image, tag, encoded))) => {
+                    store_encoded_tagged(
+                        &cache_at,
+                        &cache_path,
+                        &results,
+                        &path,
+                        &tag,
+                        &stamp,
+                        &encoded,
+                    );
+                    Some(image)
+                }
+                Ok(None) | Err(_) => None,
+            };
             results.send(if cancel.load(Ordering::Relaxed) {
                 EditResult::Skipped(id, ticket)
             } else {
