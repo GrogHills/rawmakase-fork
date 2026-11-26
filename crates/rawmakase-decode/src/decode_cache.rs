@@ -341,6 +341,8 @@ impl DecodeCache {
                     Ok(out)
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let batch_pixels: usize = decoded_batch.iter().map(Vec::len).sum();
+            try_grow_bounded(&mut pixels, batch_pixels, n as usize)?;
             for stripe in decoded_batch {
                 pixels.extend_from_slice(&stripe);
             }
@@ -366,41 +368,24 @@ impl DecodeCache {
         let recovered_pixels = if change_stripes.is_empty() {
             image.pixels.clone()
         } else {
-            let mut recovered: Option<Vec<[f32; 3]>> = None;
-            let change_batch = (MAX_READ_BATCH_RAW_BYTES / (stripe_changes * 16)).max(1);
-            for batch in change_stripes.chunks(change_batch) {
-                let decoded_batch: Vec<Vec<Change>> = batch
-                    .par_iter()
-                    .map(|&(offset, comp_len, count)| -> Result<Vec<Change>> {
-                        let mut compressed = vec![0u8; comp_len];
-                        read_exact_at_file(&file, offset, &mut compressed)?;
-                        let mut raw = vec![0u8; count * 16];
-                        zlib_decompress_exact(&compressed, &mut raw)?;
-                        unshuffle_changes(&raw, count)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                for changes in &decoded_batch {
-                    for change in changes {
-                        ensure!(
-                            (change.index as usize) < image.pixels.len(),
-                            "Invalid recovered pixel"
-                        );
-                    }
-                }
-                let target = recovered.get_or_insert_with(|| {
-                    let mut buf = vec![[0.; 3]; image.pixels.len()];
+            let target = apply_change_stripes(
+                &file,
+                image.pixels.len(),
+                &change_stripes,
+                stripe_changes,
+                MAX_READ_BATCH_RAW_BYTES,
+                || {
+                    let mut buf = Vec::new();
+                    buf.try_reserve_exact(image.pixels.len())
+                        .context("Decode cache recovery allocation failed")?;
+                    buf.resize(image.pixels.len(), [0.; 3]);
                     buf.par_chunks_mut(1 << 20)
                         .zip(image.pixels.par_chunks(1 << 20))
                         .for_each(|(a, b)| a.copy_from_slice(b));
-                    buf
-                });
-                for changes in decoded_batch {
-                    for change in changes {
-                        target[change.index as usize] = change.value;
-                    }
-                }
-            }
-            Arc::new(recovered.context("Missing recovered pixel stripes")?)
+                    Ok(buf)
+                },
+            )?;
+            Arc::new(target)
         };
         let recovered = CameraImage {
             recovered: Default::default(),
@@ -618,6 +603,8 @@ fn compress_block(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(stored)
 }
 
+type StripeSpan = (u64, usize, usize);
+
 fn parse_stripes(
     table: &[u8],
     count: usize,
@@ -625,7 +612,7 @@ fn parse_stripes(
     max_per_stripe: usize,
     bytes_per_item: u64,
     cursor: &mut u64,
-) -> Result<Vec<(u64, usize, usize)>> {
+) -> Result<Vec<StripeSpan>> {
     let mut stripes = Vec::with_capacity(count);
     let mut remaining = total_items;
     ensure!(table.len() == count * 4, "Decode cache table size mismatch");
@@ -648,6 +635,81 @@ fn parse_stripes(
     }
     ensure!(remaining == 0, "Decode cache stripe count mismatch");
     Ok(stripes)
+}
+
+fn try_grow_bounded<T>(vec: &mut Vec<T>, needed_additional: usize, max_cap: usize) -> Result<()> {
+    let required = vec
+        .len()
+        .checked_add(needed_additional)
+        .context("Decode cache allocation overflow")?;
+    ensure!(required <= max_cap, "Decode cache decoded past image size");
+    if vec.capacity() >= required {
+        return Ok(());
+    }
+    let target = vec.capacity().saturating_mul(2).max(required).min(max_cap);
+    vec.try_reserve_exact(target - vec.len())
+        .context("Decode cache pixel allocation failed")?;
+    Ok(())
+}
+
+fn decode_change_batch(
+    file: &fs::File,
+    batch: &[StripeSpan],
+    pixel_len: usize,
+) -> Result<Vec<Vec<Change>>> {
+    let decoded_batch = batch
+        .par_iter()
+        .map(|&(offset, comp_len, count)| -> Result<Vec<Change>> {
+            let mut compressed = vec![0u8; comp_len];
+            read_exact_at_file(file, offset, &mut compressed)?;
+            let mut raw = vec![0u8; count * 16];
+            zlib_decompress_exact(&compressed, &mut raw)?;
+            unshuffle_changes(&raw, count)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for changes in &decoded_batch {
+        for change in changes {
+            ensure!(
+                (change.index as usize) < pixel_len,
+                "Invalid recovered pixel"
+            );
+        }
+    }
+    Ok(decoded_batch)
+}
+
+fn apply_change_stripes(
+    file: &fs::File,
+    pixel_len: usize,
+    change_stripes: &[StripeSpan],
+    stripe_changes: usize,
+    max_batch_raw_bytes: usize,
+    alloc_recovery: impl FnOnce() -> Result<Vec<[f32; 3]>>,
+) -> Result<Vec<[f32; 3]>> {
+    let change_batch = (max_batch_raw_bytes / (stripe_changes * 16)).max(1);
+    let (first_batch, rest) = change_stripes.split_at(change_stripes.len().min(change_batch));
+    let first_decoded = decode_change_batch(file, first_batch, pixel_len)?;
+    // Validate every remaining delta batch in bounded scratch before cloning
+    // the full pixel buffer, so corrupt or out-of-range trailing batches fail
+    // without triggering a gigabyte-scale allocation.
+    for batch in rest.chunks(change_batch) {
+        let _ = decode_change_batch(file, batch, pixel_len)?;
+    }
+    let mut target = alloc_recovery()?;
+    ensure!(target.len() == pixel_len, "Recovery buffer size mismatch");
+    for changes in first_decoded {
+        for change in changes {
+            target[change.index as usize] = change.value;
+        }
+    }
+    for batch in rest.chunks(change_batch) {
+        for changes in decode_change_batch(file, batch, pixel_len)? {
+            for change in changes {
+                target[change.index as usize] = change.value;
+            }
+        }
+    }
+    Ok(target)
 }
 
 /// Transposes each channel's 4 little-endian `f32` bytes into contiguous byte
@@ -1319,6 +1381,105 @@ mod tests {
                 [b[0].to_bits(), b[1].to_bits(), b[2].to_bits()]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_pixel_growth_caps_capacity_at_validated_size() -> Result<()> {
+        let max_cap = 150usize;
+        let mut buf: Vec<[f32; 3]> = Vec::new();
+        for i in 0..8usize {
+            let chunk_len = if i == 7 { 10 } else { 20 };
+            try_grow_bounded(&mut buf, chunk_len, max_cap)?;
+            assert!(
+                buf.capacity() <= max_cap,
+                "capacity {} exceeded validated max {max_cap}",
+                buf.capacity()
+            );
+            buf.resize(buf.len() + chunk_len, [i as f32; 3]);
+        }
+        assert_eq!(buf.len(), max_cap);
+        assert_eq!(buf.capacity(), max_cap);
+        assert!(try_grow_bounded(&mut buf, 1, max_cap).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_or_oob_later_delta_batch_never_allocates_recovery() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let write_batches =
+            |name: &str, batches: &[&[Change]]| -> Result<(fs::File, Vec<StripeSpan>)> {
+                let path = dir.path().join(name);
+                let mut blob = Vec::new();
+                let mut stripes = Vec::new();
+                for &changes in batches {
+                    let compressed = compress_block(&shuffle_changes(changes))?;
+                    stripes.push((blob.len() as u64, compressed.len(), changes.len()));
+                    blob.extend_from_slice(&compressed);
+                }
+                fs::write(&path, &blob)?;
+                Ok((fs::File::open(&path)?, stripes))
+            };
+
+        let batch0 = [
+            Change {
+                index: 1,
+                value: [1.0, 2.0, 3.0],
+            },
+            Change {
+                index: 5,
+                value: [4.0, 5.0, 6.0],
+            },
+        ];
+        let batch1_ok = [Change {
+            index: 50,
+            value: [7.0, 8.0, 9.0],
+        }];
+
+        // (a) Valid multi-batch deltas allocate recovery once and apply all changes.
+        let (file_ok, stripes_ok) = write_batches("ok.bin", &[&batch0, &batch1_ok])?;
+        let mut allocs = 0usize;
+        let out = apply_change_stripes(&file_ok, 100, &stripes_ok, 4, 4 * 16, || {
+            allocs += 1;
+            Ok(vec![[0.0; 3]; 100])
+        })?;
+        assert_eq!(allocs, 1);
+        assert_eq!(out[1], [1.0, 2.0, 3.0]);
+        assert_eq!(out[5], [4.0, 5.0, 6.0]);
+        assert_eq!(out[50], [7.0, 8.0, 9.0]);
+
+        // (b) Corrupt checksum in trailing batch must fail without calling alloc_recovery.
+        let path_bad = dir.path().join("bad.bin");
+        let mut raw_bad = fs::read(dir.path().join("ok.bin"))?;
+        let last = raw_bad.len() - 2;
+        raw_bad[last] ^= 0xff;
+        fs::write(&path_bad, &raw_bad)?;
+        let file_bad = fs::File::open(&path_bad)?;
+        let mut allocs_bad = 0usize;
+        assert!(
+            apply_change_stripes(&file_bad, 100, &stripes_ok, 4, 4 * 16, || {
+                allocs_bad += 1;
+                Ok(vec![[0.0; 3]; 100])
+            })
+            .is_err()
+        );
+        assert_eq!(allocs_bad, 0);
+
+        // (c) Out-of-range pixel index in trailing batch must fail without calling alloc_recovery.
+        let batch1_oob = [Change {
+            index: 100,
+            value: [7.0, 8.0, 9.0],
+        }];
+        let (file_oob, stripes_oob) = write_batches("oob.bin", &[&batch0, &batch1_oob])?;
+        let mut allocs_oob = 0usize;
+        assert!(
+            apply_change_stripes(&file_oob, 100, &stripes_oob, 4, 4 * 16, || {
+                allocs_oob += 1;
+                Ok(vec![[0.0; 3]; 100])
+            })
+            .is_err()
+        );
+        assert_eq!(allocs_oob, 0);
         Ok(())
     }
 }
