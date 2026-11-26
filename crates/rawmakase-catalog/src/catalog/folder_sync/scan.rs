@@ -318,16 +318,24 @@ pub fn scan(
         states,
         dir_cache,
         unhashed_present_by_size,
+        had_retry_failure: HashSet::new(),
+        retried_sizes: HashSet::new(),
         extra_checksums: HashMap::new(),
         extra_by_quick: HashMap::new(),
     };
     let mut found: Vec<(PathBuf, (RootId, String), Identity, Found)> = Vec::new();
+    let mut retried_before: HashMap<u64, usize> = HashMap::new();
     for (n, (file, place)) in unknown.into_iter().enumerate() {
         if cancelled() {
             bail!("Synchronization stopped");
         }
         progress(n + 1);
-        match matcher.find(&file) {
+        let before = found.len();
+        let matched = matcher.find(&file);
+        for size in matcher.retried_sizes.drain() {
+            retried_before.insert(size, before);
+        }
+        match matched {
             Ok(Some((identity, what))) => found.push((file, place, identity, what)),
             Ok(None) => {}
             Err(_) if cancelled() => bail!("Synchronization stopped"),
@@ -335,6 +343,47 @@ pub fn scan(
                 path: file,
                 reason: format!("{e:#}"),
             }),
+        }
+    }
+    while !retried_before.is_empty() {
+        let pending = std::mem::take(&mut retried_before);
+        let total = found.len();
+        let mut drop_indices: Vec<usize> = Vec::new();
+        for (i, (file, _, identity, what)) in found.iter_mut().enumerate() {
+            let Some(&cutoff) = pending.get(&identity.size) else {
+                continue;
+            };
+            if i >= cutoff {
+                continue;
+            }
+            if cancelled() {
+                bail!("Synchronization stopped");
+            }
+            let matched = matcher.find(file);
+            for size in matcher.retried_sizes.drain() {
+                retried_before
+                    .entry(size)
+                    .and_modify(|end| *end = (*end).max(total))
+                    .or_insert(total);
+            }
+            match matched {
+                Ok(Some((new_identity, new_what))) => {
+                    *identity = new_identity;
+                    *what = new_what;
+                }
+                Ok(None) => drop_indices.push(i),
+                Err(_) if cancelled() => bail!("Synchronization stopped"),
+                Err(e) => {
+                    drop_indices.push(i);
+                    plan.not_checked.push(NotChecked {
+                        path: file.clone(),
+                        reason: format!("{e:#}"),
+                    });
+                }
+            }
+        }
+        for i in drop_indices.into_iter().rev() {
+            found.remove(i);
         }
     }
     if cancelled() {
@@ -494,6 +543,11 @@ struct Matching<'a> {
     dir_cache: DirCheckCache,
     /// Present photos without a current checksum, grouped by stamped size for lazy hashing.
     unhashed_present_by_size: HashMap<u64, Vec<PhotoId>>,
+    /// Size buckets where at least one present photo transiently failed to hash.
+    had_retry_failure: HashSet<u64>,
+    /// Sizes for which a deferred candidate later hashed (or hashed under a new size),
+    /// so earlier files of that size are re-checked before claims are settled.
+    retried_sizes: HashSet<u64>,
     /// Checksums of present photos read during this scan.
     extra_checksums: HashMap<PhotoId, FileChecksum>,
     extra_by_quick: HashMap<(u64, String), Vec<PhotoId>>,
@@ -504,6 +558,7 @@ impl Matching<'_> {
         let Some(ids) = self.unhashed_present_by_size.remove(&size) else {
             return Ok(());
         };
+        let retrying = self.had_retry_failure.contains(&size);
         let mut retry = Vec::new();
         for id in ids {
             if !self.go_on() {
@@ -514,6 +569,12 @@ impl Matching<'_> {
             };
             match FileChecksum::read_quick(&path, |_| self.go_on()) {
                 Ok(ChecksumRead::Done(quick)) => {
+                    if retrying {
+                        self.retried_sizes.insert(size);
+                        self.retried_sizes.insert(quick.size);
+                    } else if quick.size != size {
+                        self.retried_sizes.insert(quick.size);
+                    }
                     self.extra_by_quick
                         .entry((quick.size, quick.quick.clone()))
                         .or_default()
@@ -530,6 +591,7 @@ impl Matching<'_> {
             }
         }
         if !retry.is_empty() {
+            self.had_retry_failure.insert(size);
             self.unhashed_present_by_size.insert(size, retry);
         }
         Ok(())

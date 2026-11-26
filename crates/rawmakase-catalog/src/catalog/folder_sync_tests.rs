@@ -1169,10 +1169,10 @@ mod scenarios {
         assert!(plan.not_checked.is_empty(), "{:?}", plan.not_checked);
         assert_eq!(plan.additions.len(), 2);
         assert_eq!(plan.additions[0].file, copy1);
-        assert!(plan.additions[0].copy_of.is_empty());
+        assert_eq!(plan.additions[0].copy_of, [id]);
         assert_eq!(plan.additions[1].file, copy2);
         assert_eq!(plan.additions[1].copy_of, [id]);
-        assert_eq!(plan.default_accepted().additions, vec![copy1]);
+        assert!(plan.default_accepted().additions.is_empty());
         Ok(())
     }
 
@@ -1196,6 +1196,52 @@ mod scenarios {
             super::super::state_of_cached(Some(&b), Some(&f.root), &online, &mut cache),
             super::super::FileState::Unavailable
         );
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_source_root_is_not_poisoned_by_earlier_dir_check_failure() -> Result<()> {
+        let mut f = fixture()?;
+        let dest_root = f._dir.path().canonicalize()?.join("archive");
+        std::fs::create_dir_all(&dest_root)?;
+        std::fs::write(dest_root.join("IMG_0000.dng"), bytes(9))?;
+        f.cat.add_folder(&dest_root)?;
+        f.checksum_all()?;
+
+        let dest_root_id = f
+            .cat
+            .roots()?
+            .into_iter()
+            .find(|(_, path, _)| Path::new(path) == dest_root)
+            .unwrap()
+            .0;
+        let id_1 = f.id("IMG_1001.dng");
+        let id_3 = f.id("IMG_2001.dng");
+        let moved_1 = dest_root.join("IMG_A.dng");
+        let moved_2 = dest_root.join("IMG_B.dng");
+        let moved_3 = dest_root.join("IMG_C.dng");
+        std::fs::rename(f.root.join("Lisbon/IMG_1001.dng"), &moved_1)?;
+        std::fs::rename(f.root.join("Lisbon/IMG_1002.dng"), &moved_2)?;
+        std::fs::rename(f.root.join("Porto/IMG_2001.dng"), &moved_3)?;
+
+        let inputs = f.cat.sync_inputs(SyncScope::Root(dest_root_id))?;
+        let offline_root = f._dir.path().join("trip-offline");
+        let plan = scan(&inputs, &|_| true, Cancel::NEVER, &|n| match n {
+            // Source root disappears before the second moved photo and returns before the third.
+            2 => std::fs::rename(&f.root, &offline_root).unwrap(),
+            3 => std::fs::rename(&offline_root, &f.root).unwrap(),
+            _ => {}
+        })?;
+        assert!(plan.not_checked.is_empty(), "{:?}", plan.not_checked);
+        let moved: Vec<(PhotoId, PathBuf, bool)> = plan
+            .moves
+            .iter()
+            .map(|m| (m.photo, m.to.clone(), m.verified))
+            .collect();
+        assert_eq!(moved, vec![(id_1, moved_1, true), (id_3, moved_3, true)]);
+        assert_eq!(plan.additions.len(), 1);
+        assert_eq!(plan.additions[0].file, moved_2);
+        assert_eq!(plan.default_accepted().additions, vec![moved_2]);
         Ok(())
     }
 }

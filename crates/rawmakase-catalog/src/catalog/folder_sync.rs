@@ -468,31 +468,27 @@ pub(super) fn current_master(db: &impl Reads, id: PhotoId) -> Result<Option<Mast
     }))
 }
 
-/// Memoizes `list_all(dir)` results per directory within one scan, rechecking
-/// that a previously listed directory can still be opened so a directory gone
-/// mid-scan is never treated as evidence of missing files.
+/// Memoizes directories whose full `list_all` succeeded within one scan,
+/// rechecking that a cached directory can still be opened so a directory gone
+/// mid-scan is never treated as evidence of missing files, while failures are
+/// never cached so a recovered directory is seen on subsequent checks.
 #[derive(Default)]
-pub(super) struct DirCheckCache(HashMap<PathBuf, Result<(), std::sync::Arc<std::io::Error>>>);
+pub(super) struct DirCheckCache(std::collections::HashSet<PathBuf>);
 
 impl DirCheckCache {
-    pub(super) fn list_all(
-        &mut self,
-        directory: &Path,
-    ) -> Result<(), std::sync::Arc<std::io::Error>> {
-        if let Some(cached) = self.0.get(directory) {
-            if cached.is_ok() {
-                if let Err(e) = std::fs::read_dir(directory) {
-                    let err = Err(std::sync::Arc::new(e));
-                    self.0.insert(directory.to_path_buf(), err.clone());
-                    return err;
+    pub(super) fn list_all(&mut self, directory: &Path) -> std::io::Result<()> {
+        if self.0.contains(directory) {
+            match std::fs::read_dir(directory) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    self.0.remove(directory);
+                    return Err(e);
                 }
-                return Ok(());
             }
-            return cached.clone();
         }
-        let result = list_all(directory).map_err(std::sync::Arc::new);
-        self.0.insert(directory.to_path_buf(), result.clone());
-        result
+        list_all(directory)?;
+        self.0.insert(directory.to_path_buf());
+        Ok(())
     }
 }
 
@@ -538,12 +534,10 @@ pub(super) fn state_of(
     anchor: Option<&Path>,
     online: &dyn Fn(&Path) -> bool,
 ) -> FileState {
-    state_of_with(path, anchor, online, &mut |dir| {
-        list_all(dir).map_err(std::sync::Arc::new)
-    })
+    state_of_with(path, anchor, online, &mut list_all)
 }
 
-/// [`state_of`] reusing `list_all` results cached in `cache`.
+/// [`state_of`] reusing `list_all` successes cached in `cache`.
 pub(super) fn state_of_cached(
     path: Option<&Path>,
     anchor: Option<&Path>,
@@ -557,7 +551,7 @@ fn state_of_with(
     path: Option<&Path>,
     anchor: Option<&Path>,
     online: &dyn Fn(&Path) -> bool,
-    listed: &mut impl FnMut(&Path) -> Result<(), std::sync::Arc<std::io::Error>>,
+    listed: &mut impl FnMut(&Path) -> std::io::Result<()>,
 ) -> FileState {
     let (Some(path), Some(anchor)) = (path, anchor) else {
         return FileState::Unavailable;
